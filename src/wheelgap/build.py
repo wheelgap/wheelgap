@@ -12,6 +12,7 @@ import http.client
 import posixpath
 import re
 import urllib.error
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit
@@ -187,17 +188,24 @@ def _on_pypi_files(url: str) -> bool:
         return False
 
 
-def where(pkg: Package, source: Source, simple_index: str | None = None) -> tuple[Release, str | None] | None:
+def where(
+    pkg: Package, source: Source, simple_index: str | None = None, private: Collection[str] = frozenset()
+) -> tuple[Release, str | None] | None:
     """(release, sdist URL) for a release whose sdist wheelgap may read, or None.
 
     The package must be positively PyPI's (origin.known_pypi, the rule --conda-forge follows too): never a pdm.lock
     entry, a poetry.lock or pixi.lock entry that records no index, a pylock.toml entry without an index, a private
-    index or a direct URL, whose names may be private and whose PyPI namesakes are other packages; and nothing in a run
-    with --index-url or WHEELGAP_INDEX_URL. When the lock records an sdist URL (uv.lock, pylock.toml), that URL is used
+    index or a direct URL, whose names may be private and whose PyPI namesakes are other packages; never a name another
+    input of the run places elsewhere (`private`, from origin.private_names); and nothing in a run with --index-url or
+    WHEELGAP_INDEX_URL. When the lock records an sdist URL (uv.lock, pylock.toml), that URL is used
     only if it's on PyPI's file host and names this release's sdist (otherwise None: no answer); when it records none
     (a poetry.lock or pixi.lock entry on pypi.org, say), the URL is None to ask PyPI's JSON API for it."""
     sdist = _sdist(pkg)
-    if sdist is None or not pkg.version or not origin.known_pypi(pkg, source, simple_index=simple_index):
+    if (
+        sdist is None
+        or not pkg.version
+        or not origin.known_pypi(pkg, source, simple_index=simple_index, private=private)
+    ):
         return None
     if pkg.sdist_url and isinstance(pkg.registry, str):  # known_pypi says that registry is PyPI's
         if unquote(posixpath.basename(urlsplit(pkg.sdist_url).path)) != sdist or not _on_pypi_files(pkg.sdist_url):
@@ -242,10 +250,11 @@ def lookup(
     read_cache: bool = False,
     write_cache: bool = False,
     simple_index: str | None = None,
+    private: Collection[str] = frozenset(),
 ) -> BuildInfo | None:
     """A release's build info, or None. Only an answer from a download that matched its sha256 is cached (a lock's
     URL with no sha256 never is); a network failure stops the lookups still to come."""
-    found, sdist = where(pkg, source, simple_index), _sdist(pkg)
+    found, sdist = where(pkg, source, simple_index, private), _sdist(pkg)
     if found is None or sdist is None:
         return None
     release, url = found
@@ -289,6 +298,7 @@ def lookup_all(
     read_cache: bool = False,
     write_cache: bool = False,
     simple_index: str | None = None,
+    private: Collection[str] = frozenset(),
 ) -> tuple[dict[int, BuildInfo], str | None]:
     """Build info by id() of each (package, the source it was read from), one lookup per release (see where)
     however many targets or inputs list it, at most WORKERS at a time and DEADLINE seconds in all. Also returns a
@@ -296,14 +306,16 @@ def lookup_all(
     todo: dict[Release, tuple[Package, Source]] = {}
     release_of: dict[int, Release] = {}
     for p, s in packages:
-        if (found := where(p, s, simple_index)) is not None:
+        if (found := where(p, s, simple_index, private)) is not None:
             release_of[id(p)] = found[0]
             todo.setdefault(found[0], (p, s))
     start = pypi._clock()
     phase = _Phase(start + DEADLINE)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         infos = list(
-            pool.map(lambda ps: lookup(ps[0], ps[1], phase, read_cache, write_cache, simple_index), todo.values())
+            pool.map(
+                lambda ps: lookup(ps[0], ps[1], phase, read_cache, write_cache, simple_index, private), todo.values()
+            )
         )
     by_release = {release: info for release, info in zip(todo, infos, strict=True) if info is not None}
     found_infos = {key: by_release[r] for key, r in release_of.items() if r in by_release}

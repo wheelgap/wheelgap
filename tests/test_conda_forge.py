@@ -519,13 +519,11 @@ def test_same_name_from_pypi_and_a_private_index(capsys, fake_pypi, tmp_path):
     (tmp_path / "uv.lock").write_text(uv_lock("https://pkgs.example.com/simple"), encoding="utf-8")
     code, out, err = run(capsys, str(tmp_path / "uv.lock"), "nowheels==0.9", "-t", "linux-aarch64", *FLAGS, "--json")
     hints = [p.get("conda_forge") for p in json.loads(out)["packages"]]
-    # The command line's nowheels is PyPI's and gets the hint; the lock's private one doesn't, though it's the same key.
-    assert sorted(hints, key=bool) == [
-        None,
-        {"name": "nowheels", "version": "0.9", "builds": {"linux-aarch64": ["linux-aarch64"]}},
-    ]
-    assert conda_calls(fake_pypi) == [API + "nowheels"]
-    assert "didn't look up 1 package" in err
+    # The lock places nowheels on a private index, so the command line's nowheels isn't sent either (#262): it may
+    # be that same private package.
+    assert hints == [None, None]
+    assert conda_calls(fake_pypi) == []
+    assert "didn't look up 1 package whose index isn't known to be PyPI (nowheels)" in err
 
 
 def test_index_url_keeps_even_pypi_lock_names(capsys, fake_pypi, fake_simple, tmp_path):

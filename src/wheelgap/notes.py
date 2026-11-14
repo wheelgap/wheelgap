@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import urllib.error
+from collections.abc import Collection
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -187,12 +188,13 @@ def parse(data: object, name: str) -> list[Note] | None:
     return [n for n in map(_note, raw[:MAX_NOTES]) if n is not None]
 
 
-def may_send(pkg: Package, source: Source) -> bool:
+def may_send(pkg: Package, source: Source, private: Collection[str] = frozenset()) -> bool:
     """Whether the package's name may go to the tracker: origin.known_pypi (the rule --conda-forge uses too), with
     one narrowing. known_pypi trusts a pypi.org registry from any lock, but notes take it only from uv.lock and
     pylock.toml; from another lock (a poetry.lock legacy source of pypi.org, say), only the found-on-pypi.org route
-    counts, which those locks never satisfy. The caller has already ruled out another index (origin.other_index)."""
-    if not origin.known_pypi(pkg, source):
+    counts, which those locks never satisfy. The caller has already ruled out another index (origin.other_index).
+    `private`: the names another input of the run places elsewhere (origin.private_names), which never go."""
+    if not origin.known_pypi(pkg, source, private=private):
         return False
     if source.kind in ("uv", "pylock") or pkg.registry is None:
         return True

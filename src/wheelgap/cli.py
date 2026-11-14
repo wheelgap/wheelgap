@@ -583,15 +583,23 @@ RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
 """The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
 
 
-def notes_eligible(row: Row, targets: list[Target], source_of: dict[int, Source]) -> bool:
+def notes_eligible(
+    row: Row, targets: list[Target], source_of: dict[int, Source], private: frozenset[str] = frozenset()
+) -> bool:
     """Whether --notes would look this row's package up: it has a gap, and it's positively a PyPI package
-    (tracker.may_send). `source_of` maps id() of each package to the input it was read from."""
+    (tracker.may_send). `source_of` maps id() of each package to the input it was read from; `private` holds the
+    names some input of the run places elsewhere (origin.private_names)."""
     source = source_of.get(id(row.package))
-    return source is not None and bool(gap_targets(row, targets)) and tracker.may_send(row.package, source)
+    return source is not None and bool(gap_targets(row, targets)) and tracker.may_send(row.package, source, private)
 
 
 def tracker_notes(
-    rows: list[Row], targets: list[Target], source_of: dict[int, Source], read_cache: bool, write_cache: bool
+    rows: list[Row],
+    targets: list[Target],
+    source_of: dict[int, Source],
+    read_cache: bool,
+    write_cache: bool,
+    private: frozenset[str] = frozenset(),
 ) -> tuple[RowNotes, str | None]:
     """--explain --notes: the coverage tracker's notes for each row with a gap, and why the lookups were cut short,
     if they were (see tracker.lookup).
@@ -600,7 +608,7 @@ def tracker_notes(
     platforms (and its Pythons, if it lists any: Note.covers), and only when it's about the checked release
     (Note.applies_to): the tracker checked its latest release, which may not be yours.
     """
-    eligible = [r for r in rows if notes_eligible(r, targets, source_of)]
+    eligible = [r for r in rows if notes_eligible(r, targets, source_of, private)]
     found, cut = tracker.lookup([r.package.key for r in eligible], read_cache, write_cache)
     out: RowNotes = {}
     for r in eligible:
@@ -1164,8 +1172,10 @@ def conda_forge_hints(
     gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool, cached: dict
 ) -> dict[int, condaforge.Hint]:
     """--conda-forge: look the gap packages up on anaconda.org and return their hints, by id() of the package. Only
-    names that are positively PyPI's are sent; notes on stderr say which packages weren't looked up, and why."""
+    names that are positively PyPI's are sent, and none that another input of the run places elsewhere
+    (origin.private_names); notes on stderr say which packages weren't looked up, and why."""
     other = origin.other_index(index_url)
+    elsewhere = origin.private_names(sources, simple_index=index_url)
     if other is not None and not quiet:
         print(
             "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
@@ -1173,15 +1183,16 @@ def conda_forge_hints(
             file=sys.stderr,
         )
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
-    asked, private = [], []
+    asked: list[Row] = []
+    kept_in: dict[str, str] = {}  # by canonical name, so two spellings of one package count once
     for r in gaps:
         if r.package.version and condaforge.wanted(gap_targets(r, targets)):
-            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url):
+            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url, private=elsewhere):
                 asked.append(r)
             else:
-                private.append(r.package.name)
-    if private and other is None and not quiet:
-        private = list(dict.fromkeys(private))
+                kept_in.setdefault(r.package.key, r.package.name)
+    if kept_in and other is None and not quiet:
+        private = list(kept_in.values())
         print(
             f"wheelgap: note: --conda-forge didn't look up {len(private)} package{'s' * (len(private) != 1)} "
             f"whose index isn't known to be PyPI ({_names(private)}), so their names stay private",
@@ -1600,8 +1611,9 @@ def _main(argv: list[str]) -> int:
             file=sys.stderr,
         )
     elif args.explain and gaps and not notes_off:
+        private = origin.private_names(sources, simple_index=index_url)
         if notes_asked:
-            row_notes, cut = tracker_notes(gaps, targets, source_of, **cached)
+            row_notes, cut = tracker_notes(gaps, targets, source_of, private=private, **cached)
             if cut and not quiet:
                 why = (
                     "wheelgap.github.io didn't answer in time"
@@ -1614,7 +1626,7 @@ def _main(argv: list[str]) -> int:
                     ),
                     file=sys.stderr,
                 )
-        elif notes_asked is None and not quiet and any(notes_eligible(r, targets, source_of) for r in gaps):
+        elif notes_asked is None and not quiet and any(notes_eligible(r, targets, source_of, private) for r in gaps):
             print(
                 Style(use_color(args.color)).dim(
                     "wheelgap: add --notes to show the tracker's notes for these packages "
@@ -1643,7 +1655,8 @@ def _main(argv: list[str]) -> int:
         # gets no line.
         source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
         wanted = [(r.package, source_of[id(r.package)]) for r in gaps if source_targets(r, targets)]
-        build_info, stopped = lookup_all(wanted, simple_index=index_url, **cached)
+        private = origin.private_names(sources, simple_index=index_url)
+        build_info, stopped = lookup_all(wanted, simple_index=index_url, private=private, **cached)
         if stopped is not None and not quiet:
             print(Style(use_color(args.color)).dim(f"wheelgap: note: {stopped}"), file=sys.stderr)
 
