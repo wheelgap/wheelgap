@@ -162,6 +162,13 @@ def test_yanked_files_stay_marked_when_cached(fake_pypi):
     assert second.yanked == first.yanked == frozenset({"halfyanked-2.0-py3-none-any.whl"})
 
 
+def test_requires_python_is_kept_when_cached(fake_pypi, lookup_cache):
+    lookup("pythonranged", "2.0")
+    (entry,) = lookup_cache.glob("*.json")
+    content = json.loads(entry.read_text(encoding="utf-8"))
+    assert content["files"] == [{"filename": "pythonranged-2.0-py3-none-any.whl", "requires_python": ">=3.10"}]
+
+
 def test_unpinned_and_range_lookups_are_not_cached(fake_pypi, lookup_cache):
     for _ in range(2):
         pypi.fill_all(
@@ -260,7 +267,7 @@ def test_entries_are_written_atomically_in_the_cache_folder(fake_pypi, monkeypat
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
 def test_the_cache_folder_is_private(fake_pypi, monkeypatch, tmp_path):
-    folder = tmp_path / "home" / "wheelgap" / "pinned-v1"
+    folder = tmp_path / "home" / "wheelgap" / "pinned-v2"
     monkeypatch.setattr(cache, "cache_dir", lambda: folder)
     lookup("fastlib", "2.0.0")
     assert folder.stat().st_mode & 0o777 == folder.parent.stat().st_mode & 0o777 == 0o700
@@ -284,7 +291,7 @@ def test_cache_dir_per_platform(monkeypatch, platform, env, expected):
     monkeypatch.setattr(cache.sys, "platform", platform)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    assert real_cache_dir() == expected / "wheelgap" / "pinned-v1"
+    assert real_cache_dir() == expected / "wheelgap" / "pinned-v2"
 
 
 def test_prune_removes_expired_entries_and_keeps_fresh_ones(fake_pypi, monkeypatch, lookup_cache):
@@ -374,7 +381,7 @@ def _symlinked_cache(tmp_path, monkeypatch):
     victim = elsewhere / ENTRY_NAME
     victim.write_text("{}", encoding="utf-8")
     os.utime(victim, (0, 0))  # ancient
-    link = tmp_path / "pinned-v1"
+    link = tmp_path / "pinned-v2"
     try:
         link.symlink_to(elsewhere, target_is_directory=True)
     except OSError:

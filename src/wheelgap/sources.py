@@ -68,9 +68,11 @@ class Package:
     # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
     # package is looked up on its index anyway, and skipped as a private index if it can't be.
     partial_files: bool = False
-    # A range resolved for several Python major.minors. Each value owns only that Python's eligible files.
+    # A range or pin resolved for several Python major.minors. Each value owns only that Python's eligible files.
     # Identical resolutions share a Package, so reports can keep one row for them.
     resolutions: dict[str, Package] = field(default_factory=dict)
+    # Wheels whose Requires-Python excluded the target Python, mapped to their --explain reason.
+    requires_python_rejected: dict[str, str] = field(default_factory=dict)
 
     @property
     def key(self) -> str:

@@ -250,7 +250,12 @@ def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     return (group, distance, filename)
 
 
-def explain(files: list[str], target: Target, yanked: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
+def explain(
+    files: list[str],
+    target: Target,
+    yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
     """(filename, reason) for every wheel `target` rejects, the closest misses first.
 
     A wheel the target accepts but status_for() leaves out because it's yanked (the release has other files the
@@ -266,6 +271,10 @@ def explain(files: list[str], target: Target, yanked: frozenset[str] = frozenset
             reason = "yanked"
         if reason:
             out.append((f, reason))
+    if requires_python_rejected:
+        for f, reason in requires_python_rejected.items():
+            if f.endswith(".whl"):
+                out.append((f, reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
 
 
@@ -278,6 +287,7 @@ def explain_lines(
     target: Target,
     *,
     yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
     limit: int | None = None,
     dim: Callable[[str], str] = lambda text: text,
     align: bool = False,
@@ -288,7 +298,7 @@ def explain_lines(
     The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
     unaligned (one space-separated "file  reason" per line) and with no limit.
     """
-    rejected = explain(files, target, yanked)
+    rejected = explain(files, target, yanked, requires_python_rejected)
     out = [] if rejected else [dim("no wheels published for this version")]
     shown = rejected[:limit]
     width = max((len(f) for f, _ in shown), default=0) if align else 0

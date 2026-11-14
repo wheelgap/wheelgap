@@ -607,8 +607,15 @@ def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
             if not entries:
                 pkg.error = f"version {pkg.version} not on index"
                 return pkg
-            pkg.files = [e["filename"] for e in entries]
-            pkg.yanked = frozenset(e["filename"] for e in entries if _is_yanked(e))
+            live_entries = [e for e in entries if _supports_python(e, python, "requires-python")]
+            rejected_entries = [e for e in entries if not _supports_python(e, python, "requires-python")]
+            pkg.files = [e["filename"] for e in live_entries]
+            pkg.yanked = frozenset(e["filename"] for e in live_entries if _is_yanked(e))
+            pkg.requires_python_rejected = {
+                e["filename"]: f"requires Python {e['requires-python']}"
+                for e in rejected_entries
+                if e["filename"].endswith(".whl")
+            }
             return pkg
 
         # A range, or no pin: the newest matching release that isn't fully yanked. As in fill(), a range only
@@ -699,9 +706,9 @@ def _not_found(base: str, name: str, version: str | None) -> str:
 def _resolve_pythons(
     pkg: Package, pythons: tuple[str, ...], resolve: Callable[[Package, str | None], Package], python: str | None
 ) -> Package:
-    """Share one index response, never files, between a range's per-Python resolutions."""
+    """Share one index response, never files, between per-Python resolutions."""
     versions = tuple(dict.fromkeys(pythons))
-    if not pkg.version and pkg.spec and len(versions) > 1:
+    if (bool(pkg.version) or bool(pkg.spec)) and len(versions) > 1:
         for py in versions:
             resolved = resolve(replace(pkg, resolutions={}), py)
             # Equal versions can still have different eligible files. Coalesce only identical answers.
@@ -753,19 +760,26 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                 return pkg
             pkg.version, urls = found
             pkg.version_from_index = True
+            names = [u["filename"] for u in urls if not u.get("yanked")]
+            pkg.files = names
+        elif pinned:
+            urls = _files(data.get("urls", []))
+            live = [u for u in urls if _supports_python(u, python)]
+            rejected = [u for u in urls if not _supports_python(u, python)]
+            pkg.files = [u["filename"] for u in live]
+            pkg.yanked = frozenset(u["filename"] for u in live if u.get("yanked"))
+            pkg.requires_python_rejected = {
+                u["filename"]: f"requires Python {u['requires_python']}"
+                for u in rejected
+                if u["filename"].endswith(".whl")
+            }
         else:
             urls = _files(data.get("urls", []))
-            if not pinned:
-                info = data.get("info")
-                pkg.version = info.get("version") if isinstance(info, dict) else None
-                pkg.version_from_index = True
-        names = [u["filename"] for u in urls]
-        if pinned:
-            # Keep yanked files but mark them: check.status_for uses them only if nothing else fits (PEP 592).
-            pkg.yanked = frozenset(u["filename"] for u in urls if u.get("yanked"))
-        else:
+            info = data.get("info")
+            pkg.version = info.get("version") if isinstance(info, dict) else None
+            pkg.version_from_index = True
             names = [u["filename"] for u in urls if not u.get("yanked")]
-        pkg.files = names
+            pkg.files = names
         pkg.found_on_pypi = base == DEFAULT_INDEX
     except (ValueError, TypeError, KeyError, AttributeError):
         pkg.error = "unexpected response from the index"

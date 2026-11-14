@@ -645,7 +645,15 @@ def render_explain(
             if needs and r.results[t] == Status.SOURCE:  # once per release, under its first source cell
                 out.append(f"  build needs: {needs}")
                 needs = None
-            lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
+            lines = explain_lines(
+                files,
+                t,
+                yanked=r.package.yanked,
+                requires_python_rejected=r.package.requires_python_rejected,
+                limit=EXPLAIN_LIMIT,
+                dim=style.dim,
+                align=True,
+            )
             out += [f"  {line}" for line in lines]
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
@@ -766,7 +774,13 @@ def report_json(
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [
-                    {"file": f, "reason": why} for f, why in explain(r.package.files or [], t, r.package.yanked)
+                    {"file": f, "reason": why}
+                    for f, why in explain(
+                        r.package.files or [],
+                        t,
+                        r.package.yanked,
+                        r.package.requires_python_rejected,
+                    )
                 ]
                 for t in gap_targets(r, targets)
             }
