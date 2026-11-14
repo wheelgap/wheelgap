@@ -183,10 +183,37 @@ def test_range_multiple_pythons_marker_excludes_incompatible_python(fake_pypi, t
     assert list(result.statuses.values()) == [Status.NOT_NEEDED, Status.WHEEL]
 
 
-@pytest.mark.parametrize("requirement", ["pythonranged", "pythonranged==2.0"])
-def test_range_multiple_pythons_keeps_names_and_pins(fake_pypi, capsys, tmp_path, monkeypatch, requirement):
+def test_range_multiple_pythons_keeps_bare_names(fake_pypi, capsys, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert main([requirement, "-p", "3.9,3.13", "-t", "linux", "--json"]) == 0
+    assert main(["pythonranged", "-p", "3.9,3.13", "-t", "linux", "--json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["packages"]
+    assert row["version"] == "2.0" and set(row["results"].values()) == {"wheel"}
+    assert len(fake_pypi) == 1
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_pin_multiple_pythons_resolves_per_python(fake_pypi, fake_simple, capsys, tmp_path, monkeypatch, simple):
+    monkeypatch.chdir(tmp_path)
+    args = ["--index-url", "https://private.example/simple"] if simple else []
+    assert main(["pythonranged==2.0", "-p", "3.9,3.13", "-t", "linux", "--json", "--explain", *args]) == 1
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    assert len(rows) == 2
+    for row in rows:
+        assert row["version"] == "2.0"
+    missing = next(r for r in rows if r["results"]["3.9 linux-x86_64"] == "missing")
+    wheel = next(r for r in rows if r["results"]["3.13 linux-x86_64"] == "wheel")
+    assert missing["results"] == {"3.9 linux-x86_64": "missing", "3.13 linux-x86_64": "n/a"}
+    assert missing["rejected"] == {
+        "3.9 linux-x86_64": [{"file": "pythonranged-2.0-py3-none-any.whl", "reason": "requires Python >=3.10"}]
+    }
+    assert wheel["results"] == {"3.9 linux-x86_64": "n/a", "3.13 linux-x86_64": "wheel"}
+    assert wheel["rejected"] == {}
+    assert len(fake_simple.calls if simple else fake_pypi) == 1
+
+
+def test_pin_multiple_pythons_coalesces_when_both_pythons_satisfy(fake_pypi, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["pythonranged==2.0", "-p", "3.11,3.13", "-t", "linux", "--json"]) == 0
     (row,) = json.loads(capsys.readouterr().out)["packages"]
     assert row["version"] == "2.0" and set(row["results"].values()) == {"wheel"}
     assert len(fake_pypi) == 1
@@ -326,10 +353,65 @@ def test_range_requires_python_mirror_fallback(monkeypatch, python, expected):
         assert not pkg.error and pkg.files == ["x-2.0.tar.gz"]
 
 
-@pytest.mark.parametrize("version", [None, "2.0"])
-def test_range_requires_python_keeps_bare_names_and_pins_unchanged(fake_pypi, version):
-    pkg = pypi.fill(Package("pythonranged", version), python="3.9")
+def test_range_requires_python_keeps_bare_names_unchanged(fake_pypi):
+    pkg = pypi.fill(Package("pythonranged", None), python="3.9")
+    assert pkg.version == "2.0" and not pkg.error and pkg.files == ["pythonranged-2.0-py3-none-any.whl"]
+
+
+def test_pin_requires_python_drops_incompatible_files(fake_pypi):
+    pkg = pypi.fill(Package("pythonranged", "2.0"), python="3.9")
     assert pkg.version == "2.0" and not pkg.error
+    assert pkg.files == []
+    assert pkg.requires_python_rejected == {"pythonranged-2.0-py3-none-any.whl": "requires Python >=3.10"}
+
+
+def test_pin_with_no_metadata_is_unrestricted(fake_pypi, capsys, tmp_path, monkeypatch):
+    pkg = pypi.fill(Package("purewheel", "3.1"), python="3.9")
+    assert pkg.version == "3.1" and not pkg.error and pkg.files == ["purewheel-3.1-py3-none-any.whl"]
+    assert pkg.requires_python_rejected == {}
+    monkeypatch.chdir(tmp_path)
+    assert main(["purewheel==3.1", "-p", "3.9", "-t", "linux", "--json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["packages"]
+    assert row["results"] == {"linux-x86_64": "wheel"}
+
+
+def test_pin_requires_python_cli_missing_and_explain(fake_pypi, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["pythonranged==2.0", "-p", "3.9", "-t", "linux-x86_64", "--explain"]) == 1
+    out = capsys.readouterr().out
+    assert "pythonranged 2.0 on linux-x86_64: ✗ missing" in out
+    assert "pythonranged-2.0-py3-none-any.whl  requires Python >=3.10" in out
+    assert main(["pythonranged==2.0", "-p", "3.9", "-t", "linux-x86_64", "--json", "--explain"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    pkg = data["packages"][0]
+    assert pkg["results"] == {"linux-x86_64": "missing"}
+    assert pkg["rejected"] == {
+        "linux-x86_64": [{"file": "pythonranged-2.0-py3-none-any.whl", "reason": "requires Python >=3.10"}]
+    }
+
+
+def test_pin_multiple_pythons_lockfile_api(fake_pypi, tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("pythonranged==2.0\n", encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.9,3.13", platforms="linux")
+    results = wheelgap.check_lockfile(path, targets)
+    assert len(results) == 2
+    missing = next(r for r in results if r.statuses[targets[0]] is Status.MISSING)
+    wheel = next(r for r in results if r.statuses[targets[1]] is Status.WHEEL)
+    assert missing.rejected[targets[0]] == [("pythonranged-2.0-py3-none-any.whl", "requires Python >=3.10")]
+    assert missing.reasons[targets[0]] == "pythonranged-2.0-py3-none-any.whl  requires Python >=3.10"
+    assert wheel.ok
+
+
+def test_pin_requires_python_read_from_cache(fake_pypi, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["pythonranged==2.0", "-p", "3.13", "-t", "linux"]) == 0
+    assert len(fake_pypi) == 1
+    assert main(["pythonranged==2.0", "-p", "3.9", "-t", "linux", "--explain"]) == 1
+    assert len(fake_pypi) == 1
+    out = capsys.readouterr().out
+    assert "pythonranged 2.0 on linux-x86_64: ✗ missing" in out
+    assert "pythonranged-2.0-py3-none-any.whl  requires Python >=3.10" in out
 
 
 @pytest.mark.parametrize("python,expected", [("3.9", "3.9"), ("3.13,3.13t", "3.13"), ("3.9,3.13", None)])

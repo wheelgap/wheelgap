@@ -21,7 +21,8 @@ Version ranges such as `numpy>=1.26,<2` use the newest matching release with a n
 `Requires-Python` permits the selected Python. With several `-p` versions, each Python major/minor selects its own
 release from one index response. Regular and free-threaded builds of the same Python share release selection, but
 each still checks its own wheel tags. Missing or invalid `Requires-Python` metadata is treated as unrestricted.
-Exact pins and bare package names keep their existing behavior. This applies to both the PyPI JSON API and
+Exact pins drop files whose `Requires-Python` excludes the selected Python, resolving per Python as ranges do.
+Bare package names keep their existing behavior. This applies to both the PyPI JSON API and
 `--index-url` simple indexes.
 
 Distinct resolutions appear as separate rows in text, Markdown and JSON, each with its selected version and only
@@ -56,10 +57,10 @@ still checked, so a possible gap is reported rather than hidden. See
 ## Cache
 
 Lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're
-kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and
-`%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags, named by a hash of the
-index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the
-folder and its entries readable by you only.
+kept in `wheelgap/pinned-v2` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and
+`%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names, yanked flags and Requires-Python constraints,
+named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap
+creates the folder and its entries readable by you only.
 
 `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor
 saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache`

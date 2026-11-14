@@ -42,7 +42,7 @@ def cache_dir() -> Path:
     else:
         xdg = os.environ.get("XDG_CACHE_HOME", "")
         base = xdg if os.path.isabs(xdg) else str(Path.home() / ".cache")  # the XDG spec ignores relative paths
-    return Path(base) / "wheelgap" / "pinned-v1"
+    return Path(base) / "wheelgap" / "pinned-v2"
 
 
 def _path(index: str, name: str, version: str) -> Path:
@@ -75,9 +75,9 @@ def load_files(index: str, name: str, version: str) -> list[dict] | None:
 
 
 def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
-    """Store a pinned release's file list. Only `filename` and `yanked` are kept: they're all fill() reads,
-    and a file's URL (which a private mirror may sign) never reaches the disk."""
-    kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
+    """Store a pinned release's file list. Only `filename`, `yanked` and `requires_python` are kept: they're all
+    fill() reads, and a file's URL (which a private mirror may sign) never reaches the disk."""
+    kept = [{k: f[k] for k in ("filename", "yanked", "requires_python") if k in f} for f in files]
     _save(index, name, version, "files", kept)
 
 
