@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Python API: when Pyodide locks bundle different versions for different Python releases, `Result.bundled_versions` reports the version for each Python instead of choosing whichever lock came first. The existing `bundled_version` remains available when all locks agree. (#341, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
+- Python API: when Pyodide locks bundle different versions for different Python releases, `Result.bundled_versions` reports the version for each Python instead of choosing whichever lock came first. The existing `bundled_version` remains available when all locks agree; when they disagree it is now `None` (it used to be the first lock's), and `to_dict()` leaves out `"bundled"`. (#341, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 - `--dockerfile` now says `ARG PY has an empty default, pass -p/-t instead` for an `ARG PY=` that the final image's `FROM` uses, instead of claiming the syntax is wrong, and reports an ARG value with a non-ASCII character (such as the no-break space Docker splits an ARG on) as unreadable, instead of reading it as one value and failing later with `invalid tag`. (#335, thanks [@bfs2021](https://github.com/bfs2021))
 
 ## 0.10.0 (2026-11-15)
