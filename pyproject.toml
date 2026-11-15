@@ -34,7 +34,7 @@ wheelgap = "wheelgap.cli:main"
 wheelgap-mcp = "wheelgap.mcp:main"
 
 [dependency-groups]
-dev = ["mypy>=1.13", "pytest>=8", "pyyaml>=6.0.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_full_version >= '3.12'", "ruff>=0.8"]
+dev = ["mypy>=1.13", "pip==26.3", "pytest>=8", "pyyaml>=6.0.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_full_version >= '3.12'", "ruff>=0.8"]
 docs = ["mkdocs-material>=9.7"]
 
 [build-system]
