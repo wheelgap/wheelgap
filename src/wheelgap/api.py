@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import sys
 import sysconfig
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
+from types import MappingProxyType
+from typing import ClassVar
 
 from .check import Row, Status, check, explain, explain_lines, status_for, wheel_tags
 from .offline import require_offline
@@ -89,7 +91,8 @@ class Result:
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
     no_binary: bool = False
     only_binary: bool = False
-    _resolutions: dict[str, Package] = field(default_factory=dict, repr=False, compare=False)
+    # _result installs per-instance data; the immutable default is not a public dataclass field.
+    _resolutions: ClassVar[Mapping[str, Package]] = MappingProxyType({})
     # Each applicable Pyodide lock may ship a different version for its Python.
     bundled_versions: dict[str, str] = field(default_factory=dict)
 
@@ -187,7 +190,7 @@ def _result(
     unique_versions = set(bundled_versions.values())
     shared_version = next(iter(unique_versions)) if len(unique_versions) == 1 else None
     via = via or {}
-    return Result(
+    result = Result(
         pkg.name,
         pkg.version,
         statuses,
@@ -203,9 +206,10 @@ def _result(
         {f: why for variant in pkg.variants for f, why in variant.requires_python_rejected.items()},
         pkg.no_binary,
         pkg.only_binary,
-        pkg.resolutions,
         bundled_versions=bundled_versions,
     )
+    object.__setattr__(result, "_resolutions", pkg.resolutions)
+    return result
 
 
 def _package_targets(targets: Sequence[Target] | None) -> list[Target]:

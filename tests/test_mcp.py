@@ -263,6 +263,39 @@ def test_check_lockfile_lists_skipped_packages(fake_pypi, fixtures):
     assert {s["name"]: s["reason"] for s in data["skipped"]} == {"demo": "editable", "gitdep": "git"}
 
 
+@pytest.mark.parametrize("environment", [None, "default", "test"])
+def test_check_lockfile_pixi_environment(fake_pypi, fixtures, environment):
+    args = {} if environment is None else {"environment": environment}
+    (_, reply) = run(
+        init(),
+        call("check_lockfile", path=str(fixtures / "pixiproj"), python="3.13", targets=["linux-x86_64"], **args),
+    )
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    if environment == "test":
+        assert data["packages"] == 1
+        assert {g["name"]: g["results"] for g in data["gaps"]} == {"nowheels": {"3.13 linux-x86_64": "source"}}
+        assert fake_pypi == ["https://pypi.org/pypi/nowheels/0.9/json"]
+    else:
+        assert data["packages"] == 2 and data["gaps"] == []
+
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        ("docs", "no environment 'docs' (it has: default, test)"),
+        ("", "--environment needs a name"),
+        (42, "'environment' must be a string"),
+        (["test"], "'environment' must be a string"),
+    ],
+)
+def test_check_lockfile_pixi_environment_errors(fake_pypi, fixtures, environment, message):
+    (_, reply) = run(init(), call("check_lockfile", path=str(fixtures / "pixiproj"), environment=environment))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
 def test_check_lockfile_uses_project_config_and_arguments_win(fake_pypi, fixtures):
     path = str(fixtures / "configproj")
     (_, configured, explicit) = run(

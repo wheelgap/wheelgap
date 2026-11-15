@@ -1094,6 +1094,8 @@ def render_markdown(
     notes: RowNotes | None = None,
     build_info: dict[int, BuildInfo] | None = None,
     builds: RowBuilds | None = None,
+    *,
+    suggestions: Suggestions | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1159,6 +1161,20 @@ def render_markdown(
         lines = render_explain(gaps, targets, plain, conda_forge, notes, build_info, builds=builds)
         fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
         out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
+        if suggestions:
+            multi_py = len({t.python for t in targets}) > 1
+            sug_lines = []
+            for r in gaps:
+                if (found := suggestions.get(id(r.package))) is not None:
+                    g = gap_targets(r, targets)
+                    sug_lines += [
+                        f"- {_md(ln)}"
+                        for ln in release_suggest.suggest_lines(
+                            r.package.name, r.package.version or "?", g, found, multi_py
+                        )
+                    ]
+            if sug_lines:
+                out += [*sug_lines, ""]
     return out
 
 
@@ -1454,8 +1470,6 @@ def _main(argv: list[str]) -> int:
         parser.error("--conda-forge only adds to --explain; pass --explain too")
     if args.suggest and not args.explain:
         parser.error("--suggest only adds to --explain; pass --explain too")
-    if args.suggest and args.markdown:
-        parser.error("--suggest has no Markdown form yet (use --json, or the text output)")
     if args.notes and not args.explain:
         parser.error("--notes only adds to --explain; pass --explain too")
     try:
@@ -1892,6 +1906,7 @@ def _main(argv: list[str]) -> int:
                     row_notes,
                     build_info,
                     row_builds,
+                    suggestions=suggestions,
                 )
             )
         )

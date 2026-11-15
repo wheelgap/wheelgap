@@ -219,6 +219,10 @@ TOOLS: list[dict[str, Any]] = [
                     "path is looked for in the client's roots if it shares them, else in the server's working "
                     "directory).",
                 },
+                "environment": {
+                    "type": "string",
+                    "description": "The pixi.lock environment to check. Default: default. Only for pixi.lock inputs.",
+                },
                 "python": _PYTHON_PROP
                 | {
                     "description": _PYTHON_PROP["description"] + " Default: [tool.wheelgap] python, then "
@@ -441,9 +445,12 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     offline = args.get("offline")
     if offline is not None and not isinstance(offline, bool):
         raise ToolError("'offline' must be true or false")
+    environment = _string(args, "environment")
     path = _existing(raw)
     # --name=value forms, and -- before the path, so no value can be read as another option.
     argv = ["--json"]
+    if environment is not None:
+        argv.append(f"--environment={environment}")
     argv += [f"--python={p}" for p in _pythons(args)]
     argv += [f"--target={p}" for p in _platforms(args)]
     argv += [f"--{key}={value}" for key, value in _versions(args).items()]

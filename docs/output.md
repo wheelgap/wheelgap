@@ -282,7 +282,7 @@ left out (so the object can be empty). The key is left out for a package with no
 requirements file's `--no-binary` covers, a package that wasn't looked up (its index isn't known to be PyPI, or the run
 uses `--index-url` or `WHEELGAP_INDEX_URL`), and a failed or dropped lookup (a note on stderr says so). Like the other
 hints, it never changes a status, the summary or the exit code. Quiet text output can't show it (quiet can't be combined
-with `--explain`), and `--markdown --suggest` is an error for now.
+with `--explain`). After 0.10.0, with `--markdown --explain --suggest`, suggestions render as a list under the collapsed explanation details.
 
 ## --json {#json}
 

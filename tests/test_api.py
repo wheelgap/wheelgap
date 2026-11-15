@@ -1,6 +1,7 @@
 import json
 import re
-from dataclasses import replace
+from dataclasses import asdict, fields, replace
+from inspect import signature
 
 import pytest
 
@@ -107,6 +108,14 @@ def test_check_packages_mixes_names_and_pins(fake_pypi):
     assert by_name["does-not-exist"].statuses[targets[0]] is Status.UNKNOWN
 
 
+def test_result_keeps_resolution_details_out_of_public_dataclass_interface():
+    assert "_resolutions" not in signature(wheelgap.Result).parameters
+    result = wheelgap.Result("x", "1.0")
+    assert "_resolutions" not in {f.name for f in fields(result)}
+    assert "_resolutions" not in asdict(result)
+    assert result.rejected == {} and result.reasons == {}
+
+
 @pytest.mark.parametrize("check_one", [False, True])
 def test_package_pin_respects_requires_python_per_target(fake_pypi, check_one):
     old, new = wheelgap.make_targets(python="3.9,3.13", platforms="linux-x86_64")
@@ -124,6 +133,8 @@ def test_package_pin_respects_requires_python_per_target(fake_pypi, check_one):
     assert result.to_dict(explain=True)["rejected"] == {
         old.label(True): [{"file": f, "reason": why} for f, why in rejected]
     }
+    # asdict cannot serialize dataclass Target keys; omit that public mapping for this check.
+    assert "_resolutions" not in asdict(replace(result, statuses={}))
     assert fake_pypi == ["https://pypi.org/pypi/pythonranged/2.0/json"]
 
 

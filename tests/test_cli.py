@@ -1212,6 +1212,39 @@ def test_markdown_all_explain_and_quiet(capsys, fake_pypi, tmp_path, monkeypatch
     assert "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl" in out
 
 
+def test_markdown_explain_suggest(capsys, fake_pypi):
+    code, out, _ = run(
+        capsys,
+        "laggard==1.0",
+        "-t",
+        "win-amd64,musl-x86_64,musl-aarch64,linux-riscv64",
+        "-p",
+        "3.13",
+        "--markdown",
+        "--explain",
+        "--suggest",
+    )
+    assert code == 1
+    assert "<details><summary>Why (rejected wheels)</summary>" in out
+    assert "- laggard 1.0 -\\> 1.2 has wheels for win-amd64, musl-x86\\_64, musl-aarch64" in out
+    assert "- laggard 1.0: no newer release has a wheel for linux-riscv64" in out
+
+    code, out, _ = run(
+        capsys,
+        "wheellost==1.0",
+        "-t",
+        "linux-x86_64,win-amd64,linux-riscv64",
+        "-p",
+        "3.13",
+        "--markdown",
+        "--explain",
+        "--suggest",
+    )
+    assert code == 1
+    assert "- wheellost 1.0: no newer release has a wheel for linux-riscv64" in out
+    assert "- wheellost 1.0: no newer release has a wheel for win-amd64 without losing one elsewhere" in out
+
+
 def test_markdown_clean_run(capsys, fake_pypi):
     code, out, _ = run(
         capsys, "purewheel==3.1", "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--markdown", "--exit-zero"

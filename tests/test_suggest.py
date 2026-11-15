@@ -359,14 +359,10 @@ def test_other_index_runs_look_nothing_up(capsys, fake_pypi, fake_simple, monkey
     assert "another index (WHEELGAP_INDEX_URL)" in err
 
 
-def test_needs_explain_and_no_markdown(capsys):
-    for args, message in (
-        (["laggard==1.0", "--suggest"], "--suggest only adds to --explain; pass --explain too"),
-        (["laggard==1.0", "--explain", "--suggest", "--markdown"], "--suggest has no Markdown form yet"),
-    ):
-        with pytest.raises(SystemExit) as e:
-            main(args)
-        assert e.value.code == 2 and message in capsys.readouterr().err
+def test_needs_explain(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["laggard==1.0", "--suggest"])
+    assert e.value.code == 2 and "--suggest only adds to --explain; pass --explain too" in capsys.readouterr().err
 
 
 def test_offline_refuses_it(capsys, fake_pypi, fixtures, tmp_path):
