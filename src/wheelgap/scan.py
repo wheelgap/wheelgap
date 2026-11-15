@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from .api import Result, check_packages
@@ -69,6 +73,48 @@ def scan(
     return check_packages([r["project"] for r in rows], targets, workers=workers, pyodide_locks=pyodide_locks)
 
 
+def _bundled_versions(result: Result, locks: Sequence[PyodideLock]) -> dict[str, str]:
+    """The version each lock that made one of the result's cells `bundled` ships, by the lock's Python."""
+    key = canonicalize_name(result.name)
+    return {
+        f"{lock.python[0]}.{lock.python[1]}": lock.packages[key]
+        for lock in locks
+        if key in lock.packages and any(s is Status.BUNDLED and lock.applies_to(t) for t, s in result.statuses.items())
+    }
+
+
+def _differs(bundled: str, version: str | None) -> bool:
+    """Whether Pyodide's version differs from the release the scan checked (by PEP 440, so 0.9 == 0.9.0)."""
+    if version is None:
+        return False
+    try:
+        return Version(bundled) != Version(version)
+    except InvalidVersion:
+        return bundled != version
+
+
+def _package_entry(
+    rank: int, row: dict, result: Result, targets: list[Target], locks: Sequence[PyodideLock] = ()
+) -> dict:
+    entry = {
+        "rank": rank,
+        "name": result.name,
+        "version": result.version,
+        "downloads": row.get("download_count"),
+        "pure": result.pure,
+        "error": result.error,
+        "results": [result.statuses[t].value for t in targets],
+    }
+    if bundled := _bundled_versions(result, locks):
+        # Locks for different Pythons often ship different versions (aiohttp 3.11.13 in one, 3.13.5 in the next), so
+        # bundled_versions gives each one; bundled_version is only set when they all agree, never one picked by order.
+        versions = set(bundled.values())
+        entry["bundled_version"] = versions.pop() if len(versions) == 1 else None
+        entry["bundled_versions"] = bundled
+        entry["bundled_version_differs"] = any(_differs(v, result.version) for v in bundled.values())
+    return entry
+
+
 def report(
     rows: list[dict],
     results: list[Result],
@@ -107,15 +153,7 @@ def report(
         "lookup_errors": sum(1 for r in results if r.error),
         "summary": summarise(results, targets),
         "packages": [
-            {
-                "rank": rank,
-                "name": r.name,
-                "version": r.version,
-                "downloads": row.get("download_count"),
-                "pure": r.pure,
-                "error": r.error,
-                "results": [r.statuses[t].value for t in targets],
-            }
+            _package_entry(rank, row, r, targets, pyodide_locks)
             for rank, (row, r) in enumerate(zip(rows, results, strict=True), start=1)
         ],
     }
@@ -128,6 +166,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from None
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def fraction(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number from 0 to 1") from None
+    if not math.isfinite(number) or not 0 <= number <= 1:
+        raise argparse.ArgumentTypeError("must be a number from 0 to 1")
     return number
 
 
@@ -149,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--max-error-rate",
-        type=float,
+        type=fraction,
         default=0.05,
         metavar="FRACTION",
         help="exit 1 without writing if more than this share of lookups fail (default: 0.05)",

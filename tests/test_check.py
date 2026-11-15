@@ -48,7 +48,7 @@ def graph(edges, root_edges=(), root_groups=None, roots=(0,)):
     packages = [Package(n, "1", files=[f"{n}-1.tar.gz"]) for n in names]
     for i in roots:
         packages[i].skip = "editable"
-    deps = {names.index(n): [(d, None, m) for d, m in out] for n, out in edges.items()}
+    deps = {names.index(n): [(d, None, m, None) for d, m in out] for n, out in edges.items()}
     return Source(
         "uv.lock", packages, edges=deps, roots=list(roots), root_edges=list(root_edges), root_groups=root_groups or {}
     )
@@ -84,7 +84,9 @@ def test_via_differs_per_target():
 
 def test_via_from_dependency_group():
     src = graph(
-        {"root": [], "tool": [("dep", None)], "dep": []}, root_edges=[("tool", None, None)], root_groups={0: "dev"}
+        {"root": [], "tool": [("dep", None)], "dep": []},
+        root_edges=[("tool", None, None, None)],
+        root_groups={0: "dev"},
     )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "tool") == {t: ["(dev group)", "tool"]}
@@ -92,7 +94,7 @@ def test_via_from_dependency_group():
 
 
 def test_via_from_plain_requirement():
-    src = graph({"req": []}, root_edges=[("req", None, None)], roots=())
+    src = graph({"req": []}, root_edges=[("req", None, None, None)], roots=())
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "req") == {t: ["req"]}
 
@@ -113,12 +115,77 @@ def test_uv_version_disambiguation():
             Package("np", "1.0", files=["np-1.0.tar.gz"]),
             Package("np", "2.0", files=["np-2.0-py3-none-any.whl"]),
         ],
-        edges={0: [("np", "1.0", "python_version < '3.10'"), ("np", "2.0", "python_version >= '3.10'")], 1: [], 2: []},
+        edges={
+            0: [("np", "1.0", "python_version < '3.10'", None), ("np", "2.0", "python_version >= '3.10'", None)],
+            1: [],
+            2: [],
+        },
         roots=[0],
     )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     rows = check([src], [t])
     assert [(r.package.version, r.results[t].value) for r in rows] == [("1.0", "n/a"), ("2.0", "wheel")]
+
+
+def test_uv_source_disambiguation(tmp_path):
+    cpu = "https://download.pytorch.org/whl/cpu"
+    pypi = "https://pypi.org/simple"
+    cpu_whl = "torch-2.5.1-cp313-cp313-manylinux_2_17_x86_64.whl"
+    mac_whl = "torch-2.5.1-cp313-none-macosx_11_0_arm64.whl"
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [
+    {{ name = "linux-helper" }},
+    {{ name = "mac-helper" }},
+]
+
+[[package]]
+name = "linux-helper"
+version = "1.0"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/linux_helper-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{cpu}" }}, marker = "sys_platform == 'linux'" }},
+]
+
+[[package]]
+name = "mac-helper"
+version = "1.0"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/mac_helper-1.0-py3-none-any.whl", hash = "sha256:00" }}]
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{pypi}" }}, marker = "sys_platform == 'darwin'" }},
+]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{cpu}" }}
+wheels = [{{ url = "{cpu}/{cpu_whl}", hash = "sha256:00" }}]
+
+[[package]]
+name = "torch"
+version = "2.5.1"
+source = {{ registry = "{pypi}" }}
+wheels = [{{ url = "https://files.pythonhosted.org/packages/{mac_whl}", hash = "sha256:00" }}]
+""",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    lin, mac = build_targets(["3.13"], ["linux-x86_64", "macos-arm64"])
+    rows = [r for r in check([src], [lin, mac]) if r.package.name == "torch"]
+    assert [(r.package.registry, r.results[lin].value, r.results[mac].value) for r in rows] == [
+        (cpu, "wheel", "n/a"),
+        (pypi, "n/a", "wheel"),
+    ]
+    assert rows[0].via == {lin: ["app", "linux-helper", "torch"]}
+    assert rows[1].via == {mac: ["app", "mac-helper", "torch"]}
 
 
 def test_markers_on_packages(fixtures):
@@ -180,7 +247,9 @@ def test_pyodide_sdist_only_is_missing():
 
 def test_via_prefers_the_projects_own_dependency_over_a_group():
     # numpy is a runtime dependency of the project and also listed in the dev group.
-    src = graph({"app": [("numpy", None)], "numpy": []}, root_edges=[("numpy", None, None)], root_groups={0: "dev"})
+    src = graph(
+        {"app": [("numpy", None)], "numpy": []}, root_edges=[("numpy", None, None, None)], root_groups={0: "dev"}
+    )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "numpy") == {t: ["app", "numpy"]}
 
@@ -188,7 +257,7 @@ def test_via_prefers_the_projects_own_dependency_over_a_group():
 def test_via_prefers_a_plain_requirement_over_a_group():
     src = graph(
         {"a": [("c", None)], "b": [("c", None)], "c": []},
-        root_edges=[("a", None, None), ("b", None, None)],
+        root_edges=[("a", None, None, None), ("b", None, None, None)],
         root_groups={0: "dev"},
         roots=(),
     )
@@ -323,3 +392,72 @@ def test_mobile_explain_reasons_and_sdists():
     )
     # Mobile installs can't build sdists, so an sdist alone is "can't install", not "from source".
     assert status_for(["x-1.0.tar.gz"], ios) is Status.MISSING
+
+
+def test_python_full_version_and_implementation_version_markers():
+    from packaging._parser import parse_marker as _parse
+
+    from wheelgap.check import _atom
+
+    (lin313,) = build_targets(["3.13"], ["linux-x86_64"])
+    (win313,) = build_targets(["3.13"], ["win-x86_64"])
+
+    # Patch-dependent comparisons on the target minor version are unknown (never hide).
+    assert _atom(_parse("python_full_version >= '3.13.2'")[0], lin313) is None
+    assert _atom(_parse("python_full_version > '3.13.0'")[0], lin313) is None
+    assert _atom(_parse("python_full_version == '3.13.1'")[0], lin313) is None
+    assert _atom(_parse("python_full_version != '3.13.1'")[0], lin313) is None
+    assert _atom(_parse("python_full_version in '3.13.1 3.13.2'")[0], lin313) is None
+    assert _atom(_parse("implementation_version >= '3.13.2'")[0], lin313) is None
+    assert _atom(_parse("python_full_version != '3.13.0'")[0], lin313) is None
+    assert _atom(_parse("'3.13.2' <= python_full_version")[0], lin313) is None
+    assert _atom(_parse("python_full_version < '3.13.1rc1'")[0], lin313) is None
+    # A patch named however the value writes it: a wildcard, a v prefix, an epoch, another separator
+    assert _atom(_parse("python_full_version == '3.13.1.*'")[0], lin313) is None
+    assert _atom(_parse("python_full_version == 'v3.13.2'")[0], lin313) is None
+    assert _atom(_parse("python_full_version == '0!3.13.2'")[0], lin313) is None
+    assert _atom(_parse("python_full_version in '3.13.1;3.13.2'")[0], lin313) is None
+
+    # Comparisons that agree across every X.Y.* patch release still decide True/False.
+    assert _atom(_parse("python_full_version >= '3.13.0'")[0], lin313) is True
+    assert _atom(_parse("python_full_version >= '3.13.0rc1'")[0], lin313) is True
+    assert _atom(_parse("python_full_version == '3.14.1.*'")[0], lin313) is False
+    assert _atom(_parse("python_full_version == '3.13.*'")[0], lin313) is True
+    assert _atom(_parse("python_full_version < '3.14.0'")[0], lin313) is True
+    assert _atom(_parse("python_full_version < '3.13.0'")[0], lin313) is False
+    assert _atom(_parse("python_full_version >= '3.14.0'")[0], lin313) is False
+    assert _atom(_parse("python_full_version == '3.14.1'")[0], lin313) is False
+    assert _atom(_parse("implementation_version < '3.13.0'")[0], lin313) is False
+
+    # Three-valued logic keeps unknown patch-gated packages reachable unless another term is False.
+    assert marker_holds("python_full_version >= '3.13.2'", lin313)
+    assert marker_holds("python_full_version >= '3.13.2' and sys_platform == 'win32'", win313)
+    assert not marker_holds("python_full_version >= '3.13.2' and sys_platform == 'win32'", lin313)
+    assert marker_holds("extra == 'api' and python_full_version >= '3.13.2'", lin313, extras=frozenset({"api"}))
+    assert not marker_holds("extra == 'api' and python_full_version >= '3.13.2'", lin313, extras=frozenset({"other"}))
+
+
+def test_status_for_and_explain_with_format_control():
+    from wheelgap.check import explain, explain_lines
+
+    (lin,) = build_targets(["3.13"], ["linux-x86_64"])
+    (win,) = build_targets(["3.13"], ["win-amd64"])
+    files = ["fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "fastlib-2.0.0.tar.gz"]
+
+    assert status_for(files, lin, no_binary=True) is Status.SOURCE
+    assert status_for([files[0]], lin, no_binary=True) is Status.MISSING
+    assert status_for(files, win, only_binary=True) is Status.MISSING
+    assert status_for(files, lin, only_binary=True) is Status.WHEEL
+
+    # With a live wheel and a yanked sdist, --no-binary falls back to the yanked sdist.
+    yanked_sdist = frozenset({"fastlib-2.0.0.tar.gz"})
+    assert status_for(files, lin, yanked=yanked_sdist, no_binary=True) is Status.SOURCE
+
+    assert explain(files, lin, no_binary=True) == [
+        ("fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "ignored (--no-binary)")
+    ]
+    assert explain_lines(files, lin, no_binary=True) == [
+        "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl  ignored (--no-binary)"
+    ]
+    lines_only_bin = explain_lines(files, win, only_binary=True)
+    assert any("--only-binary forbids building from source" in line for line in lines_only_bin)

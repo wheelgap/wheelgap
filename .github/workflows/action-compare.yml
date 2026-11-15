@@ -1,0 +1,98 @@
+name: Action compare-to
+
+# Runs the GitHub Action's compare-to mode (#201) against the two fixture lockfiles in tests/fixtures/actioncompare
+# and checks the report it writes to the job summary. The fixtures are uv.lock files that list every wheel, for a
+# Python inside their requires-python, so wheelgap diff looks nothing up (tests/test_action_compare.py checks that);
+# diff has no --offline flag to enforce it. The Action itself still installs wheelgap with pipx.
+# The token stays read-only, so this never posts a comment: tests/test_action_step.py runs the step's comment logic
+# against a stub gh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # compare-to: base on wheelgap's own uv.lock, from a shallow checkout, so the base commit is fetched. Its result
+      # depends on what the pull request does to uv.lock (and pipx needs PyPI), so it doesn't fail the job; the next
+      # step checks that it got past the merge-commit check and the fetch to a report.
+      - name: wheelgap's uv.lock against the base branch
+        id: dogfood
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: ./
+        with:
+          args: uv.lock -p 3.11,3.14,3.14t -t all
+          compare-to: base
+
+      - name: Check that it compared
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          REPORT: ${{ steps.dogfood.outputs.report }}
+        run: |
+          set -eu
+          [ -n "$REPORT" ] && grep -qF 'with the base branch (<code>' "$REPORT"
+
+      - name: Commit the base fixture
+        id: base
+        shell: bash
+        run: |
+          mkdir action-compare-test
+          cp tests/fixtures/actioncompare/base/uv.lock action-compare-test/uv.lock
+          git add action-compare-test/uv.lock
+          git -c user.name=ci -c user.email=ci@example.invalid commit --quiet --no-verify -m "base fixture"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cp tests/fixtures/actioncompare/head/uv.lock action-compare-test/uv.lock
+
+      - name: A bump that drops a platform
+        id: worse
+        continue-on-error: true
+        uses: ./
+        with:
+          args: action-compare-test/uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
+          compare-to: ${{ steps.base.outputs.sha }}
+
+      - name: Check that it failed and what the summary says
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.worse.outcome }}
+          REPORT: ${{ steps.worse.outputs.report }}
+        run: |
+          set -eu
+          cat "$REPORT"
+          [ "$OUTCOME" = failure ] || { echo "::error::expected the step to fail, got $OUTCOME"; exit 1; }
+          grep -qF '1 package got worse, 1 new package has gaps.' "$REPORT"
+          grep -qF '<tr><td><code>armlib</code></td><td><code>1&#46;4&#46;0</code> → <code>1&#46;5&#46;0</code></td><td><code>musl-aarch64</code></td><td>✓ → ● source</td></tr>' "$REPORT"
+          grep -qF '<tr><td><code>nativeext</code></td><td>(new) <code>0&#46;3</code></td><td><code>musl-aarch64</code></td><td>(new) → ● source</td></tr>' "$REPORT"
+          [ "$(grep -c '^<tr><td>' "$REPORT")" = 3 ]
+          cp tests/fixtures/actioncompare/base/uv.lock action-compare-test/uv.lock
+
+      - name: Nothing got worse
+        id: same
+        uses: ./
+        with:
+          args: action-compare-test/uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
+          compare-to: ${{ steps.base.outputs.sha }}
+
+      - name: Check the summary
+        shell: bash
+        env:
+          REPORT: ${{ steps.same.outputs.report }}
+        run: |
+          set -eu
+          cat "$REPORT"
+          grep -qF 'Nothing got worse.' "$REPORT"
+          if grep -qF '<table>' "$REPORT"; then echo "::error::expected no table"; exit 1; fi

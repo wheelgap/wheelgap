@@ -1,0 +1,2 @@
+# Real lockfiles are byte-for-byte copies (#227): no line-ending conversion on checkout.
+tests/fixtures/real/** -text

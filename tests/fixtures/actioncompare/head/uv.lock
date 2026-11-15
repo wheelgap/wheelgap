@@ -1,0 +1,41 @@
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+# The pull request side of the GitHub Action's compare-to test (.github/workflows/action-compare.yml): the armlib bump
+# drops the musl aarch64 wheel (the Alpine ARM trap), and the new nativeext has only an sdist.
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "armlib" },
+    { name = "nativeext" },
+    { name = "purewheel" },
+]
+
+[[package]]
+name = "armlib"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/armlib-1.5.0.tar.gz", hash = "sha256:00", size = 1 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/armlib-1.5.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:00", size = 1 },
+    { url = "https://files.pythonhosted.org/packages/aa/armlib-1.5.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:00", size = 1 },
+    { url = "https://files.pythonhosted.org/packages/aa/armlib-1.5.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:00", size = 1 },
+]
+
+[[package]]
+name = "nativeext"
+version = "0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/nativeext-0.3.tar.gz", hash = "sha256:00", size = 1 }
+
+[[package]]
+name = "purewheel"
+version = "3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/purewheel-3.1.tar.gz", hash = "sha256:00", size = 1 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/purewheel-3.1-py3-none-any.whl", hash = "sha256:00", size = 1 },
+]

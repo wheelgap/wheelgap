@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urlparse
+from urllib.parse import ParseResult, unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -27,11 +28,16 @@ LOCKFILES = (
     "Pipfile.lock",
     "requirements.txt",
     "requirements.lock",
+    "pixi.lock",
 )
 
 
 class SourceError(ValueError):
     pass
+
+
+# A Poetry 2.x lock's extras for an extras selection: (every extra in its [extras] table, the ones selected), canonical.
+PoetryExtras = tuple[frozenset[str], frozenset[str]]
 
 
 @dataclass
@@ -55,14 +61,48 @@ class Package:
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
+    # uv.lock / pylock.toml: the sdist's URL and sha256, as the lock records them (for --build-info).
+    sdist_url: str | None = None
+    sdist_sha256: str | None = None
+    # This run found the package on pypi.org's JSON API (pypi.fill), so its name is public there.
+    found_on_pypi: bool = False
+    # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
+    # package is looked up on its index anyway, and skipped as a private index if it can't be.
+    partial_files: bool = False
+    # A range or pin resolved for several Python major.minors. Each value owns only that Python's eligible files.
+    # Identical resolutions share a Package, so reports can keep one row for them.
+    resolutions: dict[str, Package] = field(default_factory=dict)
+    # Files of a pinned release whose Requires-Python excludes the target Python, mapped to their --explain reason.
+    requires_python_rejected: dict[str, str] = field(default_factory=dict)
+    # pip requirements.txt --no-binary / --only-binary policy for this package.
+    no_binary: bool = False
+    only_binary: bool = False
 
     @property
     def key(self) -> str:
         return canonicalize_name(self.name)
 
+    @property
+    def variants(self) -> list[Package]:
+        """The input package and its resolved variants, retaining their source provenance."""
+        return list({id(p): p for p in (self, *self.resolutions.values())}.values())
 
-# A dependency edge in a lockfile graph: (name, version or None, marker or None)
-Edge = tuple[str, str | None, str | None]
+
+# PEP 508's package name. pip and uv can't install anything else, and the CLI prints names at the start of lines,
+# where a lockfile's `::error::...` would otherwise read as a workflow command in a GitHub Actions log.
+_NAME_RE = re.compile(r"[A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9]", re.IGNORECASE | re.ASCII)
+
+
+def package_name(path: Path, name: object) -> str:
+    """A lockfile's package name, or SourceError naming the file if it isn't a valid one."""
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        what = "has no name" if name is None else f"has the name {name!r}, which isn't a valid package name (PEP 508)"
+        raise SourceError(f"{path.name}: a package {what}")
+    return name
+
+
+# A dependency edge in a lockfile graph: (name, version or None, marker or None, source table or None)
+Edge = tuple[str, str | None, str | None, dict[str, object] | None]
 
 
 @dataclass(frozen=True)
@@ -109,8 +149,30 @@ class Source:
     # by the groups Poetry records on them.
     poetry_tables: list[dict] | None = None
     poetry_pyproject: Path | None = None
+    # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
+    poetry_lock_extras: list[str] = field(default_factory=list)
+    # poetry.lock after a selection: the note that says where extras couldn't leave packages out, because Poetry
+    # 2.0-2.2 may install them without the extra (see poetry_extras_decide and _poetry_extras_declared_elsewhere).
+    poetry_extras_unsure: str | None = None
+    # pdm.lock only: each package's `groups` list (None for a package that records none, as before PDM 2.x),
+    # kept so --group/--only-group/--no-dev can pick packages. None when the input isn't a pdm.lock.
+    pdm_groups: list[list[str] | None] | None = None
+    # pdm.lock only: its [metadata] groups (canonical; None if it has none), and whether its [metadata] strategy has
+    # inherit_metadata, without which PDM doesn't go by package groups.
+    pdm_locked_groups: list[str] | None = None
+    pdm_inherit_metadata: bool = False
+    pdm_pyproject: Path | None = None
     # poetry.lock after a group selection: the packages it left out, which were still read (for --ignore notes).
     unselected_keys: set[str] = field(default_factory=set)
+    # The file this source was read from (None for package names on the command line) and which reader read it
+    # (a key of READERS), for --github-annotations.
+    path: Path | None = None
+    kind: str | None = None
+    # The input names no index but PyPI, so a package this run found on pypi.org is a PyPI package (for --conda-forge,
+    # which sends only such names). False when unsure: lockfiles rely on each package's registry instead.
+    pypi_only: bool = False
+    # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
+    passed_over: Path | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -144,57 +206,133 @@ def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_on
     return list(dict.fromkeys(out))
 
 
-def _filename(entry: dict) -> str | None:
+def _filename(entry: dict, origin: str, package: str) -> str | None:
+    url = entry.get("url")
+    parts: ParseResult | None = None
+    if isinstance(url, str):
+        # A lock URL that `urlparse` can't read (an unclosed IPv6 bracket) or whose host holds a space is a
+        # broken lock, even when the entry also records a file name: name the file and the package instead of
+        # letting ValueError escape. The URL isn't echoed back, since it may carry credentials.
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            pass
+        if parts is None or any(c.isspace() for c in parts.netloc.rpartition("@")[2]):
+            raise SourceError(f"{origin}: package {package} has a file URL that can't be parsed")
     for k in ("filename", "file", "name"):
         if isinstance(entry.get(k), str) and entry[k].endswith((".whl", ".tar.gz", ".zip", ".tar.bz2", ".tgz")):
             return entry[k]
-    url = entry.get("url")
-    if isinstance(url, str):
-        return unquote(Path(urlparse(url).path).name)
+    if parts is not None:
+        return unquote(Path(parts.path).name)
     path = entry.get("path")
     if isinstance(path, str):
         return Path(path).name
     return None
 
 
-def _uv_edges(p: dict) -> list[Edge]:
-    groups = [p.get("dependencies", [])]
+def _sdist_source(entry: object, hash_key: str) -> tuple[str | None, str | None]:
+    """(URL, sha256) of a uv.lock sdist (hash = "sha256:...") or a pylock.toml one (hashes = {sha256 = ...})."""
+    if not isinstance(entry, dict):
+        return None, None
+    url, digest = entry.get("url"), entry.get(hash_key)
+    if isinstance(digest, dict):
+        digest = digest.get("sha256")
+    elif isinstance(digest, str) and digest.startswith("sha256:"):
+        digest = digest.removeprefix("sha256:")
+    else:
+        digest = None
+    if not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest)):
+        digest = None
+    return (url if isinstance(url, str) else None), (digest.lower() if digest else None)
+
+
+def _uv_edge(path: Path, owner: str, d: object) -> Edge:
+    """One uv.lock dependency edge. A field of the wrong type (`marker = 5`) crashes later, inside `packaging`, so
+    it's a SourceError here, next to the file. `owner` says whose edge it is: "package a" or "the manifest"."""
+    if not isinstance(d, dict):
+        raise SourceError(f"{path.name}: {owner} has a dependency that isn't a table")
+    if "name" not in d:
+        raise SourceError(f"{path.name}: {owner} has a dependency without a `name`")
+    if not isinstance(d["name"], str):
+        raise SourceError(f"{path.name}: {owner} has a dependency with a `name` that isn't a string")
+    for what in ("version", "marker"):
+        value = d.get(what)
+        if value is not None and not isinstance(value, str):
+            raise SourceError(
+                f"{path.name}: {owner} has a dependency {d['name']!r} with a `{what}` that isn't a string"
+            )
+    # uv writes the extras an edge asks for as a list. A plain string would be read as its characters.
+    for what in ("extra", "extras"):
+        extra = d.get(what)
+        if extra is not None and not (isinstance(extra, list) and all(isinstance(e, str) for e in extra)):
+            raise SourceError(
+                f"{path.name}: {owner} has a dependency {d['name']!r} with an `{what}` that isn't a list of strings"
+            )
+    edge_source = d.get("source")
+    if edge_source is not None and not isinstance(edge_source, dict):
+        raise SourceError(f"{path.name}: {owner} has a dependency {d['name']!r} with a `source` that isn't a table")
+    return (d["name"], d.get("version"), d.get("marker"), edge_source)
+
+
+def _uv_edges(path: Path, p: dict) -> list[Edge]:
+    """A uv.lock package's dependency edges, from `dependencies` and the two tables of groups."""
+    owner = f"package {p.get('name')}"
+    groups: list[object] = [p.get("dependencies", [])]
     for table in ("optional-dependencies", "dev-dependencies"):
-        groups.extend(p.get(table, {}).values())
-    return [(d["name"], d.get("version"), d.get("marker")) for g in groups for d in g]
+        value = p.get(table, {})
+        if not isinstance(value, dict):
+            raise SourceError(f"{path.name}: {owner} has a `{table}` that isn't a table of groups")
+        groups.extend(value.values())
+    out: list[Edge] = []
+    for group in groups:
+        if not isinstance(group, list):
+            raise SourceError(f"{path.name}: {owner} has a group of dependencies that isn't a list")
+        out.extend(_uv_edge(path, owner, d) for d in group)
+    return out
 
 
 def parse_uv_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     manifest = data.get("manifest", {})
+    if not isinstance(manifest, dict):
+        raise SourceError(f"{path.name}: `manifest` isn't a table")
+    # The manifest's lists of edges are walked here and again for a selection, so their shapes are checked first.
+    manifest_groups = manifest.get("dependency-groups", {})
+    if not isinstance(manifest_groups, dict):
+        raise SourceError(f"{path.name}: the manifest has a `dependency-groups` that isn't a table of groups")
+    if not all(isinstance(group, list) for group in manifest_groups.values()):
+        raise SourceError(f"{path.name}: the manifest has a group of dependencies that isn't a list")
+    if not isinstance(manifest.get("requirements", []), list):
+        raise SourceError(f"{path.name}: the manifest has a `requirements` that isn't a list")
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
     source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
         src = p.get("source", {})
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         kind = next((k for k in ("editable", "virtual", "git", "path", "directory", "url") if k in src), None)
         if kind and "registry" not in src:
             pkg.skip = kind
         else:
             pkg.registry = src.get("registry")
-            files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
-                files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hash")
             pkg.files = files
         i = len(source.packages)
         source.packages.append(pkg)
-        edges[i] = _uv_edges(p)
+        edges[i] = _uv_edges(path, p)
         # Roots are the project itself (source "."), plus workspace members. A path dependency elsewhere
         # (directory = "libs/x") is reached through its dependents' edges and their markers instead.
         if (kind in ("editable", "virtual") and src.get(kind) == ".") or pkg.key in members:
             source.roots.append(i)
-    for name, group in manifest.get("dependency-groups", {}).items():
+    for name, group in manifest_groups.items():
         for d in group:
             source.root_groups[len(source.root_edges)] = name
-            source.root_edges.append((d["name"], None, d.get("marker")))
-    source.root_edges.extend((d["name"], None, d.get("marker")) for d in manifest.get("requirements", []))
+            source.root_edges.append(_uv_edge(path, "the manifest", d))
+    source.root_edges.extend(_uv_edge(path, "the manifest", d) for d in manifest.get("requirements", []))
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
@@ -234,27 +372,46 @@ def select_uv_dependencies(
     *,
     configured_extras: bool = False,
     poetry: bool = True,
+    pdm: bool = True,
 ) -> None:
-    """Apply `selection` to the uv.lock sources, and its groups to Poetry 2.x poetry.lock sources. With strict
-    (selectors from the command line), other inputs are an error; otherwise (from [tool.wheelgap]) they're left as
-    they are. configured_extras: the extras come from [tool.wheelgap], which apply to uv.lock inputs only, so a
-    poetry.lock doesn't reject them. poetry=False leaves poetry.lock inputs as they are (only extras configured)."""
-    if selection.only_groups and (selection.extras or selection.all_extras):
-        raise SourceError("--only-group cannot be combined with --extra or --all-extras")
+    """Apply `selection` to the uv.lock and Poetry 2.x poetry.lock sources, and its groups to pdm.lock sources. With
+    strict (selectors from the command line), other inputs are an error; otherwise (from [tool.wheelgap]) they're left
+    as they are. configured_extras: the extras come from [tool.wheelgap], which don't apply to pdm.lock inputs, so a
+    pdm.lock doesn't reject them. poetry=False leaves poetry.lock inputs as they are, and pdm=False pdm.lock inputs
+    (only extras configured)."""
+    # `poetry install --only main --extras api` is a production install, so poetry.lock inputs allow it.
+    if (
+        selection.only_groups
+        and (selection.extras or selection.all_extras)
+        and (not sources or any(source.poetry_tables is None for source in sources))
+    ):
+        raise SourceError("--only-group cannot be combined with --extra or --all-extras for uv.lock inputs")
     if selection.no_dev and "dev" in selection.groups | selection.only_groups:
         raise SourceError("--no-dev cannot be combined with an explicit dev group")
     if strict and (not sources or any(source.uv_packages is None for source in sources)):
         others = [source for source in sources if source.uv_packages is None]
-        if sources and all(source.poetry_tables is not None for source in others):
-            if selection.all_extras or (selection.extras and not configured_extras):
-                raise SourceError("extra selection requires uv.lock inputs (poetry.lock supports groups only)")
+        if sources and all(source.poetry_tables is not None or source.pdm_groups is not None for source in others):
+            pdm_lock = any(source.pdm_groups is not None for source in others)
+            if pdm_lock and (selection.all_extras or (selection.extras and not configured_extras)):
+                raise SourceError(
+                    "extra selection requires uv.lock or poetry.lock inputs (pdm.lock supports groups only)"
+                )
         else:
-            raise SourceError("extra/group selection requires uv.lock inputs")
+            unsupported = [s.label for s in others if s.poetry_tables is None and s.pdm_groups is None]
+            raise SourceError(
+                "extra/group selection requires uv.lock, Poetry 2.x poetry.lock or pdm.lock inputs "
+                f"(not {', '.join(unsupported) or 'no input'})"
+            )
     for source in sources:
+        if source.pdm_groups is not None:
+            # A lock without package groups or inherit_metadata: configured groups leave it as it is.
+            if pdm and (strict or (source.pdm_inherit_metadata and all(g is not None for g in source.pdm_groups))):
+                _select_pdm_groups(source, selection)
+            continue
         if source.poetry_tables is not None:
-            # A Poetry 1.x lock doesn't record groups per package; configured groups leave it as it is.
+            # A Poetry 1.x lock doesn't record groups or extras per package; a configured selection leaves it as it is.
             if poetry and (strict or source.edges is None):
-                _select_poetry_groups(source, selection)
+                _select_poetry(source, selection)
             continue
         if source.uv_packages is None:
             continue
@@ -300,29 +457,61 @@ def _poetry_markers(p: dict, groups: Iterable[str]) -> list[str] | None:
     return [m for g in groups if isinstance(m := markers.get(g), str)] or None
 
 
-def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
+def _select_poetry(source: Source, selection: UvSelection) -> None:
     """Keep the poetry.lock packages that Poetry would install for `selection`, with Poetry's meanings: `main` and
     every non-optional group by default, `--group` adds a group (like `poetry install --with`), `--no-dev` leaves
-    out `dev`, and `--only-group` installs only the named groups (`main` too only if named)."""
+    out `dev`, and `--only-group` installs only the named groups (`main` too only if named). Extras are only those
+    selected, as with `poetry install --extras` / `--all-extras`: a package's markers read `extra` as that set."""
+    from .check import poetry_extras_decide  # check imports this module
+
     tables = source.poetry_tables or []
     if source.edges is not None or any(not isinstance(t.get("groups"), list) for t in tables):
-        raise SourceError(f"{source.label}: group selection needs a poetry.lock from Poetry 2.x (with package groups)")
+        raise SourceError(
+            f"{source.label}: extra/group selection needs a poetry.lock from Poetry 2.x (with package groups)"
+        )
+    # Poetry checks --extras against the lock's [extras] table, which lists every extra (empty ones too).
+    known_extras = frozenset(canonicalize_name(name) for name in source.poetry_lock_extras)
+    if selection.extras - known_extras:
+        raise SourceError(f"{source.label}: unknown extras: {', '.join(sorted(selection.extras - known_extras))}")
+    extras: PoetryExtras | None = (known_extras, known_extras if selection.all_extras else selection.extras)
     known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
     optional: set[str] = set()
     pyproject = source.poetry_pyproject
+    unsure = None
+    if known_extras and (pyproject is None or not pyproject.is_file()):
+        unsure = "no pyproject.toml beside it to show how its extras are declared"
     if pyproject is not None and pyproject.is_file():
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        elsewhere, unreadable = _poetry_extras_declared_elsewhere(data)
+        if unreadable:
+            unsure = f"pyproject.toml has requirements wheelgap can't read ({', '.join(unreadable)})"
+        elif elsewhere:
+            unsure = f"{', '.join(elsewhere)} in an extra and declared elsewhere in pyproject.toml"
         # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
         pep735 = data.get("dependency-groups")
         known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
         declared = data.get("tool", {}).get("poetry", {})
+        if isinstance(declared.get("dev-dependencies"), dict):
+            known.add("dev")  # the old [tool.poetry.dev-dependencies] table declares `dev`, even when it's empty
         for name, group in (declared.get("group") or {}).items():
             known.add(canonicalize_name(name))
             if isinstance(group, dict) and group.get("optional") is True:
                 optional.add(canonicalize_name(name))
+    if unsure is not None:
+        # The lock's markers can be wrong for Poetry 2.0-2.2 here: never let extras leave a package out of it.
+        source.poetry_extras_unsure = (
+            f"{unsure}, so Poetry 2.0-2.2 and 2.3+ may install different packages without an extra; "
+            "extras leave no package out of this lock"
+        )
+        extras = None
     unknown = (selection.groups | selection.only_groups) - known
     if unknown:
         raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
+    if selection.no_dev and "dev" not in known:
+        # Like `poetry install --without dev` on a project with no dev group (Poetry 2.5.1).
+        # Without pyproject.toml an empty dev group can't be seen (the lock only lists groups that have packages).
+        unseen = "" if pyproject is not None and pyproject.is_file() else "; no pyproject.toml beside it to declare one"
+        raise SourceError(f"{source.label}: Group(s) not found: dev (via --no-dev){unseen}")
     if selection.only_groups:
         chosen = set(selection.only_groups | selection.groups)
     else:
@@ -330,30 +519,162 @@ def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
     if selection.no_dev:
         chosen.discard("dev")
     kept = []
+    kept_anyway: list[str] = []
     for pkg, table in zip(source.packages, tables, strict=True):
         groups = [g for g in table["groups"] if canonicalize_name(g) in chosen]
-        if groups:
-            pkg.markers = _poetry_markers(table, groups)
+        if not groups:
+            source.unselected_keys.add(pkg.key)
+            continue
+        markers = _poetry_markers(table, groups)
+        if markers is not None and extras is not None:
+            decided = [poetry_extras_decide(m, extras) for m in markers]
+            if all(holds is not None for holds, _ in decided):
+                if not any(holds for holds, _ in decided):
+                    source.unselected_keys.add(pkg.key)  # only for extras that aren't selected
+                    continue
+                markers = None  # a selected extra installs it, on every target
+            elif any(holds is False or ruled_out for holds, ruled_out in decided):
+                kept_anyway.append(pkg.name)  # the extras selected would have left it out somewhere
+        pkg.markers = markers
+        kept.append(pkg)
+    if kept_anyway:
+        shown = ", ".join(kept_anyway[:5]) + (f" and {len(kept_anyway) - 5} more" if len(kept_anyway) > 5 else "")
+        source.poetry_extras_unsure = (
+            f"{shown} kept for every extra: their markers combine an extra with other conditions, and Poetry 2.0-2.2 "
+            "can install them without the extra"
+        )
+    source.packages = kept
+    source.poetry_tables = None
+
+
+def _poetry_extras_declared_elsewhere(data: dict) -> tuple[list[str], list[str]]:
+    """Names in an extra that pyproject.toml also declares somewhere else: in the main dependencies (in any form), in
+    a group, or in another extra entry that isn't the same plain requirement. Poetry 2.x can lock these, and what they
+    depend on, with only the extra's marker (`requests; python_version < '3.11'` that an extra also lists becomes
+    `extra == "s3"`), and then Poetry 2.3 and later (which install from the lock's markers) leave them out where
+    Poetry 2.0 to 2.2 (which re-resolve, as installer.re-resolve does) install them. Found with Poetry 2.5.1 locks
+    installed by Poetry 2.0.1, 2.2.1 and 2.5.1. The same plain requirement in several extras locks correctly. Also
+    returns the requirement strings it can't read, which could be any of these."""
+
+    def table(value: object) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    def strings(value: object) -> list[str]:
+        return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+    unreadable: list[str] = []
+
+    def requirements(specs: list[str]) -> list[Requirement]:
+        out: list[Requirement] = []
+        for spec in specs:
+            try:
+                out.append(Requirement(spec))
+            except InvalidRequirement:
+                unreadable.append(spec)
+        return out
+
+    def names(specs: list[str]) -> list[str]:
+        return [canonicalize_name(req.name) for req in requirements(specs)]
+
+    project = table(data.get("project"))
+    poetry = table(table(data.get("tool")).get("poetry"))
+    legacy = {canonicalize_name(name): spec for name, spec in table(poetry.get("dependencies")).items()}
+    # Each extra entry, as (name, what it says): a repeated entry is safe only if it's the same plain requirement.
+    entries: list[tuple[str, str | None]] = []
+    for specs in table(project.get("optional-dependencies")).values():
+        for req in requirements(strings(specs)):
+            says = f"{sorted(map(canonicalize_name, req.extras))} {req.specifier} {req.url}"
+            entries.append((canonicalize_name(req.name), None if req.marker else says))
+    pep621 = {name for name, _ in entries}
+    for specs in table(poetry.get("extras")).values():
+        for legacy_name in map(canonicalize_name, strings(specs)):
+            dependency = legacy.get(legacy_name)
+            plain = isinstance(dependency, dict) and not {"markers", "python", "platform"} & dependency.keys()
+            entries.append((legacy_name, f"tool.poetry {legacy_name}" if plain else None))
+    in_extras = {name for name, _ in entries}
+    elsewhere: set[str] = set()
+    for name in in_extras:
+        said = [what for n, what in entries if n == name]
+        if len(said) > 1 and (None in said or len(set(said)) > 1):
+            elsewhere.add(name)
+    # Main dependencies. A [tool.poetry.dependencies] table with optional = true is how a legacy extra declares its
+    # dependency, so only that doesn't count; any form counts for a [project] optional-dependencies name.
+    elsewhere |= in_extras & set(names(strings(project.get("dependencies"))))
+    for name, declared in legacy.items():
+        own = isinstance(declared, dict) and declared.get("optional") is True and name not in pep621
+        if name != "python" and not own:
+            elsewhere.add(name)
+    # Groups.
+    tables = [table(poetry.get("dev-dependencies"))]
+    tables += [table(table(g).get("dependencies")) for g in table(poetry.get("group")).values()]
+    elsewhere |= {canonicalize_name(name) for t in tables for name in t}
+    elsewhere |= {name for group in table(data.get("dependency-groups")).values() for name in names(strings(group))}
+    return sorted(elsewhere & in_extras), unreadable
+
+
+def _select_pdm_groups(source: Source, selection: UvSelection) -> None:
+    """Keep the pdm.lock packages that `pdm install` would install for `selection`, with PDM's meanings: every group
+    the lock was made for ([metadata] groups) by default, `--no-dev` leaves out `dev` (like `pdm install --without
+    dev`), `--group` only checks that a group is locked, and `--only-group` installs only the named groups (`default`
+    too only if named). A package counts if any of its groups is selected."""
+    per_package = source.pdm_groups or []
+    if not source.pdm_inherit_metadata or any(g is None for g in per_package):
+        raise SourceError(
+            f"{source.label}: group selection needs a pdm.lock with package groups "
+            "(locked with the inherit_metadata strategy)"
+        )
+    package_groups = [[canonicalize_name(g) for g in groups or []] for groups in per_package]
+    if source.pdm_locked_groups is not None:
+        locked = set(source.pdm_locked_groups)
+    else:  # no [metadata] groups: the groups its packages record
+        locked = {"default"} | {g for groups in package_groups for g in groups}
+    asked = selection.groups | selection.only_groups
+    if asked - locked:
+        declared: set[str] = set()
+        pyproject = source.pdm_pyproject
+        if pyproject is not None and pyproject.is_file():
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            tables = (
+                data.get("project", {}).get("optional-dependencies"),
+                data.get("dependency-groups"),
+                data.get("tool", {}).get("pdm", {}).get("dev-dependencies"),
+            )
+            declared = {canonicalize_name(name) for table in tables if isinstance(table, dict) for name in table}
+        unknown = asked - locked - declared
+        if unknown:
+            raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
+        unlocked = sorted(asked - locked)
+        raise SourceError(
+            f"{source.label}: groups not in the lock: {', '.join(unlocked)} "
+            f"(lock them with `pdm lock {' '.join(f'-G {name}' for name in unlocked)}`)"
+        )
+    chosen = set(selection.only_groups | selection.groups) if selection.only_groups else locked
+    if selection.no_dev:
+        chosen.discard("dev")
+    kept = []
+    for pkg, groups in zip(source.packages, package_groups, strict=True):
+        if any(g in chosen for g in groups):
             kept.append(pkg)
         else:
             source.unselected_keys.add(pkg.key)
     source.packages = kept
-    source.poetry_tables = None
+    source.pdm_groups = None
 
 
 def parse_pylock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     pkgs = []
     for p in data.get("packages", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name, registry=p.get("index"))
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
             pkg.skip = next(k for k in ("vcs", "directory", "archive") if k in p)
         else:
-            files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
-                files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
         pkgs.append(pkg)
     requires = data.get("requires-python")
@@ -368,7 +689,7 @@ def _poetry_edges(p: dict) -> list[Edge]:
         for s in spec if isinstance(spec, list) else [spec]:
             version = s.get("version") if isinstance(s, dict) else s
             marker = s.get("markers") if isinstance(s, dict) else None
-            out.append((name, version if isinstance(version, str) and version != "*" else None, marker))
+            out.append((name, version if isinstance(version, str) and version != "*" else None, marker, None))
     return out
 
 
@@ -379,8 +700,14 @@ def parse_poetry_lock(path: Path) -> Source:
     pkgs: list[Package] = []
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         markers = p.get("markers")
+        if markers is not None and not (
+            isinstance(markers, str)
+            or isinstance(markers, dict)
+            and all(isinstance(marker, str) for marker in markers.values())
+        ):
+            raise SourceError(f"{path.name}: {pkg.name}: markers must be a string or a table of strings")
         if isinstance(markers, str):
             pkg.markers = [markers]
         elif isinstance(markers, dict):
@@ -399,7 +726,9 @@ def parse_poetry_lock(path: Path) -> Source:
                 entries = legacy_files.get(p["name"])
             # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
             # packages from another index are skipped (fill_all).
-            pkg.files = None if entries is None else [f for f in (_filename(e) for e in entries) if f]
+            pkg.files = (
+                None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
+            )
         edges[len(pkgs)] = _poetry_edges(p)
         pkgs.append(pkg)
     # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on
@@ -411,8 +740,13 @@ def parse_poetry_lock(path: Path) -> Source:
         declared = _project_dependencies(path.parent / "pyproject.toml")
         roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
         return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+    extras = data.get("extras")
     return Source(
-        path.name, pkgs, poetry_tables=data.get("package", []), poetry_pyproject=path.parent / "pyproject.toml"
+        path.name,
+        pkgs,
+        poetry_tables=data.get("package", []),
+        poetry_pyproject=path.parent / "pyproject.toml",
+        poetry_lock_extras=[name for name in extras if isinstance(name, str)] if isinstance(extras, dict) else [],
     )
 
 
@@ -425,7 +759,7 @@ def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]
     for i, p in enumerate(pkgs):
         by_name.setdefault(p.key, []).append(i)
     succ = {
-        i: sorted({j for name, _, _ in edges.get(i, []) for j in by_name.get(canonicalize_name(name), [])})
+        i: sorted({j for name, *_ in edges.get(i, []) for j in by_name.get(canonicalize_name(name), [])})
         for i in range(len(pkgs))
     }
     comp = _components(len(pkgs), succ)
@@ -540,11 +874,21 @@ def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], 
 
 def parse_pdm_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
-    legacy_files = data.get("metadata", {}).get("files", {})
+    metadata = data.get("metadata", {})
+    legacy_files = metadata.get("files", {})
+    locked_groups = metadata.get("groups")
+    strategy = metadata.get("strategy")
     pkgs: list[Package] = []
     seen: dict[tuple[str, str | None], Package] = {}
+    # Each package's groups, merged over its entries (PDM writes one per extras variant).
+    groups: dict[tuple[str, str | None], list[str] | None] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
+        recorded = p.get("groups")
+        recorded = [g for g in recorded if isinstance(g, str)] if isinstance(recorded, list) else None
+        key = (pkg.key, pkg.version)
+        before = groups.get(key, [])
+        groups[key] = None if recorded is None or (key in groups and before is None) else [*(before or []), *recorded]
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         src_type = next((k for k in ("git", "hg", "svn", "bzr", "path", "url", "file") if k in p), None)
@@ -566,10 +910,21 @@ def parse_pdm_lock(path: Path) -> Source:
                             entries = value
                             break
             if entries is not None:
-                pkg.files = [f for f in (_filename(e) for e in entries) if f]
+                pkg.files = [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             # Not in either place: leave files as None so the PyPI lookup fills them in.
         _add_once(pkgs, seen, pkg)
-    return Source(path.name, pkgs)
+    return Source(
+        path.name,
+        pkgs,
+        pdm_groups=[groups[(pkg.key, pkg.version)] for pkg in pkgs],
+        pdm_locked_groups=(
+            [canonicalize_name(g) for g in locked_groups if isinstance(g, str)]
+            if isinstance(locked_groups, list)
+            else None
+        ),
+        pdm_inherit_metadata=isinstance(strategy, list) and "inherit_metadata" in strategy,
+        pdm_pyproject=path.parent / "pyproject.toml",
+    )
 
 
 def parse_pipfile_lock(path: Path) -> Source:
@@ -593,6 +948,7 @@ def parse_pipfile_lock(path: Path) -> Source:
     }
     for section in sections:
         for name, p in data[section].items():
+            package_name(path, name)
             if not isinstance(p, dict):
                 raise SourceError(f"{path.name}: {section}.{name} isn't a package entry")
             version = p.get("version")
@@ -612,7 +968,11 @@ def parse_pipfile_lock(path: Path) -> Source:
                 elif not _is_public_pypi(url):
                     pkg.registry = url  # pypi.fill_all skips it, unless WHEELGAP_INDEX_URL is that index
             _add_once(pkgs, seen, pkg)
-    return Source(path.name, pkgs)
+    # A package with no "index" comes from the Pipfile's default source, which may be private: only a lock whose
+    # sources are all PyPI says where every package came from.
+    urls = [s.get("url") if isinstance(s, dict) else None for s in (sources if isinstance(sources, list) else [])]
+    only_pypi = bool(urls) and all(_is_public_pypi(u) for u in urls) and not _nearby_config_names_an_index(path)
+    return Source(path.name, pkgs, pypi_only=only_pypi)
 
 
 def _is_public_pypi(url: str | None) -> bool:
@@ -627,6 +987,63 @@ def _pinned_version(req: Requirement) -> str | None:
     if len(specs) == 1 and specs[0].operator in ("==", "===") and "*" not in specs[0].version:
         return specs[0].version
     return None
+
+
+# uv settings (in [tool.uv], [tool.uv.pip] or uv.toml) that point it at an index or a folder of distributions.
+_UV_INDEX_KEYS = ("index", "sources", "index-url", "extra-index-url", "find-links", "no-index", "default-index")
+
+
+def _table(data: object, name: str) -> dict:
+    value = data.get(name) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _uv_names_an_index(uv: dict) -> bool:
+    return any(k in uv for k in _UV_INDEX_KEYS) or any(k in _table(uv, "pip") for k in _UV_INDEX_KEYS)
+
+
+def _names_an_index(pyproject: dict) -> bool:
+    """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM, pixi's PyPI options),
+    so its dependencies may come from somewhere other than PyPI."""
+    tool = _table(pyproject, "tool")
+    pixi = _table(_table(tool, "pixi"), "pypi-options")
+    return (
+        _uv_names_an_index(_table(tool, "uv"))
+        or "source" in _table(tool, "poetry")
+        or "source" in _table(tool, "pdm")
+        or any(k in pixi for k in ("index-url", "extra-index-urls", "find-links"))
+    )
+
+
+def _pdm_names_an_index(pdm: dict) -> bool:
+    """pdm.toml: [pypi] (url, or a named [pypi.<name>] index) or a source."""
+    return "pypi" in pdm or "source" in pdm
+
+
+# Project config files an installer reads from the input's folder or a folder above it, and how to tell whether one
+# points it at an index.
+_CONFIG_FILES = {"uv.toml": _uv_names_an_index, "pyproject.toml": _names_an_index, "pdm.toml": _pdm_names_an_index}
+
+
+def _nearby_config_names_an_index(path: Path) -> bool:
+    """Whether a uv.toml, pyproject.toml or pdm.toml in the input's folder, or a folder above it up to the
+    repository root (the first with a .git), configures an index: uv applies [tool.uv] to `uv pip install -r` and
+    looks in parent folders, and `uv pip compile` writes no index lines. One that can't be read counts as naming
+    one. User and system settings (pip.conf, ~/.config/uv/uv.toml, /etc/uv/uv.toml, .netrc) aren't read."""
+    folder = path.resolve().parent
+    for directory in (folder, *folder.parents):
+        for name, names_an_index in _CONFIG_FILES.items():
+            config = directory / name
+            if not config.is_file():
+                continue
+            try:
+                if names_an_index(tomllib.loads(config.read_text(encoding="utf-8-sig"))):
+                    return True
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                return True
+        if (directory / ".git").exists():
+            break
+    return False
 
 
 def parse_pyproject(path: Path) -> Source:
@@ -675,7 +1092,12 @@ def parse_pyproject(path: Path) -> Source:
                 "(PEP 685)"
             )
         extras[key] = list(lines)
-    source = Source(path.name, pyproject_extras=extras, pyproject_dynamic_extras="optional-dependencies" in dynamic)
+    source = Source(
+        path.name,
+        pyproject_extras=extras,
+        pyproject_dynamic_extras="optional-dependencies" in dynamic,
+        pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
+    )
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
@@ -768,14 +1190,145 @@ def requirement_to_package(text: str, origin: str) -> Package:
 _NAMED_URL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*@")
 _EGG_RE = re.compile(r"[#&]egg=([A-Za-z0-9][A-Za-z0-9._-]*)")
 _COMMENT_RE = re.compile(r"\s#")
+_FULL_LINE_COMMENT_RE = re.compile(r"^\s*#")
 _INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
 _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
+
+
+# pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
+_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "--no-index")
+
+
+def _names_index_option(line: str) -> bool:
+    """Whether a requirements line has an index option anywhere on it, as pip reads them: `-i URL`, `-iURL`,
+    `--index-url=URL`, `-f`, `--find-links`, `--extra-index-url`, `--no-index`, or an abbreviation of a long one
+    (optparse accepts unambiguous prefixes)."""
+    for token in line.split():
+        if token.startswith(("-i", "-f")) and not token.startswith("--"):
+            return True
+        option = token.split("=", 1)[0]
+        if len(option) > 2 and option.startswith("--") and any(name.startswith(option) for name in _INDEX_OPTIONS):
+            return True
+    return False
+
+
+def _abbreviated_include(line: str) -> bool:
+    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
+    doesn't follow: the file it names may set an index."""
+    option = line.split(None, 1)[0].split("=", 1)[0]
+    return (
+        len(option) > 2
+        and option not in ("--requirement", "--constraint")
+        and any(name.startswith(option) for name in ("--requirement", "--constraint"))
+    )
+
+
+class _FormatControl:
+    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files."""
+
+    def __init__(self) -> None:
+        self.no_binary: set[str] = set()
+        self.only_binary: set[str] = set()
+
+    def apply(self, option: str, value: str) -> None:
+        target, other = (
+            (self.no_binary, self.only_binary) if option == "--no-binary" else (self.only_binary, self.no_binary)
+        )
+        for item in value.split(","):
+            if item == ":all:":
+                other.clear()
+                target.clear()
+                target.add(":all:")
+            elif item == ":none:":
+                target.clear()
+            else:
+                key = canonicalize_name(item)
+                other.discard(key)
+                target.add(key)
+
+    def policy(self, key: str) -> tuple[bool, bool]:
+        if key in self.only_binary:
+            return (False, True)
+        if key in self.no_binary:
+            return (True, False)
+        if ":all:" in self.only_binary:
+            return (False, True)
+        if ":all:" in self.no_binary:
+            return (True, False)
+        return (False, False)
+
+
+def _join_continued_lines(text: str) -> list[str]:
+    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines."""
+    joined: list[str] = []
+    pending: list[str] = []
+    for line in text.splitlines():
+        is_comment = _FULL_LINE_COMMENT_RE.match(line) is not None
+        if not line.endswith("\\") or is_comment:
+            if is_comment:
+                line = " " + line
+            if pending:
+                pending.append(line)
+                joined.append("".join(pending))
+                pending.clear()
+            else:
+                joined.append(line)
+        else:
+            pending.append(line.strip("\\"))
+    if pending:
+        joined.append("".join(pending))
+    return joined
+
+
+def _format_option(token: str) -> tuple[str, str | None] | None:
+    """--no-binary or --only-binary and its =VALUE, if any, from an option token. optparse accepts unambiguous
+    prefixes: --no-b on (--no- is also --no-index), and --o on for --only-binary (pip 26's --only-final makes that
+    --only-b, but older pips take the shorter ones)."""
+    option, eq, value = token.partition("=")
+    if option.startswith("--no-b") and "--no-binary".startswith(option):
+        name = "--no-binary"
+    elif option.startswith("--o") and "--only-binary".startswith(option):
+        name = "--only-binary"
+    else:
+        return None
+    return name, value if eq else None
+
+
+def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
+    if not line.startswith("-"):
+        return False
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        tokens = line.split()
+    if not tokens:
+        return False
+    i = 0
+    while i < len(tokens):
+        found = _format_option(tokens[i])
+        if not found:
+            i += 1
+            continue
+        option, given = found
+        if given is not None:
+            val = given
+            i += 1
+        elif i + 1 < len(tokens):
+            val = tokens[i + 1]
+            i += 2
+        else:
+            break
+        if val:
+            format_control.apply(option, val)
+    return True
 
 
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
-    pkgs = _read_requirements(path, seen, constraints)
+    index_options: list[str] = []
+    format_control = _FormatControl()
+    pkgs = _read_requirements(path, seen, constraints, index_options=index_options, format_control=format_control)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
@@ -796,88 +1349,568 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-    return Source(path.name, pkgs, requirements=True)
-
-
-def _read_requirements(
-    path: Path, seen: dict[bool, set[Path]], constraints: list[Package], constraint: bool = False
-) -> list[Package]:
-    path = path.resolve()
-    if path in seen[constraint]:
-        return []
-    seen[constraint].add(path)
-    pkgs: list[Package] = []
-    append = constraints.append if constraint else pkgs.append
-    lines = path.read_text(encoding="utf-8").replace("\\\n", " ").splitlines()
-    for raw in lines:
-        line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
-        if not line or line.startswith("#"):
-            continue
-        if m := _CONSTRAINT_RE.match(line):
-            target = m.group(1).strip()
-            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
-            if "://" not in target and "${" not in target:
-                _read_requirements(path.parent / target, seen, constraints, True)
-            continue
-        if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
-            pkgs.extend(_read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint))
-            continue
-        if line.startswith("-e ") or line.startswith("--editable"):
-            name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
-            append(Package(name, None, skip="editable", origin=path.name))
-            continue
-        if line.startswith("-"):
-            continue  # pip options: --index-url, --hash continuation, ...
-        tokens = line.split()
-        # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
-        line = " ".join(
-            t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-        )
-        if line.startswith((".", "/")):
-            append(Package(line, None, skip="path", origin=path.name))
-            continue
-        if "://" in line and not _NAMED_URL_RE.match(line):
-            # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
-            # "name @ url" lines are left to Requirement, which knows the name and markers.
-            egg = _EGG_RE.search(line)
-            name = egg.group(1) if egg else line.split(";", 1)[0].strip()
-            append(Package(name, None, skip="url", origin=path.name))
-            continue
-        append(requirement_to_package(line, path.name))
-    return pkgs
-
-
-PARSERS = {
-    "uv.lock": parse_uv_lock,
-    "pylock.toml": parse_pylock,
-    "poetry.lock": parse_poetry_lock,
-    "pdm.lock": parse_pdm_lock,
-    "Pipfile.lock": parse_pipfile_lock,
-}
-
-
-def load_file(path: Path) -> Source:
-    name = path.name
-    if name == "pyproject.toml":
-        return parse_pyproject(path)
-    if name in PARSERS:
-        return PARSERS[name](path)
-    if name.startswith("pylock.") and name.endswith(".toml"):
-        return parse_pylock(path)
-    if name.startswith("requirements") and name.endswith(".lock"):
-        return parse_requirements(path)
-    if name.endswith(".lock") and "uv" in name:
-        return parse_uv_lock(path)
-    if name.endswith((".txt", ".in")):
-        return parse_requirements(path)
-    raise SourceError(
-        f"don't know how to read {path} "
-        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock, requirements.txt "
-        "or pyproject.toml)"
+    for pkg in pkgs:
+        if not pkg.skip:
+            pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
+    return Source(
+        path.name, pkgs, requirements=True, pypi_only=not index_options and not _nearby_config_names_an_index(path)
     )
 
 
-def find_lockfile(directory: Path) -> Path:
+def _read_requirements(
+    path: Path,
+    seen: dict[bool, set[Path]],
+    constraints: list[Package],
+    constraint: bool = False,
+    index_options: list[str] | None = None,
+    format_control: _FormatControl | None = None,
+    stack: dict[bool, set[Path]] | None = None,
+) -> list[Package]:
+    """`index_options` collects the lines that may point pip at another index: index options (--index-url,
+    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options."""
+    path = path.resolve()
+    if stack is None:
+        stack = {False: set(), True: set()}
+    if path in stack[constraint]:
+        return []
+    already_seen = path in seen[constraint]
+    seen[constraint].add(path)
+    stack[constraint].add(path)
+    pkgs: list[Package] = []
+    try:
+        append = constraints.append if constraint else pkgs.append
+        # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
+        lines = _join_continued_lines(path.read_text(encoding="utf-8-sig"))
+        for raw in lines:
+            line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
+            if not line or line.startswith("#"):
+                continue
+            if (
+                not already_seen
+                and index_options is not None
+                and (_names_index_option(line) or _abbreviated_include(line))
+            ):
+                index_options.append(line)
+            if m := _CONSTRAINT_RE.match(line):
+                target = m.group(1).strip()
+                # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
+                # Unread, it may name an index, so the input isn't PyPI-only.
+                if "://" not in target and "${" not in target:
+                    _read_requirements(
+                        path.parent / target, seen, constraints, True, index_options, format_control, stack
+                    )
+                elif not already_seen and index_options is not None:
+                    index_options.append(line)
+                continue
+            if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
+                pkgs.extend(
+                    _read_requirements(
+                        path.parent / m.group(1).strip(),
+                        seen,
+                        constraints,
+                        constraint,
+                        index_options,
+                        format_control,
+                        stack,
+                    )
+                )
+                continue
+            if line.startswith("-e ") or line.startswith("--editable"):
+                if not already_seen:
+                    name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
+                    append(Package(name, None, skip="editable", origin=path.name))
+                continue
+            if line.startswith("-"):
+                if format_control is not None:
+                    _apply_format_options(line, format_control)
+                continue  # pip options: --index-url, --no-binary, --hash continuation, ...
+            if already_seen:
+                continue
+            tokens = line.split()
+            # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
+            line = " ".join(
+                t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
+            )
+            if line.startswith((".", "/")):
+                append(Package(line, None, skip="path", origin=path.name))
+                continue
+            if "://" in line and not _NAMED_URL_RE.match(line):
+                # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
+                # "name @ url" lines are left to Requirement, which knows the name and markers.
+                egg = _EGG_RE.search(line)
+                name = egg.group(1) if egg else line.split(";", 1)[0].strip()
+                append(Package(name, None, skip="url", origin=path.name))
+                continue
+            append(requirement_to_package(line, path.name))
+    finally:
+        stack[constraint].remove(path)
+    return pkgs
+
+
+class _YamlError(Exception):
+    def __init__(self, number: int, message: str):
+        super().__init__(f"line {number}: {message}")
+
+
+class _BlockYaml:
+    """The block-style YAML subset pixi writes (serde_yaml): mappings, sequences (also "indentless" ones under a
+    key), plain and quoted one-line scalars, and the empty `[]` and `{}`. Scalars stay strings. Anything else
+    (anchors, aliases, tags, block scalars, flow collections, multi-line scalars, comments, tabs) is an error rather
+    than a guess at what YAML would make of it."""
+
+    _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+    # Tabs, control characters (libyaml refuses most of them), line breaks other than \n and \r (which
+    # str.splitlines would also split on), a byte order mark after the start, lone surrogates, and the
+    # noncharacters U+FFFE and U+FFFF, which libyaml refuses too.
+    _BAD_CHAR = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff\ud800-\udfff\ufffe\uffff]")
+
+    def __init__(self, text: str):
+        self.lines: list[tuple[int, int, str]] = []  # (line number, indent, content)
+        for number, raw in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1):
+            if bad := self._BAD_CHAR.search(raw):
+                raise _YamlError(number, f"unsupported character {bad.group()!r} (tabs and control characters)")
+            line = raw.rstrip(" ")
+            if not line:
+                continue
+            content = line.lstrip(" ")
+            if content.startswith("#") or (line == content and content.startswith(("---", "..."))):
+                raise _YamlError(number, "comments and document markers aren't supported")
+            self.lines.append((number, len(line) - len(content), content))
+        self.i = 0
+
+    def read(self) -> object:
+        if not self.lines:
+            return None
+        value = self._node(0)
+        if self.i < len(self.lines):
+            raise _YamlError(self.lines[self.i][0], "unexpected indentation")
+        return value
+
+    def _node(self, indent: int) -> object:
+        number, at, content = self.lines[self.i]
+        if at != indent:
+            raise _YamlError(number, "unexpected indentation")
+        return self._sequence(indent) if self._is_item(content) else self._mapping(indent)
+
+    @staticmethod
+    def _is_item(content: str) -> bool:
+        return content == "-" or content.startswith("- ")
+
+    def _sequence(self, indent: int) -> list:
+        items: list = []
+        while self.i < len(self.lines):
+            number, at, content = self.lines[self.i]
+            if at < indent or (at == indent and not self._is_item(content)):
+                break
+            if at > indent or content == "-":
+                raise _YamlError(number, "unexpected indentation")
+            rest = content[2:].lstrip(" ")
+            if self._is_item(rest) or self._split_key(rest, number) is not None:
+                # "- key: value": a mapping whose first line is this one, at the item's column
+                if self._is_item(rest):
+                    raise _YamlError(number, "nested sequences aren't supported")
+                self.lines[self.i] = (number, at + len(content) - len(rest), rest)
+                items.append(self._mapping(at + len(content) - len(rest)))
+            else:
+                items.append(self._scalar(rest, number))
+                self.i += 1
+        return items
+
+    def _mapping(self, indent: int) -> dict:
+        out: dict = {}
+        while self.i < len(self.lines):
+            number, at, content = self.lines[self.i]
+            if at < indent:
+                break
+            if at > indent or self._is_item(content):
+                raise _YamlError(number, "unexpected indentation")
+            split = self._split_key(content, number)
+            if split is None:
+                raise _YamlError(number, "expected `key: value`")
+            key, rest = split
+            if key in out:
+                raise _YamlError(number, f"duplicate key {key!r}")
+            self.i += 1
+            if rest:
+                out[key] = self._scalar(rest, number)
+            elif self.i < len(self.lines) and self.lines[self.i][1] > indent:
+                out[key] = self._node(self.lines[self.i][1])
+            elif self.i < len(self.lines) and self.lines[self.i][1] == indent and self._is_item(self.lines[self.i][2]):
+                out[key] = self._sequence(indent)
+            else:
+                out[key] = None
+        return out
+
+    def _split_key(self, content: str, number: int) -> tuple[str, str] | None:
+        """(key, rest of the line) for `key: rest` or `key:`, else None."""
+        if content[0] in "'\"":
+            end = self._quoted_end(content, number)
+            if end is None or not (content[end:] == ":" or content[end:].startswith(": ")):
+                return None
+            return self._key(content[:end], number), content[end + 1 :].strip(" ")
+        if content.endswith(":"):
+            key, rest = content[:-1], ""
+        elif ": " in content:
+            key, rest = content.split(": ", 1)
+            rest = rest.strip(" ")
+        else:
+            return None
+        return self._key(key, number), rest
+
+    def _key(self, text: str, number: int) -> str:
+        if text != text.strip(" "):
+            raise _YamlError(number, f"unsupported key {text!r} (a space before the colon)")
+        key = self._scalar(text, number)
+        if not isinstance(key, str):
+            raise _YamlError(number, f"unsupported key {text!r}")
+        return key
+
+    @staticmethod
+    def _quoted_end(text: str, number: int) -> int | None:
+        """Where the quoted scalar that starts `text` ends (just past its closing quote), or None if it isn't closed
+        on this line."""
+        quote, i = text[0], 1
+        while i < len(text):
+            if quote == '"' and text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == quote:
+                if quote == "'" and text[i + 1 : i + 2] == "'":
+                    i += 2
+                    continue
+                return i + 1
+            i += 1
+        return None
+
+    def _scalar(self, text: str, number: int) -> object:
+        if not text:
+            raise _YamlError(number, "empty key")
+        if text in ("[]", "{}"):
+            return [] if text == "[]" else {}
+        if text[0] in "'\"":
+            if self._quoted_end(text, number) != len(text):
+                raise _YamlError(number, "a quoted string must end on its own line")
+            if text[0] == "'":
+                return text[1:-1].replace("''", "'")
+            return self._unescape(text[1:-1], number)
+        if (
+            text[0] in "[]{}&*!|>%@`#?,:"
+            or text == "-"
+            or text.startswith("- ")
+            or " #" in text
+            or ": " in text
+            or text[-1] == ":"
+        ):
+            raise _YamlError(number, f"unsupported YAML: {text[:40]!r}")
+        return text
+
+    def _unescape(self, text: str, number: int) -> str:
+        out, i = [], 0
+        while i < len(text):
+            c = text[i]
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            code = text[i + 1 : i + 2]
+            width = {"x": 2, "u": 4, "U": 8}.get(code)
+            if code in self._ESCAPES:
+                out.append(self._ESCAPES[code])
+                i += 2
+            elif (
+                width and re.fullmatch(r"[0-9A-Fa-f]+", digits := text[i + 2 : i + 2 + width]) and len(digits) == width
+            ):
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    raise _YamlError(number, f"escape \\{code}{digits} isn't a Unicode character")
+                out.append(chr(point))
+                i += 2 + width
+            else:
+                raise _YamlError(number, f"unsupported escape \\{code}")
+        return "".join(out)
+
+
+# pixi.lock versions this reader knows (rattler_lock's FileFormatVersion, crates/rattler_lock/src/file_format_version.rs
+# in conda/rattler): 6, and 7, which pixi writes since 0.68. A newer pixi rewrites an older lock when it locks again;
+# a newer version may change what a field means, so it's refused rather than guessed at.
+PIXI_LOCK_VERSIONS = ("6", "7")
+# conda subdir -> (sys_platform, platform_machine) of the Python that runs there. 32-bit x86 and Arm are left out:
+# their platform_machine is the machine's (see targets._UNKNOWN_MACHINE_ARCHES), so no target matches them for sure.
+_CONDA_MARKERS = {
+    "linux-64": ("linux", "x86_64"),
+    "linux-aarch64": ("linux", "aarch64"),
+    "linux-ppc64le": ("linux", "ppc64le"),
+    "linux-s390x": ("linux", "s390x"),
+    "linux-riscv64": ("linux", "riscv64"),
+    "osx-64": ("darwin", "x86_64"),
+    "osx-arm64": ("darwin", "arm64"),
+    "win-64": ("win32", "AMD64"),
+    "win-arm64": ("win32", "ARM64"),
+}
+_PIXI_ENV_KEYS = {"channels", "indexes", "find-links", "options", "packages"}
+_PIXI_PYPI_KEYS = {
+    "6": {"pypi", "name", "version", "sha256", "md5", "requires_dist", "requires_python", "editable"},
+    "7": {"pypi", "name", "version", "sha256", "md5", "index", "requires_dist", "requires_python"}
+    | {"build_packages", "host_packages"},
+}
+_CONDA_ARCHIVE_RE = re.compile(r"^(.+)-([^-]+)-([^-]+)\.(?:conda|tar\.bz2)$")
+
+
+def _pixi_conda_name(location: str, selector: dict, entry: dict | None) -> tuple[str, str | None]:
+    """A conda package's name and version, from what the lock records or its archive's filename."""
+    for record in (selector, entry or {}):
+        if isinstance(record.get("name"), str):
+            version = record.get("version")
+            return record["name"], version if isinstance(version, str) else None
+    if m := _CONDA_ARCHIVE_RE.match(unquote(Path(urlparse(location).path).name)):
+        return m.group(1), m.group(2)
+    return location.split("[", 1)[0].split(" @ ", 1)[0].strip() or location, None
+
+
+def _pixi_pypi_package(entry: dict, indexes: list[str], where: str) -> tuple[Package, tuple[str, str]]:
+    """A pixi.lock `pypi:` entry as a Package, and the key that merges it with the same package on other platforms."""
+    location, name = entry["pypi"], package_name(Path(where), entry.get("name"))
+    pkg = Package(name, entry.get("version"), origin=where)
+    scheme = m.group(1).lower() if (m := re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", location)) else None
+    if scheme in ("http", "https"):
+        url = urlparse(location)
+        filename = unquote(Path(url.path).name)
+        index = entry.get("index")
+        if isinstance(index, str):
+            pkg.registry = index  # v7 records the index for a package that didn't come from PyPI
+        elif url.hostname == "files.pythonhosted.org":
+            pass  # PyPI's own file host: the release is on PyPI
+        elif all(i.rstrip("/") == "https://pypi.org/simple" for i in indexes):
+            pkg.skip = "url"  # PyPI serves files only from files.pythonhosted.org, so this is a direct URL
+        else:
+            pkg.skip = "private index"  # another index, or a direct URL: the lock doesn't say which
+        if not pkg.skip:
+            if pkg.version is None:
+                raise SourceError(f"{where}: {name} comes from an index but has no version")
+            pkg.files, pkg.partial_files = [filename], True
+            return pkg, (pkg.key, pkg.version)
+    elif scheme is None or scheme == "file":
+        pkg.skip = "editable" if entry.get("editable") == "true" else "path"
+    elif "+" in scheme:
+        pkg.skip = scheme.split("+", 1)[0]  # git+https://..., hg+..., svn+...
+    else:
+        raise SourceError(f"{where}: {name} has a location wheelgap can't read: {location!r}")
+    return pkg, (pkg.key, f"{pkg.skip} {location}")
+
+
+def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
+    """One environment of a pixi.lock (`default` unless named): its PyPI packages with the files pixi picked for
+    each platform, and its conda packages, skipped. A package missing from some of the lock's platforms gets a
+    marker that hides it on those platforms (for the environment's Python there) and nowhere else."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # serde_yaml takes a leading byte order mark too
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path.name}: not valid UTF-8 (byte {e.start}), so it can't be read for sure") from None
+    top = re.search(r"^version:[ ]*(.*?)[ ]*$", text, re.MULTILINE)
+    if top is None:
+        raise SourceError(f"{path.name}: no top-level `version`, so this isn't a pixi.lock wheelgap can read")
+    version = top.group(1).strip("'\"")
+    if version not in PIXI_LOCK_VERSIONS:
+        raise SourceError(
+            f"{path.name}: pixi.lock version {top.group(1)!r} isn't supported (wheelgap reads versions "
+            f"{' and '.join(PIXI_LOCK_VERSIONS)}); run `pixi lock` with a pixi that writes one of them, or update "
+            "wheelgap"
+        )
+    try:
+        data = _BlockYaml(text).read()
+    except _YamlError as e:
+        raise SourceError(f"{path.name}: can't read it for sure: {e}") from None
+
+    def bad(what: str) -> SourceError:
+        return SourceError(f"{path.name}: can't read it for sure: {what}")
+
+    if not isinstance(data, dict) or data.get("version") != version:
+        raise bad("the top level isn't a mapping with that `version`")
+    allowed = {"version", "environments", "packages"} | ({"platforms"} if version == "7" else set())
+    if unknown := sorted(set(data) - allowed):
+        raise bad(f"unknown top-level key {unknown[0]!r} for version {version}")
+    subdirs: dict[str, str] = {}  # platform name -> conda subdir
+    if version == "7":
+        for p in data.get("platforms") or []:
+            if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+                raise bad("a `platforms` entry has no name")
+            subdir = p.get("subdir", p["name"])
+            if not isinstance(subdir, str):
+                raise bad(f"platform {p['name']!r} has a `subdir` that isn't a string")
+            subdirs[p["name"]] = subdir
+    environments, entries = data.get("environments"), data.get("packages") or []
+    if not isinstance(environments, dict) or not isinstance(entries, list):
+        raise bad("`environments` must be a mapping and `packages` a list")
+    name = "default" if environment is None else environment
+    if not name:
+        raise SourceError(f"{path.name}: the environment name is empty")
+    env = environments.get(name)
+    if env is None:
+        names = ", ".join(sorted(environments)) or "none"
+        raise SourceError(f"{path.name}: no environment {name!r} (it has: {names}); pick one with --environment")
+    if not isinstance(env, dict):
+        raise bad(f"environment {name!r} isn't a mapping")
+    if unknown := sorted(set(env) - _PIXI_ENV_KEYS):
+        raise bad(f"environment {name!r} has an unknown key {unknown[0]!r}")
+    indexes = env.get("indexes")
+    if indexes is not None and not (isinstance(indexes, list) and all(isinstance(i, str) for i in indexes)):
+        raise bad(f"environment {name!r}: `indexes` must be a list of URLs")
+    per_platform = env.get("packages") or {}
+    if not isinstance(per_platform, dict):
+        raise bad(f"environment {name!r}: `packages` must be a mapping of platforms")
+
+    pypi: dict[str, dict] = {}
+    conda: dict[str, dict] = {}
+    for entry in entries:
+        kinds = [k for k in ("conda", "pypi", "conda_source")[: 3 if version == "7" else 2] if k in (entry or {})]
+        if not isinstance(entry, dict) or len(kinds) != 1 or not isinstance(entry[kinds[0]], str):
+            raise bad("a `packages` entry isn't exactly one of conda, pypi" + (", conda_source" * (version == "7")))
+        if kinds[0] != "pypi":
+            conda[entry[kinds[0]]] = entry
+            continue
+        if unknown := sorted(set(entry) - _PIXI_PYPI_KEYS[version]):
+            raise bad(f"PyPI package {entry['pypi']!r} has an unknown key {unknown[0]!r}")
+        for field_name in ("name", "version", "index", "editable"):
+            if field_name in entry and not isinstance(entry[field_name], str):
+                raise bad(f"PyPI package {entry['pypi']!r}: `{field_name}` isn't a string")
+        if "name" not in entry or (version == "6" and "version" not in entry):
+            raise bad(f"PyPI package {entry['pypi']!r} has no name" + (" or version" * (version == "6")))
+        if entry["pypi"] in pypi:
+            raise bad(f"two PyPI packages at {entry['pypi']!r}")
+        pypi[entry["pypi"]] = entry
+
+    pythons: dict[str, str] = {}  # platform -> the environment's Python there ("3.12")
+    found: dict[tuple[str, str], tuple[Package, set[str]]] = {}
+    skipped: dict[str, Package] = {}  # by name: one row however many builds or versions
+    for platform, selectors in per_platform.items():
+        if version == "7" and platform not in subdirs:
+            raise bad(f"environment {name!r} uses platform {platform!r}, which `platforms` doesn't list")
+        if not isinstance(selectors, list):
+            raise bad(f"environment {name!r}: {platform} must list packages")
+        for s in selectors:
+            kinds = [k for k in ("conda", "pypi", "conda_source") if isinstance(s, dict) and k in s]
+            if len(kinds) != 1 or not isinstance(s[kinds[0]], str) or (kinds[0] == "conda_source" and version != "7"):
+                raise bad(f"environment {name!r}: a {platform} package isn't exactly one of conda, pypi")
+            location = s[kinds[0]]
+            if kinds[0] != "pypi":
+                conda_name, conda_version = _pixi_conda_name(location, s, conda.get(location))
+                if canonicalize_name(conda_name) == "python" and conda_version:
+                    if m := re.match(r"(\d+)\.(\d+)", conda_version):
+                        pythons[platform] = f"{m.group(1)}.{m.group(2)}"
+                pkg = Package(conda_name, conda_version, skip="conda", origin=path.name)
+                skipped.setdefault(pkg.key, pkg)
+                continue
+            if len(s) != 1:  # a PyPI selector is its location alone
+                raise bad(f"environment {name!r}: {platform} PyPI package {location!r} has other keys")
+            entry = pypi.get(location)
+            if entry is None:
+                raise bad(
+                    f"environment {name!r}: {platform} lists PyPI package {location!r}, which isn't in `packages`"
+                )
+            pkg, key = _pixi_pypi_package(entry, list(indexes or []), path.name)
+            if not pkg.skip and indexes is None:
+                raise bad(f"environment {name!r} has PyPI packages but no `indexes`")
+            if key not in found:
+                found[key] = (pkg, set())
+            first, platforms = found[key]
+            platforms.add(platform)
+            if first.files is not None and pkg.files and pkg.files[0] not in first.files:
+                first.files.append(pkg.files[0])
+            if first.registry != pkg.registry:
+                first.skip, first.files = "private index", None  # from two indexes: no single lookup is safe
+
+    # Locked platforms by the markers pip would see there: sys_platform, platform_machine and the environment's
+    # Python. Platforms that share them (linux-64 and a linux-64-cuda with subdir linux-64, say) are one group.
+    groups: dict[tuple[str, str, str], set[str]] = {}
+    # Platforms whose Python isn't known (no conda `python` package, or one built from source), by their markers:
+    # one of them may be the same Python as a group, so a package it installs is never hidden on that machine.
+    unknown_python: dict[tuple[str, str], set[str]] = {}
+    for platform in per_platform:
+        machine = _CONDA_MARKERS.get(subdirs[platform] if platform in subdirs else platform)
+        if machine and platform in pythons:
+            groups.setdefault((*machine, pythons[platform]), set()).add(platform)
+        elif machine:
+            unknown_python.setdefault(machine, set()).add(platform)
+    # A package missing from every platform of a group isn't installed for those markers. Hide it on exactly them;
+    # every other target, such as another Python or a platform the lock doesn't cover, still counts it.
+    for pkg, platforms in found.values():
+        clauses = [
+            f"(sys_platform != '{sys_platform}' or platform_machine != '{machine}' or python_version != '{python}')"
+            for (sys_platform, machine, python), members in groups.items()
+            if not members & platforms and not unknown_python.get((sys_platform, machine), set()) & platforms
+        ]
+        pkg.markers = [" and ".join(clauses)] if clauses else None
+    pkgs = [pkg for pkg, _ in found.values()]
+    return Source(path.name, pkgs + sorted(skipped.values(), key=lambda p: p.key))
+
+
+READERS = {
+    "pyproject": parse_pyproject,
+    "uv": parse_uv_lock,
+    "pylock": parse_pylock,
+    "poetry": parse_poetry_lock,
+    "pdm": parse_pdm_lock,
+    "pipfile": parse_pipfile_lock,
+    "requirements": parse_requirements,
+    "pixi": parse_pixi_lock,
+}
+PARSERS = {
+    "uv.lock": "uv",
+    "pylock.toml": "pylock",
+    "poetry.lock": "poetry",
+    "pdm.lock": "pdm",
+    "Pipfile.lock": "pipfile",
+    "pixi.lock": "pixi",
+}
+
+
+def load_file(path: Path, environment: str | None = None) -> Source:
+    """Read one input file. `environment` picks a pixi.lock environment (default: `default`)."""
+    kind = file_kind(path)
+    source = parse_pixi_lock(path, environment) if kind == "pixi" else READERS[kind](path)
+    source.path, source.kind = path, kind
+    _check_field_types(path, source)
+    return source
+
+
+def _check_field_types(path: Path, source: Source) -> None:
+    """SourceError for a package field of the wrong type (`version = 1`, a list of markers), which would otherwise
+    crash later, far from the file."""
+    for pkg in source.packages:
+        for what, value in (("version", pkg.version), ("index", pkg.registry)):
+            if value is not None and not isinstance(value, str):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
+        for what, values in (("marker", pkg.markers), ("file name", pkg.files)):
+            if values is not None and not all(isinstance(v, str) for v in values):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
+
+
+def file_kind(path: Path) -> str:
+    """Which reader (a key of READERS) reads this file, by its name."""
+    name = path.name
+    if name == "pyproject.toml":
+        return "pyproject"
+    if name in PARSERS:
+        return PARSERS[name]
+    if name.startswith("pylock.") and name.endswith(".toml"):
+        return "pylock"
+    if name.startswith("requirements") and name.endswith(".lock"):
+        return "requirements"
+    if name.endswith(".lock") and "uv" in name:
+        return "uv"
+    if name.endswith((".txt", ".in")):
+        return "requirements"
+    raise SourceError(
+        f"don't know how to read {path} "
+        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, requirements.lock, "
+        "requirements.txt or pyproject.toml)"
+    )
+
+
+def find_lockfile(directory: Path, pixi: bool = False) -> Path:
+    """The directory's lockfile, in LOCKFILES order; pixi.lock first with `pixi` (an environment was named)."""
+    if pixi and (directory / "pixi.lock").is_file():
+        return directory / "pixi.lock"
     for name in LOCKFILES:
         candidate = directory / name
         if candidate.is_file():
@@ -897,20 +1930,27 @@ def _has_project_table(pyproject: Path) -> bool:
         return False
 
 
-def load_inputs(inputs: list[str]) -> list[Source]:
-    """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'."""
+def load_inputs(inputs: list[str], environment: str | None = None) -> list[Source]:
+    """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'.
+    `environment` picks the pixi.lock environment; with no pixi.lock input it's an error."""
+    if environment == "":
+        raise SourceError("--environment needs a name")
     sources: list[Source] = []
-    adhoc = Source("command line")
+    adhoc = Source("command line", pypi_only=True)  # names to look up on PyPI
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            sources.append(load_file(find_lockfile(p)))
+            sources.append(load_file(find_lockfile(p, environment is not None), environment))
+            if sources[-1].kind != "pixi" and (p / "pixi.lock").is_file():
+                sources[-1].passed_over = p / "pixi.lock"
         elif p.is_file():
-            sources.append(load_file(p))
+            sources.append(load_file(p, environment))
         elif "/" in item or item.endswith((".lock", ".txt", ".toml")):
             raise SourceError(f"{item}: no such file")
         else:
             adhoc.packages.append(requirement_to_package(item, "command line"))
     if adhoc.packages:
         sources.append(adhoc)
+    if environment is not None and not any(s.kind == "pixi" for s in sources):
+        raise SourceError("--environment applies to pixi.lock inputs only")
     return sources

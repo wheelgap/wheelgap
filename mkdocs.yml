@@ -1,0 +1,82 @@
+# The documentation site: https://wheelgap.github.io/wheelgap/
+# Build it with `uv run --locked --group docs mkdocs build --strict` (or `mkdocs serve` to preview).
+# .github/workflows/docs.yml builds it on every pull request and deploys it from main.
+site_name: wheelgap
+site_description: Find the Python dependencies that have no prebuilt wheel for your target platform, before your Docker build does.
+site_url: https://wheelgap.github.io/wheelgap/
+repo_url: https://github.com/wheelgap/wheelgap
+repo_name: wheelgap/wheelgap
+edit_uri: edit/main/docs/
+
+# Files under docs/ that aren't pages of the site.
+exclude_docs: |
+  hooks/
+  demo/
+
+hooks:
+  - docs/hooks/schema_reference.py
+
+# --strict turns these warnings into errors, so a broken link or #anchor fails the build.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  logo: logo/wheelgap-mark.svg
+  favicon: logo/wheelgap-mark.svg
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Guides:
+      - Inputs: inputs.md
+      - Targets: targets.md
+      - Configuration: configuration.md
+      - Output: output.md
+      - CI: ci.md
+      - Comparing two lockfiles: diff.md
+      - Recipes: recipes.md
+  - Integrations:
+      - Python API: python-api.md
+      - MCP server: mcp.md
+      - AI coding agents: agents.md
+  - Reference:
+      - Command line: cli.md
+      - How it works: how-it-works.md
+      - FAQ: faq.md
+  - Changelog: https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md

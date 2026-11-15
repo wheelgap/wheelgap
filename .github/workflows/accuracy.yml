@@ -1,0 +1,47 @@
+name: Accuracy
+
+# Weekly: compare wheelgap's answers with pip's on about 50 real PyPI packages and the targets in
+# scripts/check_against_pip.py (#226). It needs the network, so it's kept out of CI's test job, which stays
+# offline. It fails when wheelgap and pip disagree, or when a check couldn't be made; the run's summary page
+# lists them, with the pip command for each disagreement.
+#
+# Read-only and no secrets: it only reads the repo and PyPI.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1" # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: accuracy
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Compare wheelgap with pip
+        # The latest pip, on purpose: the check is against what pip does today.
+        run: |
+          set -o pipefail
+          uv run --python 3.14 --with pip python scripts/check_against_pip.py | tee accuracy.log
+      - name: Summarise
+        if: always()
+        run: |
+          [ -s accuracy.log ] || exit 0  # failed before the script reported: the log says why
+          {
+            echo "### wheelgap against pip"
+            echo
+            echo '~~~~~~~~~~text'
+            head -c 60000 accuracy.log | sed 's/^~~~~/ ~~~~/'  # the log can't close the fence
+            echo
+            echo '~~~~~~~~~~'
+          } >> "$GITHUB_STEP_SUMMARY"

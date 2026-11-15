@@ -29,6 +29,8 @@ from wheelgap.dockerfile import (
         ("python:3.11-slim-bullseye", ImageTarget("3.11", "linux-x86_64", glibc="2.31")),
         ("python:3.13.1-alpine3.22 AS runtime", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("docker.io/library/python:3.12", ImageTarget("3.12", "linux-x86_64", glibc="2.41")),
+        ("index.docker.io/library/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
+        ("index.docker.io/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("--platform= python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # empty value: the default
         ("-- python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # BuildKit drops a bare --
         ("--platform=linux/arm64 -- python:3.13-alpine", ImageTarget("3.13", "musl-aarch64", musl="1.2")),
@@ -44,6 +46,24 @@ from wheelgap.dockerfile import (
         ("python:3.12.7-slim", ImageTarget("3.12", "linux-x86_64")),
         ("python:3.13.9", ImageTarget("3.13", "linux-x86_64")),
         ("python:3.13-windowsservercore-ltsc2022", ImageTarget("3.13", "win-amd64")),
+        # The floating X.Y-rc tags read their variant like X.Y tags. One with no Debian release in the tag stopped
+        # being rebuilt at X.Y's release, on the Debian of the day (3.11-rc-slim is bullseye, not trixie), so it's
+        # read from RC_DEBIAN; a still-built one (3.16-rc) keeps the --glibc default.
+        ("python:3.16-rc", ImageTarget("3.16", "linux-x86_64")),
+        ("python:3.16-rc-slim", ImageTarget("3.16", "linux-x86_64")),
+        ("python:3.13-rc-slim", ImageTarget("3.13", "linux-x86_64", glibc="2.36")),
+        ("python:3.11-rc-slim", ImageTarget("3.11", "linux-x86_64", glibc="2.31")),
+        ("python:3.10-rc", ImageTarget("3.10", "linux-x86_64", glibc="2.31")),
+        ("python:3.15-rc", ImageTarget("3.15", "linux-x86_64", glibc="2.41")),
+        ("--platform=linux/s390x python:3.11-rc-slim", ImageTarget("3.11", "linux-s390x", glibc="2.31")),
+        ("python:3.16-rc-alpine", ImageTarget("3.16", "musl-x86_64", musl="1.2")),
+        ("python:3.16-rc-slim-trixie", ImageTarget("3.16", "linux-x86_64", glibc="2.41")),
+        ("--platform=linux/arm64 python:3.16-rc-slim-trixie", ImageTarget("3.16", "linux-aarch64", glibc="2.41")),
+        ("python:3.15-rc-bookworm", ImageTarget("3.15", "linux-x86_64", glibc="2.36")),
+        ("--platform=linux/ppc64le python:3.15-rc-bookworm", ImageTarget("3.15", "linux-ppc64le", glibc="2.36")),
+        # Astral published rc tags for 3.14 (uv 0.8's Docker guide lists them); they always name their base
+        ("ghcr.io/astral-sh/uv:python3.14-rc-alpine", ImageTarget("3.14", "musl-x86_64", musl="1.2")),
+        ("ghcr.io/astral-sh/uv:python3.14-rc-bookworm-slim", ImageTarget("3.14", "linux-x86_64", glibc="2.36")),
         ("ghcr.io/astral-sh/uv:python3.13-bookworm-slim", ImageTarget("3.13", "linux-x86_64", glibc="2.36")),
         ("ghcr.io/astral-sh/uv:python3.14-trixie-slim", ImageTarget("3.14", "linux-x86_64", glibc="2.41")),
         ("ghcr.io/astral-sh/uv:0.13.7-python3.13-trixie-slim", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),
@@ -78,6 +98,7 @@ def test_parse_from(line, expected):
     ("line", "message"),
     [
         ("ubuntu:24.04", "only the official python images"),
+        ("Index.docker.io/library/python:3.13-alpine", "only the official python images"),
         ("python", "must start with a Python version"),
         ("python:latest", "must start with a Python version"),
         ("ghcr.io/astral-sh/uv:bookworm-slim", r"must specify a Python version like python3\.13-alpine"),
@@ -89,6 +110,20 @@ def test_parse_from(line, expected):
         ("--platform=linux/386 ghcr.io/astral-sh/uv:python3.13-bookworm-slim", "only published for linux/amd64"),
         ("--platform=linux/s390x ghcr.io/astral-sh/uv:python3.13-bookworm-slim", "only published for linux/amd64"),
         ("python:3.13-slim-buster", "unknown image variant 'buster'"),
+        ("python:3.16-rc-nonsense", "unknown image variant 'nonsense'"),
+        ("python:3.9-rc-slim", "older than bullseye: pass -t and --glibc instead"),
+        ("--platform=linux/riscv64 python:3.13-rc-slim", r"isn't published for linux/riscv64 \(3\.13-trixie is\)$"),
+        ("python:3.16-rc1", "unknown image variant 'rc1'"),
+        # An X.Y-rc tag isn't read as frozen: 3.14-rc-bookworm has s390x but 3.15-rc-bookworm, built later, doesn't
+        (
+            "--platform=linux/s390x python:3.15-rc-bookworm",
+            r"may not be published for linux/s390x: older -rc builds have it, newer ones don't \(3\.15-trixie is\)$",
+        ),
+        (
+            "--platform=linux/ppc64le python:3.13-rc-slim-bullseye",
+            r"may not be published for linux/ppc64le: .* \(3\.13-trixie is\)$",
+        ),
+        ("--platform=linux/riscv64 python:3.15-rc-bookworm", r"isn't published for linux/riscv64 \(3\.15-trixie is\)$"),
         ("--platform=linux/riscv64 python:3.13-bookworm", r"python:3\.13-bookworm isn't published for linux/riscv64"),
         (
             "--platform=linux/riscv64 python:3.13-slim-bookworm",
@@ -125,6 +160,12 @@ def test_last_from_takes_the_final_stage():
     assert parse_from(last_from(text)) == ImageTarget("3.13", "musl-aarch64", musl="1.2")
 
 
+def test_read_dockerfile_legacy_docker_hub_in_final_stage(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("FROM python:3.12 AS base\nFROM index.docker.io/library/python:3.13\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
+
+
 def test_no_from(tmp_path):
     path = tmp_path / "Dockerfile"
     path.write_text("RUN echo hi\n")
@@ -151,7 +192,15 @@ def test_cli_flags_beat_dockerfile(capsys, fixtures, tmp_path):
     assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "win-amd64")]
 
 
-@pytest.mark.parametrize(("image", "status"), [("python:3.13-slim", "wheel"), ("python:3.13-slim-bookworm", "source")])
+@pytest.mark.parametrize(
+    ("image", "status"),
+    [
+        ("python:3.13-slim", "wheel"),
+        ("python:3.13-slim-bookworm", "source"),
+        ("python:3.13-rc-slim", "source"),  # bookworm, 2.36
+        ("python:3.13-rc-slim-trixie", "wheel"),
+    ],
+)
 def test_cli_untagged_image_uses_its_debian_glibc(capsys, monkeypatch, tmp_path, image, status):
     files = [{"filename": "trixielib-1.0-cp313-cp313-manylinux_2_39_x86_64.whl"}, {"filename": "trixielib-1.0.tar.gz"}]
     monkeypatch.setattr(pypi, "fetch_json", lambda url, timeout=20.0: {"info": {"version": "1.0"}, "urls": files})
@@ -176,6 +225,8 @@ def test_cli_bad_dockerfile_exit_2(capsys, fixtures, tmp_path):
         ("python:3.9-alpine3.10", "1.1"),
         ("python:3.13-alpine3.13", "1.2"),
         ("python:3.13-alpine", "1.2"),
+        ("python:3.16-rc-alpine3.22", "1.2"),
+        ("python:3.9-rc-alpine3.12", "1.1"),
     ],
 )
 def test_alpine_musl_version(line, musl):

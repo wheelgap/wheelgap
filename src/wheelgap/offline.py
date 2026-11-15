@@ -17,16 +17,21 @@ def require_offline(
     """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
     problems = []
     for s in sources:
-        # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
+        # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count. A
+        # pixi.lock records only the file it picked per platform (partial_files), which can't answer other targets.
         need = [
             p.name
             for p in s.packages
-            if not p.skip and not p.error and p.files is None and may_look_up(p.registry, simple_index)
+            if not p.skip
+            and not p.error
+            and (p.files is None or p.partial_files)
+            and may_look_up(p.registry, simple_index)
         ]
         if need:
             names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
+            why = " (it records only the file pixi picked for each platform)" * any(p.partial_files for p in s.packages)
             problems.append(
-                f"{s.label} needs the index for {len(need)} package{'s' if len(need) != 1 else ''} ({names})"
+                f"{s.label}{why} needs the index for {len(need)} package{'s' if len(need) != 1 else ''} ({names})"
             )
     if problems:
         raise SourceError(

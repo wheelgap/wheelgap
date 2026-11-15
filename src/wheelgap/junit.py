@@ -21,17 +21,24 @@ def _cell_fails(status: Status, fail_on: str) -> bool:
 def _rank(cell: tuple[str | None, str | None]) -> int:
     fail, skip = cell
     if fail is not None:
-        return 2 if fail == Status.SOURCE.value else 3
+        return 4 if fail == Status.SOURCE.value else 5
+    if skip is not None and skip.startswith("advisory: "):
+        # A gap reported as a skip: it beats a pass, so another input's wheel can't hide it, and as on a
+        # required target, a package that can't install (or couldn't be checked) beats a source build.
+        return 2 if skip == f"advisory: {Status.SOURCE.value}" else 3
     return 0 if skip is not None else 1
 
 
-def junit_xml(rows: list[Row], targets: list[Target], fail_on: str) -> str:
+def junit_xml(rows: list[Row], targets: list[Target], fail_on: str, advisory: frozenset[Target] = frozenset()) -> str:
     """One testsuite per target, one testcase per package.
 
     A cell is a failure when its status fails the run (`missing`, `unknown`,
     and `source` unless `--fail-on missing`). `n/a` is skipped, and so is a
-    cell that would fail on a target `--ignore NAME:TARGET` ignores. Other
-    statuses (wheel, bundled, and source with `--fail-on missing`) are passes.
+    cell that would fail on a target `--ignore NAME:TARGET` ignores. On an
+    `--advisory` target such a cell is skipped with the message `advisory:
+    STATUS`, so the gap stays visible without failing the report (Jenkins
+    marks a build unstable on any failed test). Other statuses (wheel,
+    bundled, and source with `--fail-on missing`) are passes.
 
     Dashboards key a test on classname + name, so each name appears once per
     suite: a package locked at several versions gets the version in its name,
@@ -63,11 +70,14 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str) -> str:
                 cell: tuple[str | None, str | None] = (None, "n/a")
             elif _cell_fails(status, fail_on) and target in row.ignored:
                 cell = (None, "ignored")  # --ignore NAME:TARGET: accepted, so not a failure
+            elif _cell_fails(status, fail_on) and target in advisory:
+                cell = (None, f"advisory: {status.value}")  # reported, but doesn't fail the run
             elif _cell_fails(status, fail_on):
                 cell = (status.value, None)
             else:
                 cell = (None, None)
-            # The worst cell wins: missing or unknown, then source, then a pass, then skipped.
+            # The worst cell wins: missing or unknown, then source, then an advisory gap (missing or unknown, then
+            # source), then a pass, then skipped.
             if ident not in merged or _rank(cell) > _rank(merged[ident]):
                 merged[ident] = cell
         cases = [(names[ident], fail, skip) for ident, (fail, skip) in merged.items()]
@@ -91,5 +101,7 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str) -> str:
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
 
-def write_junit(path: str, rows: list[Row], targets: list[Target], fail_on: str) -> None:
-    Path(path).write_text(junit_xml(rows, targets, fail_on), encoding="utf-8")
+def write_junit(
+    path: str, rows: list[Row], targets: list[Target], fail_on: str, advisory: frozenset[Target] = frozenset()
+) -> None:
+    Path(path).write_text(junit_xml(rows, targets, fail_on, advisory), encoding="utf-8")

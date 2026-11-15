@@ -1,0 +1,53 @@
+# Real lockfiles from open-source projects (#227), each copied unchanged from `repo` at `commit`, where it is `path`.
+# Each copy is under its project's licence, given here; its LICENSE file, from the same commit, is next to it. tests/test_real_lockfiles.py reads these copies offline, and
+# scripts/check_real_lockfiles.py (run weekly by .github/workflows/lockfile-corpus.yml) reads each project's current
+# file from its default branch. AGENTS.md says how to refresh a copy.
+
+[[lockfile]]
+file = "pluggy/uv.lock"  # uv.lock revision 5
+repo = "pytest-dev/pluggy"
+path = "uv.lock"
+commit = "9d5cfafe1a476be5376449e653970733955533f2"
+licence = "MIT"
+
+[[lockfile]]
+file = "iniconfig/uv.lock"  # uv.lock revision 3, with a package locked at two versions (resolution markers)
+repo = "pytest-dev/iniconfig"
+path = "uv.lock"
+commit = "e0f1ee1ccd69634acf5d127ed2ea6e628f18da31"
+licence = "MIT"
+
+[[lockfile]]
+file = "tomlkit/poetry.lock"  # Poetry 2.5.1, lock-version 2.1 (groups and markers on packages)
+repo = "python-poetry/tomlkit"
+path = "poetry.lock"
+commit = "73078ea2b86cd7a89ee27d5be9232ae1b3e85409"
+licence = "MIT"
+
+[[lockfile]]
+file = "cleo/poetry.lock"  # Poetry 1.8.3, lock-version 2.0 (markers on dependency edges only); from November 2024
+repo = "python-poetry/cleo"
+path = "poetry.lock"
+commit = "aefc8901e51fe269d11dd6180a36dd0207402095"
+licence = "MIT"
+
+[[lockfile]]
+file = "webcolors/pdm.lock"  # PDM lock_version 4.5.0, inherit_metadata
+repo = "ubernostrum/webcolors"
+path = "pdm.lock"
+commit = "6c8da6832eb4ae2591a1883a0d1371263d6cd4db"
+licence = "BSD-3-Clause"
+
+[[lockfile]]
+file = "pdfly/pylock.toml"  # PEP 751 lock-version 1.0, created by `pip lock`
+repo = "py-pdf/pdfly"
+path = "pylock.toml"
+commit = "911e55f25a09cbb933af0ff3c65a85923bbab93e"
+licence = "BSD-3-Clause"
+
+[[lockfile]]
+file = "pipenv/Pipfile.lock"  # pipfile-spec 6; records hashes, not filenames, so wheelgap looks its packages up
+repo = "pypa/pipenv"
+path = "Pipfile.lock"
+commit = "a7783051ede5ba7fc4d4ab50d4ceb63947937b2c"
+licence = "MIT"

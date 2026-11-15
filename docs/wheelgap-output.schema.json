@@ -38,7 +38,7 @@
         },
         "packages": {
             "type": "array",
-            "description": "One entry per package that is installed on at least one target.",
+            "description": "One entry per package that is installed on at least one target. A range that resolves to different releases for different Pythons has one entry per release, with n/a for the targets using the other.",
             "items": {"$ref": "#/$defs/package"}
         },
         "skipped": {
@@ -58,7 +58,7 @@
         },
         "ignored_targets": {
             "type": "array",
-            "description": "Present from the release after 0.8.0 on (older versions don't write it): packages ignored on some targets only, by --ignore NAME:TARGET or the same form in ignore = [...]. They stay in packages with their real results, but a gap on these platforms doesn't count towards with_gaps or the exit code. Lists only checked platforms, and no package that is also in ignored.",
+            "description": "Present from 0.9.0 on (older versions don't write it): packages ignored on some targets only, by --ignore NAME:TARGET or the same form in ignore = [...]. They stay in packages with their real results, but a gap on these platforms doesn't count towards with_gaps or the exit code. Lists only checked platforms, and no package that is also in ignored.",
             "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -73,6 +73,16 @@
                 }
             }
         },
+        "advisory": {
+            "type": "array",
+            "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it): labels of the checked targets that --advisory or advisory = [...] in [tool.wheelgap] made advisory, empty when there are none. Gaps on these targets are reported in packages and counted in with_gaps and per_target as usual, but don't change the exit code.",
+            "items": {"type": "string"}
+        },
+        "blocking_newer_python": {
+            "type": "array",
+            "description": "Present only when exactly two Python versions are checked and one is newer (3.14 and 3.15, or 3.14 and 3.15t; not 3.14 and 3.14t), and not written by 0.9.0 and older: the packages that block the move to the newer one, in the order of packages. A package is listed when the newer Python's result is source or missing on a platform where the older one's is wheel, n/a or bundled, not counting the platforms in ignored_targets. It's decided per package name, over every version of it in the inputs. Packages that couldn't be checked (unknown on the newer Python) are left out, so an empty list isn't a pass on its own: summary and the exit code still decide.",
+            "items": {"type": "string", "description": "Package name as written in the input."}
+        },
         "summary": {
             "type": "object",
             "additionalProperties": false,
@@ -82,11 +92,11 @@
                 "with_gaps": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets."
+                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets. Gaps on advisory targets count."
                 },
                 "per_target": {
                     "type": "object",
-                    "description": "Gap counts for every checked target, keyed by target label, with zeros for a target without gaps (including when only one target is checked). A package's cell on a platform ignored_targets lists for it isn't counted. Present from the release after 0.8.0 on; older versions leave it out.",
+                    "description": "Gap counts for every checked target, keyed by target label, with zeros for a target without gaps (including when only one target is checked). A package's cell on a platform ignored_targets lists for it isn't counted. Present from 0.9.0 on; older versions leave it out.",
                     "additionalProperties": {
                         "type": "object",
                         "additionalProperties": false,
@@ -135,8 +145,51 @@
                 },
                 "via": {
                     "type": "object",
-                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock). Empty object when the input has no graph.",
+                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                },
+                "build_requires": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it), with --explain --build-info: the [build-system] requires of the release's sdist, normalized (name, extras, version range) and limited to those whose marker holds on a target in rejected that is source; null when there is no source build or no answer (the sdist isn't positively from PyPI, couldn't be read, or pip could read another pyproject.toml from it)."
+                },
+                "notes": {
+                    "type": "array",
+                    "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it), with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up with --notes (or notes = true), for packages that are positively from PyPI, and never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror. Empty without --notes, when there are none, or when the lookup failed. Treat text as untrusted plain text.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["platforms", "kind", "text", "links", "versions", "updated", "targets"],
+                        "properties": {
+                            "platforms": {"type": "array", "items": {"type": "string"}, "description": "Platforms the note is about, or [\"all\"]: the nine platforms the tracker scans."},
+                            "kind": {"type": "string", "description": "workaround, alternative, upstream-issue or other-source."},
+                            "text": {"type": "string", "description": "One line of plain text; backticks mark commands and names."},
+                            "links": {"type": "array", "items": {"type": "string"}, "description": "https:// URLs that back the note."},
+                            "versions": {"type": ["string", "null"], "description": "The releases the note is about (a version specifier), or null for all."},
+                            "updated": {"type": "string", "description": "When the note was last checked (YYYY-MM-DD)."},
+                            "targets": {"type": "array", "items": {"type": "string"}, "description": "The labels of this package's gap targets the note covers."}
+                        }
+                    }
+                },
+                "conda_forge": {
+                    "description": "Present with --explain --conda-forge, in versions after 0.9.0, when conda-forge has a package with exactly this package's canonical name and a build of this version that fits at least one of the targets in rejected: on the main label and not marked broken, for the target's conda subdir or noarch, and for its Python version and ABI (free-threaded or not). A hint only: it doesn't change results, summary or the exit code, and the conda package may be another project. Left out when nothing fits, the package's index isn't known to be PyPI (its name isn't sent), or the lookup failed (a note on stderr says so).",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "version", "builds"],
+                    "properties": {
+                        "name": {"type": "string", "description": "The conda-forge package name that was looked up (the canonical PyPI name)."},
+                        "version": {"type": "string", "description": "The checked version, which every build counted is of."},
+                        "builds": {
+                            "type": "object",
+                            "description": "For each target label with a build that fits: the conda subdirs of those builds, its own (such as linux-aarch64 or osx-arm64) and/or noarch.",
+                            "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                        }
+                    }
+                },
+                "suggest": {
+                    "description": "Present with --explain --suggest, in versions after 0.9.0, for a pinned package with a gap whose releases were looked up on PyPI: for each target in rejected, a newer release with a wheel for it (not yanked, Requires-Python admitting the target's Python, and no pre-release unless the checked version is one) that also keeps a wheel on every target where this package is wheel now. The targets get the lowest such release with a wheel for all of them when there is one, otherwise each its own nearest; a target with no such release is left out, so the object can be empty. The release can be outside the input's own version specifier (foo<2 resolving to 1.9 may get 2.1). Absent when the package has no gap, has no version, is covered by a requirements file's --no-binary, wasn't looked up (its index isn't known to be PyPI, or the run uses --index-url or WHEELGAP_INDEX_URL), or its lookup failed or was dropped (a note on stderr says so). It doesn't change results, summary or the exit code.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
                 },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",

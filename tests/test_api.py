@@ -1,9 +1,11 @@
 import json
+import re
 
 import pytest
 
 import wheelgap
 from wheelgap import Status
+from wheelgap.cli import main
 from wheelgap.pyodide import PyodideLockError, load_pyodide_lock
 from wheelgap.sources import SourceError
 
@@ -19,6 +21,18 @@ def test_make_targets_takes_cli_style_names():
     assert len(wheelgap.make_targets(python="3.13", platforms="all")) == 8
     with pytest.raises(wheelgap.TargetError):
         wheelgap.make_targets(python="3.13", platforms="solaris")
+
+
+def test_make_targets_next_is_the_newest_python():
+    targets = wheelgap.make_targets(python=["3.14", "next-t"], platforms="linux")
+    assert [t.python for t in targets] == ["3.14", "3.15t"]
+
+
+def test_make_targets_rejects_free_threaded_before_3_13():
+    with pytest.raises(wheelgap.TargetError, match=r"free-threading starts at Python 3\.13 \(not 3\.12t\)"):
+        wheelgap.make_targets("3.12t")
+    with pytest.raises(wheelgap.TargetError, match="free-threading starts at Python 3.13"):
+        wheelgap.make_targets(python=["3.13", "cp312t"], platforms="linux")
 
 
 @pytest.mark.parametrize("python", ["", " , "])
@@ -63,7 +77,16 @@ def test_check_package_offline_with_files():
         "error": None,
         "results": {"3.13 linux-x86_64": "wheel", "3.13 musl-aarch64": "source"},
     }
-    json.dumps(result.to_dict())  # JSON-friendly
+    assert result.to_dict(explain=True) == {
+        **result.to_dict(),
+        "rejected": {
+            "3.13 musl-aarch64": [
+                {"file": files[0], "reason": "manylinux_2_17_x86_64 doesn't match musl-aarch64"},
+            ]
+        },
+        "via": {},
+    }
+    json.dumps(result.to_dict(explain=True))  # JSON-friendly
 
 
 def test_check_package_from_index(fake_pypi):
@@ -287,3 +310,158 @@ def test_check_lockfile_refuses_pyproject(fake_pypi, tmp_path):
     with pytest.raises(SourceError, match="lists direct dependencies only.*pass a lockfile"):
         wheelgap.check_lockfile(path)
     assert not fake_pypi
+
+
+# abi3lib's only wheel is abi3 for Linux: fine on 3.13 there, not on free-threaded 3.14t, and none for Windows.
+# app depends on it directly on Linux and through mid everywhere, so the path differs per target.
+LOCK_ABI3 = (
+    'version = 1\nrequires-python = ">=3.13"\n\n'
+    '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+    'dependencies = [{ name = "mid" }, { name = "abi3lib", marker = "sys_platform == \'linux\'" }]\n\n'
+    '[[package]]\nname = "mid"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'dependencies = [{ name = "abi3lib" }]\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/mid-1.0-py3-none-any.whl" }]\n\n'
+    '[[package]]\nname = "abi3lib"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'sdist = { url = "https://files.pythonhosted.org/p/abi3lib-1.0.tar.gz" }\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/abi3lib-1.0-cp312-abi3-manylinux_2_17_x86_64.whl" }]\n'
+)
+ABI3_WHEEL = "abi3lib-1.0-cp312-abi3-manylinux_2_17_x86_64.whl"
+
+
+def test_check_lockfile_reasons_and_via(fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_ABI3, encoding="utf-8")
+    linux, win, linux_ft, win_ft = wheelgap.make_targets(python="3.13,3.14t", platforms=["linux-x86_64", "win-amd64"])
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path, [linux, win, linux_ft, win_ft])}
+    lib = results["abi3lib"]
+    assert lib.statuses == {linux: Status.WHEEL, win: Status.SOURCE, linux_ft: Status.SOURCE, win_ft: Status.SOURCE}
+    abi3 = "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+    assert lib.reasons[linux_ft] == f"{ABI3_WHEEL}  {abi3}"
+    assert linux not in lib.reasons and linux not in lib.rejected  # no reason for the wheel cell
+    assert lib.rejected[linux_ft] == [(ABI3_WHEEL, abi3)]
+    # Per gap target, each with its own path: directly on Linux, through mid on Windows.
+    assert lib.via == {
+        win: ("app", "mid", "abi3lib"),
+        linux_ft: ("app", "abi3lib"),
+        win_ft: ("app", "mid", "abi3lib"),
+    }
+    assert results["mid"].via == {} and results["mid"].reasons == {}  # no gaps: nothing to explain
+    data = lib.to_dict(explain=True)
+    assert data["via"] == {
+        "3.13 win-amd64": ["app", "mid", "abi3lib"],
+        "3.14t linux-x86_64": ["app", "abi3lib"],
+        "3.14t win-amd64": ["app", "mid", "abi3lib"],
+    }
+    assert data["rejected"]["3.14t linux-x86_64"] == [{"file": ABI3_WHEEL, "reason": abi3}]
+    assert "via" not in lib.to_dict() and "rejected" not in lib.to_dict()
+    json.dumps(data)
+
+
+def test_explain_matches_the_command_line(capsys, fake_pypi, fixtures):
+    targets = wheelgap.make_targets(python="3.13,3.14", platforms=["linux-x86_64", "pyodide"])
+    results = {r.name: r for r in wheelgap.check_lockfile(fixtures / "uvproj", targets)}
+    argv = [str(fixtures / "uvproj"), "-p", "3.13,3.14", "-t", "linux-x86_64,pyodide", "--exit-zero", "--explain"]
+    main(argv)
+    out = capsys.readouterr().out
+    main([*argv, "--json"])
+    packages = {p["name"]: p for p in json.loads(capsys.readouterr().out)["packages"]}
+    assert results["nativeext"].via[targets[0]] == ("demo", "fastlib", "nativeext")
+    assert results["nativeext"].reasons[targets[0]] == "no wheels published for this version"
+    assert results["fastlib"].reasons[targets[2]].count("\n") == 2  # three rejected wheels
+    assert "can't build packages from source" in results["nativeext"].reasons[targets[1]]
+    for r in results.values():
+        data = r.to_dict(explain=True)
+        assert (data["rejected"], data["via"]) == (packages[r.name]["rejected"], packages[r.name]["via"])
+        for t, text in r.reasons.items():
+            block = out.split(f"{r.name} {r.version} on {t.label(True)}: ", 1)[1].split("\n\n", 1)[0]
+            lines = [line for line in block.split("\n")[1:] if not line.startswith(("  via: ", "  build needs: "))]
+            # The command line lines the reasons up in a column; Result.reasons doesn't.
+            assert [re.sub(r"^  (\S+\.whl) +", r"\1  ", line).removeprefix("  ") for line in lines] == text.split("\n")
+
+
+def test_reasons_list_every_wheel_unaligned():
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    files = [f"x-1.0-cp3{m}-cp3{m}-win_amd64.whl" for m in range(5, 16)] + ["x-1.0.tar.gz"]  # 11 wheels
+    result = wheelgap.check_package("x", "1.0", targets, files=files)
+    lines = result.reasons[targets[0]].split("\n")
+    assert len(lines) == 11 == len(result.rejected[targets[0]])  # not capped at --explain's 8
+    assert lines == [f"{f}  {why}" for f, why in result.rejected[targets[0]]]  # no column padding
+
+
+def test_no_reasons_for_unknown_or_bundled(fake_pypi, fixtures):
+    lock = load_pyodide_lock(str(fixtures / "pyodide-lock.json"))
+    linux, pyodide = wheelgap.make_targets(python="3.13", platforms=["linux-x86_64", "pyodide"])
+    bundled = wheelgap.check_package(
+        "MarkupSafe", "3.0.2", [linux, pyodide], files=["markupsafe-3.0.2.tar.gz"], pyodide_locks=[lock]
+    )
+    assert bundled.statuses == {linux: Status.SOURCE, pyodide: Status.BUNDLED}
+    assert list(bundled.reasons) == list(bundled.rejected) == [linux]
+    (unknown,) = wheelgap.check_packages(["does-not-exist"], [linux])
+    assert unknown.statuses == {linux: Status.UNKNOWN}
+    assert unknown.reasons == unknown.rejected == {}
+    assert unknown.to_dict(explain=True)["rejected"] == {}
+
+
+def test_yanked_wheel_is_named_not_missing(fake_pypi):
+    # halfyanked 2.0: a yanked py3-none-any wheel and an sdist, so pip builds the sdist.
+    (linux,) = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    result = wheelgap.check_package("halfyanked", "2.0", [linux])
+    assert result.statuses == {linux: Status.SOURCE}
+    assert result.reasons == {linux: "halfyanked-2.0-py3-none-any.whl  yanked"}
+
+
+def test_via_is_empty_without_a_graph(fake_pypi, tmp_path):
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n")
+    (result,) = wheelgap.check_lockfile(tmp_path / "requirements.txt", wheelgap.make_targets("3.13", "linux-x86_64"))
+    assert result.via == {} and result.to_dict(explain=True)["via"] == {}
+    assert list(result.reasons.values()) == ["no wheels published for this version"]
+    assert wheelgap.check_package("nowheels", "0.9", wheelgap.make_targets("3.13", "linux-x86_64")).via == {}
+
+
+def test_check_lockfile_pixi_environment(fake_pypi, fixtures, tmp_path):
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    default = {r.name for r in wheelgap.check_lockfile(fixtures / "pixiproj", targets)}
+    assert default == {"fastlib", "purewheel"}  # winonly is n/a on linux-x86_64
+    results = wheelgap.check_lockfile(fixtures / "pixiproj", targets, environment="test")
+    assert [(r.name, r.statuses[targets[0]]) for r in results] == [("nowheels", Status.SOURCE)]
+    # In a folder with another lockfile too, naming an environment reads pixi.lock.
+    (tmp_path / "pixi.lock").write_bytes((fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    assert [r.name for r in wheelgap.check_lockfile(tmp_path, targets, environment="test")] == ["nowheels"]
+    with pytest.raises(SourceError, match="environment applies to pixi.lock only"):
+        wheelgap.check_lockfile(fixtures / "uvproj", targets, environment="test")
+    with pytest.raises(SourceError, match="the environment name is empty"):
+        wheelgap.check_lockfile(fixtures / "pixiproj", targets, environment="")
+
+
+def test_check_lockfile_pixi_failed_lookup_has_no_files(fixtures, monkeypatch):
+    from wheelgap import pypi
+
+    def down(url, timeout=20.0):
+        raise OSError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", down)
+    targets = wheelgap.make_targets(python="3.13", platforms="macos-arm64")
+    (fastlib,) = [r for r in wheelgap.check_lockfile(fixtures / "pixiproj", targets) if r.name == "fastlib"]
+    # Not the lock's two files, which are only what pixi picked for its platforms
+    assert (fastlib.statuses[targets[0]], fastlib.files) == (Status.UNKNOWN, ())
+
+
+def test_check_lockfile_requirements_format_control_explain(fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("--no-binary fastlib\n--only-binary nowheels\nfastlib==2.0.0\nnowheels==0.9\n", encoding="utf-8")
+    (lin,) = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    results = {r.name: r for r in wheelgap.check_lockfile(req, [lin])}
+
+    assert results["fastlib"].statuses[lin] is Status.SOURCE
+    assert results["fastlib"].rejected[lin] == [
+        ("fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "ignored (--no-binary)")
+    ]
+    assert "ignored (--no-binary)" in results["fastlib"].reasons[lin]
+    assert results["fastlib"].to_dict(explain=True)["rejected"] == {
+        lin.label(True): [
+            {"file": "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "reason": "ignored (--no-binary)"}
+        ]
+    }
+
+    assert results["nowheels"].statuses[lin] is Status.MISSING
+    assert "--only-binary forbids building from source" in results["nowheels"].reasons[lin]

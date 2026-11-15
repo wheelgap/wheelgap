@@ -46,6 +46,8 @@ def test_rejection_reasons():
     )
     assert rejection("x-1-cp313-cp313-win_amd64.whl", target()) == "win_amd64 doesn't match linux-x86_64"
     assert rejection("x-1-py3-none-any.whl", target()) is None
+    for _ in range(2):  # the second time from the filename cache
+        assert rejection("bad.whl", target()) == "unparseable wheel filename"
 
 
 def test_explain_puts_closest_misses_first(fixtures):
@@ -54,6 +56,12 @@ def test_explain_puts_closest_misses_first(fixtures):
     got = [f for f, _ in explain(armlib.files, target(plat="musl-aarch64"))]
     assert got[0] == GLIBC_ARM  # same arch, wrong libc: the one a bug reporter cares about
     assert not any(f.endswith(".tar.gz") for f in got)
+    # A wheel name that doesn't parse sorts last, cold or from the filename cache.
+    for _ in range(2):
+        assert explain([*armlib.files, "bad.whl"], target(plat="musl-aarch64"))[-1] == (
+            "bad.whl",
+            "unparseable wheel filename",
+        )
 
 
 def test_cli_explain(capsys, fixtures):
@@ -157,3 +165,41 @@ def test_explain_abi3t_and_legacy_manylinux():
     assert rejection("x-1-cp313-cp313-manylinux2014_x86_64.whl", old) == (
         "manylinux2014_x86_64 needs glibc 2.17, newer than 2.12 (--glibc)"
     )
+
+
+def test_cli_explain_lists_at_most_eight_wheels(capsys, fake_pypi, tmp_path):
+    wheels = [f"many-1.0-cp3{m}-cp3{m}-win_amd64.whl" for m in range(5, 16)]  # 11, none for Linux
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\nrequires-python = ">=3.13"\n\n'
+        '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\ndependencies = [{ name = "many" }]\n\n'
+        '[[package]]\nname = "many"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.pythonhosted.org/p/many-1.0.tar.gz" }\n'
+        "wheels = [" + ", ".join(f'{{ url = "https://files.pythonhosted.org/p/{w}" }}' for w in wheels) + "]\n",
+        encoding="utf-8",
+    )
+    main([str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--exit-zero"])
+    out = capsys.readouterr().out
+    assert sum(w in out for w in wheels) == 8
+    assert "  … and 3 more (--json lists them all)\n" in out
+    main([str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--exit-zero", "--json"])
+    (many,) = [p for p in json.loads(capsys.readouterr().out)["packages"] if p["name"] == "many"]
+    assert len(many["rejected"]["linux-x86_64"]) == 11
+
+
+def test_cli_explain_names_a_yanked_wheel(capsys, fake_pypi):
+    # halfyanked 2.0 has an sdist and a yanked wheel that would fit: pip skips the wheel and builds the sdist.
+    argv = ["halfyanked==2.0", "-p", "3.13", "-t", "linux-x86_64", "--explain", "--exit-zero"]
+    main(argv)
+    out = capsys.readouterr().out
+    assert "halfyanked 2.0 on linux-x86_64: ● source\n  halfyanked-2.0-py3-none-any.whl  yanked\n" in out
+    assert "no wheels published" not in out
+    main([*argv, "--json"])
+    (pkg,) = json.loads(capsys.readouterr().out)["packages"]
+    assert pkg["rejected"] == {"linux-x86_64": [{"file": "halfyanked-2.0-py3-none-any.whl", "reason": "yanked"}]}
+
+
+def test_yanked_wheel_counts_when_nothing_else_fits():
+    # Every file this target could use is yanked, so pip installs the wheel anyway: nothing to explain.
+    wheel = "y-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"
+    assert explain([wheel], target(), frozenset({wheel})) == []
+    assert explain([wheel, "y-1.0.tar.gz"], target(), frozenset({wheel})) == [(wheel, "yanked")]

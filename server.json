@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.wheelgap/wheelgap",
+  "title": "wheelgap",
+  "description": "Find Python dependencies with no prebuilt wheel for your platforms: ARM, Alpine, Windows on ARM",
+  "repository": {
+    "url": "https://github.com/wheelgap/wheelgap",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md",
+  "version": "0.9.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "wheelgap",
+      "version": "0.9.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

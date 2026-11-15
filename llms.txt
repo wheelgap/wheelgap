@@ -10,6 +10,7 @@ The README and docs on `main` can describe changes that aren't on PyPI yet; `CHA
 - [Install and run](https://github.com/wheelgap/wheelgap#install-and-run-under-30-seconds): `uvx wheelgap`, `pipx run wheelgap` or `pip install wheelgap`
 - [Usage](https://github.com/wheelgap/wheelgap#usage): examples, `[tool.wheelgap]` config, result statuses, `--explain`, how `--json` results are keyed, exit codes, `--ignore`
 - [Targets](https://github.com/wheelgap/wheelgap#targets): platform names and aliases, the wheel tags each accepts, `--glibc`, `--musl`, `--distro`
+- [Comparing two lockfiles](https://github.com/wheelgap/wheelgap#comparing-two-lockfiles): `wheelgap diff OLD NEW`, git refs such as `origin/main:uv.lock`, `--json`
 - [How it works](https://github.com/wheelgap/wheelgap#how-it-works): what is read offline, what is looked up on PyPI, environment markers
 - [Recipes](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md): multi-arch images, free-threading readiness, monorepos, agents and scripts
 - [JSON schema](https://github.com/wheelgap/wheelgap/blob/main/docs/wheelgap-output.schema.json): the shape of `--json` output on `main`; later versions may add keys
@@ -20,6 +21,7 @@ The README and docs on `main` can describe changes that aren't on PyPI yet; `CHA
 - [With pre-commit](https://github.com/wheelgap/wheelgap#with-pre-commit): the pre-commit hook
 - [From Python](https://github.com/wheelgap/wheelgap#from-python): `make_targets`, `check_package`, `check_lockfile`
 - [With an AI coding agent](https://github.com/wheelgap/wheelgap#with-an-ai-coding-agent): the `check-wheels` skill for Claude Code, Codex, Cursor and Copilot
+- [MCP server](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md): `uvx --from wheelgap wheelgap-mcp`, a stdio MCP server with read-only `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools; setup for Claude Code, Cursor, VS Code, Codex and Claude Desktop
 
 ## Optional
 

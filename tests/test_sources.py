@@ -1,15 +1,19 @@
 import json
+import re
+from pathlib import Path
 
 import pytest
 
-from wheelgap import pypi
+from wheelgap import pypi, sources
 from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
     SourceError,
     UvSelection,
+    _BlockYaml,
     find_lockfile,
     load_inputs,
+    parse_pixi_lock,
     parse_poetry_lock,
     parse_requirements,
     pythons_outside_lock,
@@ -37,8 +41,8 @@ def test_uv_lock(fixtures):
     ]
     assert pkgs["puresdist"].files == ["puresdist-1.0.tar.gz"]
     assert src.roots == [0]
-    assert ("winonly", None, "sys_platform == 'win32'") in src.edges[0]
-    assert ("devtool", None, None) in src.edges[0]
+    assert ("winonly", None, "sys_platform == 'win32'", None) in src.edges[0]
+    assert ("devtool", None, None, None) in src.edges[0]
 
 
 def test_uv_lock_dependency_group_names(tmp_path):
@@ -48,8 +52,110 @@ def test_uv_lock_dependency_group_names(tmp_path):
         encoding="utf-8",
     )
     (src,) = load_inputs([str(tmp_path)])
-    assert [name for name, _, _ in src.root_edges] == ["pytest", "sphinx", "app"]
+    assert [name for name, *_ in src.root_edges] == ["pytest", "sphinx", "app"]
     assert src.root_groups == {0: "dev", 1: "docs"}  # the plain requirement has no group
+
+
+@pytest.mark.parametrize(
+    "edge, message",
+    [
+        ('{ name = "b", marker = 5 }', "package a has a dependency 'b' with a `marker` that isn't a string"),
+        ('{ name = "b", version = ["1.0"] }', "package a has a dependency 'b' with a `version` that isn't a string"),
+        ('{ name = { x = "b" } }', "package a has a dependency with a `name` that isn't a string"),
+        ('{ name = "b", extra = 3 }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
+        # uv writes a list here; a string would be read as its characters, and the extra's packages left out
+        ('{ name = "b", extra = "s3" }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
+        ('"b"', "package a has a dependency that isn't a table"),
+        ('{ marker = "x" }', "package a has a dependency without a `name`"),
+        ('{ name = "b", source = "pypi" }', "package a has a dependency 'b' with a `source` that isn't a table"),
+    ],
+)
+def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, message):
+    # Used to reach packaging as a TypeError, far from the file. A list of extras is a format uv writes.
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\ndependencies = [{edge}]\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match=re.escape(message)):
+        load_inputs([str(tmp_path)])
+
+
+@pytest.mark.parametrize(
+    "tables, message",
+    [
+        (
+            '[package.optional-dependencies]\ns3 = [{ name = "b", marker = 5 }]\n',
+            "package a has a dependency 'b' with a `marker` that isn't a string",
+        ),
+        (
+            '[package.dev-dependencies]\ndev = [{ name = "b", version = 1 }]\n',
+            "package a has a dependency 'b' with a `version` that isn't a string",
+        ),
+        (
+            '\n[manifest]\nrequirements = [{ name = "b", marker = 5 }]\n',
+            "the manifest has a dependency 'b' with a `marker` that isn't a string",
+        ),
+        (
+            "\n[manifest.dependency-groups]\ndev = [{ name = 5 }]\n",
+            "the manifest has a dependency with a `name` that isn't a string",
+        ),
+        # the manifest writes `extras` where a package's edge writes `extra`
+        (
+            '\n[manifest]\nrequirements = [{ name = "b", extras = "s3" }]\n',
+            "the manifest has a dependency 'b' with an `extras` that isn't a list of strings",
+        ),
+        # the lists and tables that hold the edges
+        ("dependencies = 5\n", "package a has a group of dependencies that isn't a list"),
+        ("optional-dependencies = 5\n", "package a has a `optional-dependencies` that isn't a table of groups"),
+        ("\n[manifest]\nrequirements = 5\n", "the manifest has a `requirements` that isn't a list"),
+        ("\n[manifest.dependency-groups]\ndev = 5\n", "the manifest has a group of dependencies that isn't a list"),
+        (
+            "\n[manifest]\ndependency-groups = []\n",
+            "the manifest has a `dependency-groups` that isn't a table of groups",
+        ),
+    ],
+)
+def test_uv_lock_edge_of_the_wrong_type_in_a_group_or_the_manifest_raises(tmp_path, tables, message):
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\n{tables}', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match=re.escape(message)):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_manifest_that_is_not_a_table_raises(tmp_path):
+    (tmp_path / "uv.lock").write_text("version = 1\nmanifest = 5\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape("uv.lock: `manifest` isn't a table")):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_dependency_extra_may_be_a_list(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[manifest]\nrequirements = [{ name = "a" }]\n\n[[package]]\nname = "a"\nversion = "1.0"\n'
+        'dependencies = [{ name = "b", extra = ["s3", "gcs"] }]\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.edges[0] == [("b", None, None, None)]
+
+
+def test_uv_lock_dependency_source_is_preserved(tmp_path):
+    cpu = "https://download.pytorch.org/whl/cpu"
+    (tmp_path / "uv.lock").write_text(
+        f"""
+version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [
+    {{ name = "torch", version = "2.5.1", source = {{ registry = "{cpu}" }}, marker = "sys_platform == 'linux'" }},
+]
+""",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.edges[0] == [("torch", "2.5.1", "sys_platform == 'linux'", {"registry": cpu})]
 
 
 def test_poetry_lock(fixtures):
@@ -479,6 +585,17 @@ def test_uv_path_dependency_is_not_a_root(tmp_path):
     assert rows["pywin32"].results == {lin: Status.NOT_NEEDED, win: Status.WHEEL}
 
 
+@pytest.mark.parametrize("markers", ["[\"sys_platform == 'win32'\"]", "[]", "1", "true", "{ main = 1 }"])
+def test_poetry_rejects_wrong_typed_markers(tmp_path, markers):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
+        f'markers = {markers}\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"poetry\.lock.*colorama.*markers"):
+        load_inputs([str(tmp_path)])
+
+
 def test_poetry_dict_markers_with_an_unconditional_group(tmp_path):
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
@@ -709,6 +826,75 @@ def test_pylock_records_requires_python_and_index(tmp_path):
     assert src.requires_python == "==3.13.*" and src.packages[0].registry == "https://pypi.org/simple"
 
 
+def test_uv_lock_file_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://[files.pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_file_url_with_a_space_in_the_host_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://files pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_pylock_sdist_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\n'
+        'sdist = { url = "https://[files.pythonhosted.org/b-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pylock\.toml.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path / "pylock.toml")])
+
+
+def test_pylock_sdist_url_that_cannot_be_parsed_is_an_input_error_even_with_a_name(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\n'
+        'sdist = { name = "b-1.0.tar.gz", url = "https://user:secret@[files.pythonhosted.org/b-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pylock\.toml.*package b.*can't be parsed") as e:
+        load_inputs([str(tmp_path / "pylock.toml")])
+    assert "secret" not in str(e.value)  # the URL may carry credentials, so it isn't echoed back
+
+
+def test_pdm_lock_file_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "pdm.lock").write_text(
+        '[[package]]\nname = "b"\nversion = "1.0"\n'
+        'files = [{ url = "https://[files.pythonhosted.org/b-1.0-py3-none-any.whl", hash = "sha256:00" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pdm\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path / "pdm.lock")])
+
+
+def test_uv_lock_file_urls_that_still_parse_keep_their_file_names(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        "wheels = [\n"
+        '    { url = "https://files.example/b-1.0-py3-none-any.whl;x=1" },\n'  # URL parameters aren't the name
+        '    { url = "https://[::1]/b-1.0-cp313-cp313-win_amd64.whl" },\n'
+        '    { url = "https://user:p w@files.example/b-1.0-cp313-cp313-win_arm64.whl" },\n'
+        "]\n",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.packages[0].files == [
+        "b-1.0-py3-none-any.whl",
+        "b-1.0-cp313-cp313-win_amd64.whl",
+        "b-1.0-cp313-cp313-win_arm64.whl",
+    ]
+
+
 def test_pipfile_lock_non_string_version_raises(tmp_path):
     path = tmp_path / "Pipfile.lock"
     path.write_text(json.dumps({"default": {"requests": {"version": 2}}}), encoding="utf-8")
@@ -888,3 +1074,694 @@ def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
     select_uv_dependencies(sources, UvSelection(no_dev=True))
     # Without dev, only main's marker applies.
     assert sources[0].packages[0].markers == ['sys_platform == "win32"']
+
+
+def test_pixi_lock(fixtures):
+    source = load_inputs([str(fixtures / "pixiproj")])[0]
+    assert source.label == "pixi.lock" and source.kind == "pixi"
+    pkgs = by_name(source)
+    # Each platform records the one file pixi picked there; together they're the package's files, which are only
+    # some of the release's, so the package is still looked up on its index.
+    assert pkgs["fastlib"].files == ["fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "fastlib-2.0.0.tar.gz"]
+    assert pkgs["fastlib"].partial_files and pkgs["fastlib"].registry is None
+    assert pkgs["fastlib"].markers is None  # on every platform
+    assert pkgs["internal"].registry == "https://example.com/simple"
+    assert {name: p.skip for name, p in pkgs.items() if p.skip} == {
+        "gitdep": "git",
+        "localpkg": "conda",
+        "openssl": "conda",
+        "python": "conda",
+    }
+    assert pkgs["python"].version == "3.13.9"
+    # winonly is locked on win-64 only: hidden on the lock's other platforms for its Python (3.13), nowhere else.
+    linux, mac, win = build_targets(["3.13"], ["linux-x86_64", "macos-arm64", "win-amd64"])
+    (linux14,) = build_targets(["3.14"], ["linux-x86_64"])
+    rows = {r.package.name: r for r in check([source], [linux, mac, win, linux14])}
+    assert rows["winonly"].results == {
+        linux: Status.NOT_NEEDED,
+        mac: Status.NOT_NEEDED,
+        win: Status.WHEEL,
+        linux14: Status.MISSING,
+    }
+    # A platform the lock doesn't cover still counts it: what pixi would install there isn't known. musl-x86_64
+    # evaluates markers as linux-64 does (linux, x86_64), so it's hidden there too.
+    musl, arm = build_targets(["3.13"], ["musl-x86_64", "linux-aarch64"])
+    rows = {r.package.name: r for r in check([source], [musl, arm])}
+    assert rows["winonly"].results == {musl: Status.NOT_NEEDED, arm: Status.MISSING}
+
+
+def test_pixi_lock_environment(fixtures):
+    source = load_inputs([str(fixtures / "pixiproj")], "test")[0]
+    assert [(p.name, p.skip) for p in source.packages] == [("nowheels", None), ("python", "conda")]
+    with pytest.raises(SourceError, match=r"pixi.lock: no environment 'docs' \(it has: default, test\)"):
+        load_inputs([str(fixtures / "pixiproj")], "docs")
+    with pytest.raises(SourceError, match="--environment applies to pixi.lock inputs only"):
+        load_inputs([str(fixtures / "uvproj")], "test")
+
+
+def test_find_lockfile_finds_pixi_lock(fixtures):
+    assert find_lockfile(fixtures / "pixiproj").name == "pixi.lock"
+
+
+PIXI_V6 = """\
+version: 6
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - INDEX
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.8-h9e4cc4f_1_cpython.conda
+      - pypi: https://files.pythonhosted.org/packages/aa/purewheel-3.1-py3-none-any.whl
+      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+      - pypi: ./
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.8-h9e4cc4f_1_cpython.conda
+  sha256: 0123
+  md5: 4567
+  depends:
+  - libgcc >=13
+  license: Python-2.0
+- pypi: https://files.pythonhosted.org/packages/aa/purewheel-3.1-py3-none-any.whl
+  name: purewheel
+  version: '3.1'
+  sha256: 89ab
+- pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  sha256: cdef
+- pypi: ./
+  name: myproject
+  version: 0.1.0
+  sha256: 0011
+  requires_dist:
+  - "fastlib ; python_version >= \\"3.10\\""
+  requires_python: '>=3.10'
+  editable: true
+"""
+
+
+@pytest.mark.parametrize(
+    "index,fastlib",
+    [
+        # PyPI serves files only from files.pythonhosted.org, so a file elsewhere is a direct URL.
+        ("https://pypi.org/simple", "url"),
+        # A version 6 lock doesn't say which index a package came from: a name off PyPI's file host may be internal.
+        ("https://mirror.example.com/simple", "private index"),
+    ],
+)
+def test_pixi_lock_version_6(tmp_path, index, fastlib):
+    lock = tmp_path / "pixi.lock"
+    lock.write_text(PIXI_V6.replace("INDEX", index), encoding="utf-8")
+    pkgs = by_name(load_inputs([str(lock)])[0])
+    assert {name: p.skip for name, p in pkgs.items()} == {
+        "purewheel": None,  # on PyPI's file host: a PyPI package whatever the indexes
+        "fastlib": fastlib,
+        "myproject": "editable",
+        "python": "conda",
+    }
+    assert pkgs["purewheel"].files == ["purewheel-3.1-py3-none-any.whl"]
+
+
+PIXI_V7 = (Path(__file__).parent / "fixtures" / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "old,new,message",
+    [
+        # Lock versions it doesn't know, older or newer: refused, never read as if they were 6 or 7.
+        ("version: 7", "version: 5", "pixi.lock version '5' isn't supported"),
+        ("version: 7", "version: 8", "pixi.lock version '8' isn't supported"),
+        ("version: 7\n", "", "no top-level `version`"),
+        # YAML outside the subset pixi writes
+        ("- name: osx-arm64", "- name: &p osx-arm64", "unsupported YAML"),
+        ("  license: Apache-2.0\n", "  license: |\n    Apache-2.0\n", "unsupported YAML"),
+        ("  purls: []\n  run_exports:", "  purls: [pkg:pypi/x]\n  run_exports:", "unsupported YAML"),
+        ("  name: winonly\n", "  name: winonly # a comment\n", "unsupported YAML"),
+        ("  name: winonly\n", "  name: winonly\n    more\n", "unexpected indentation"),
+        ("  name: winonly\n", "  name: 'winonly\n", "must end on its own line"),
+        ("  name: winonly\n", '  name: "win\\qonly"\n', "unsupported escape"),
+        ("  name: winonly\n", "  name: winonly\n  name: other\n", "duplicate key 'name'"),
+        ("  name: winonly\n", "\tname: winonly\n", "unsupported character '\\t'"),
+        ("  name: winonly\n", "  name: winonly\n  []: x\n", "unsupported key '[]'"),
+        ("version: 7\n", "version: 7\n# generated\n", "comments and document markers"),
+        ("version: 7\n", "version: 7\n---\n", "comments and document markers"),
+        # The version the reader checked must be the one the YAML says ('7\'\'' is the string "7'").
+        ("version: 7\n", "version: '7'''\n", "with that `version`"),
+        (
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n"
+            "  version: '0.9'\n"
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "two PyPI packages at",
+        ),
+        # Structure it can't be sure of
+        ("platforms:", "platform:", "unknown top-level key 'platform'"),
+        (
+            "  requires_python: '>=3.9'\n- pypi: https://files",
+            "  editable: 'true'\n- pypi: https://files",
+            "key 'editable'",
+        ),
+        (
+            "    indexes:\n    - https://pypi.org/simple\n    packages:\n      linux-64:\n      - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl",
+            "    packages:\n      linux-64:\n      - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl",
+            "has PyPI packages but no `indexes`",
+        ),
+        ("    channels:\n", "    solver: uv\n    channels:\n", "unknown key 'solver'"),
+        ("- name: win-64\n", "", "platform 'win-64', which `platforms` doesn't list"),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-1.0.tar.gz\n",
+            "isn't in `packages`",
+        ),
+        (
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "has no name",
+        ),
+        (
+            "  name: nowheels\n  version: '0.9'\n",
+            "  name: nowheels\n",
+            "nowheels comes from an index but has no version",
+        ),
+        (
+            "- pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567\n  name",
+            "- pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567\n"
+            "  conda: x\n  name",
+            "isn't exactly one of",
+        ),
+        (
+            "git+https://github.com/example/gitdep.git",
+            "ftp://github.com/example/gitdep.git",
+            "location wheelgap can't read",
+        ),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n        extras: [x]\n",
+            "unsupported YAML",
+        ),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n        extras: x\n",
+            "has other keys",
+        ),
+    ],
+)
+def test_pixi_lock_refuses_what_it_cannot_read_for_sure(tmp_path, old, new, message):
+    assert old in PIXI_V7
+    lock = tmp_path / "pixi.lock"
+    lock.write_text(PIXI_V7.replace(old, new), encoding="utf-8")
+    with pytest.raises(SourceError, match="^pixi.lock: ") as e:
+        parse_pixi_lock(lock, "test" if "nowheels" in old else None)
+    assert message in str(e.value)
+
+
+def test_pixi_lock_reads_quoted_scalars(tmp_path):
+    lock = tmp_path / "pixi.lock"
+    text = PIXI_V7.replace("  name: winonly\n", '  name: "win\\x6fnly"\n').replace(
+        "  name: purewheel\n", "  'name': 'purewheel'\n"
+    )
+    lock.write_text(text, encoding="utf-8")
+    # (A name with '' in it, such as pure'wheel, isn't a valid package name; test_block_yaml_reads covers the escape.)
+    assert {"winonly", "purewheel"} <= set(by_name(parse_pixi_lock(lock)))
+
+
+@pytest.mark.parametrize(
+    "text,message",
+    [
+        # Tabs and control characters anywhere, which YAML would read differently or libyaml refuses
+        ("- true\t\n", "unsupported character '\\t'"),
+        ("- a,b\t# c\n", "unsupported character '\\t'"),
+        ("- a:\tb\n", "unsupported character '\\t'"),
+        ("k: \t\n", "unsupported character '\\t'"),
+        ("version: 311\t\n", "unsupported character '\\t'"),
+        ("a: 1\x0bb: 2\n", "unsupported character '\\x0b'"),
+        ("a: 1\x0cb: 2\n", "unsupported character '\\x0c'"),
+        ("a: 1\x1cb: 2\n", "unsupported character '\\x1c'"),
+        ("a: 1\x1db: 2\n", "unsupported character '\\x1d'"),
+        ("a: 1\x1eb: 2\n", "unsupported character '\\x1e'"),
+        ("a: 1\u2028b: 2\n", "unsupported character '\\u2028'"),
+        ("a: 1\u2029b: 2\n", "unsupported character '\\u2029'"),
+        ("k: a\ufffe\n", "unsupported character '\\ufffe'"),
+        ("k: 'a\uffff'\n", "unsupported character '\\uffff'"),
+        ("k: a\x01b\n", "unsupported character '\\x01'"),
+        ("k: a\x7f\n", "unsupported character '\\x7f'"),
+        ("k: a\x85\n", "unsupported character '\\x85'"),
+        ("k: 'a\x9fb'\n", "unsupported character '\\x9f'"),
+        ("\ufeffversion: 7\n", "unsupported character '\\ufeff'"),  # only parse_pixi_lock strips a leading one
+        ('k: "\\ud800"\n', "isn't a Unicode character"),
+        ('k: "\\U00110000"\n', "isn't a Unicode character"),
+        ('k: "\\q"\n', "unsupported escape"),
+        # A space before the colon, which YAML would leave out of the key
+        ("a : b\n", "a space before the colon"),
+        ("- 6 :\n", "a space before the colon"),
+        # Sequence indicators and document markers where a value or a key should be
+        ("k: -\n", "unsupported YAML: '-'"),
+        ("--- a: b\n", "comments and document markers"),
+        ("... a: b\n", "comments and document markers"),
+        ("# a comment\n", "comments and document markers"),
+        # Structure: lines left over, a first line that's indented, bare and nested items, junk after a quoted key
+        ("- a\nb: c\n", "line 2: unexpected indentation"),
+        ("  a: 1\nb: 2\n", "line 1: unexpected indentation"),
+        ("k:\n-\n", "line 2: unexpected indentation"),
+        ("k:\n- - a\n", "nested sequences"),
+        ("'a'x: b\n", "expected `key: value`"),
+        ("k:\n  a: 1\n    b: 2\n", "line 3: unexpected indentation"),
+        ("k: v\n  more\n", "line 2: unexpected indentation"),
+        # `k: a: b` is the key k with a value YAML refuses, not the key `k: a`
+        ("k: a: b\n", "unsupported YAML: 'a: b'"),
+        ("- 'a\n", "must end on its own line"),
+        ("[]: x\n", "unsupported key '[]'"),
+    ],
+)
+def test_block_yaml_refuses(text, message):
+    with pytest.raises(sources._YamlError) as e:
+        _BlockYaml(text).read()
+    assert message in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("k: v   \nl: 'w'  \n", {"k": "v", "l": "w"}),  # trailing spaces aren't part of a value
+        ("a: 1\r\nb: 2\r\n", {"a": "1", "b": "2"}),
+        ("a: 1\rb: 2\r", {"a": "1", "b": "2"}),
+        (
+            "a:\n- x\n- y: 1\n  z: '2'\nb: {}\nc: []\nd:\n",
+            {"a": ["x", {"y": "1", "z": "2"}], "b": {}, "c": [], "d": None},
+        ),
+        ("a:\n  -x: 1\n", {"a": {"-x": "1"}}),  # "-x" is a key, not a sequence item
+        ("a:\n  b:\n  - 1\n  c: 2\n", {"a": {"b": ["1"], "c": "2"}}),
+        ("- a\n-   b: 1\n    c: 2\n", ["a", {"b": "1", "c": "2"}]),
+        ("url: https://x.org/a#b\n", {"url": "https://x.org/a#b"}),
+        ('k: "a\\tb\\u00e9\\x41\\U0001F600"\n', {"k": "a\tb\u00e9A\U0001f600"}),
+        ("'a: b': 'it''s'\n", {"a: b": "it's"}),
+        ('k: "\\U0010FFFF"\n', {"k": "\U0010ffff"}),  # the last code point is still a character
+    ],
+)
+def test_block_yaml_reads(text, expected):
+    assert _BlockYaml(text).read() == expected
+
+
+def test_pixi_lock_with_a_byte_order_mark(fixtures, tmp_path):
+    lock = tmp_path / "pixi.lock"
+    lock.write_bytes(b"\xef\xbb\xbf" + (fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    assert "fastlib" in by_name(parse_pixi_lock(lock))
+
+
+def test_pixi_lock_empty_environment_name_is_an_error(fixtures):
+    with pytest.raises(SourceError, match="the environment name is empty"):
+        parse_pixi_lock(fixtures / "pixiproj" / "pixi.lock", "")
+    with pytest.raises(SourceError, match="--environment needs a name"):
+        load_inputs([str(fixtures / "pixiproj")], "")
+
+
+def python(subdir: str, version: str = "3.13.9") -> str:
+    return f"conda: https://conda.anaconda.org/conda-forge/{subdir}/python-{version}-h0123456_0_cp313.conda"
+
+
+def pypi_entry(location: str, name: str, version: str | None = None, *extra: str) -> str:
+    return "\n".join(
+        [f"- pypi: {location}", f"  name: {name}", *([f"  version: '{version}'"] if version else []), *extra]
+    )
+
+
+def write_pixi(tmp_path, platforms, entries, *, subdirs=None, indexes=("https://pypi.org/simple",)):
+    """A small version 7 pixi.lock: `platforms` maps each platform to its selectors, `entries` are PyPI entries."""
+    subdirs = subdirs or {}
+    lines = ["version: 7", "platforms:"]
+    for name in platforms:
+        lines += [f"- name: {name}"] + ([f"  subdir: {subdirs[name]}"] if name in subdirs else [])
+    lines += ["environments:", "  default:", "    channels:", "    - url: https://conda.anaconda.org/conda-forge/"]
+    lines += ["    indexes:", *(f"    - {i}" for i in indexes), "    packages:"]
+    for name, selectors in platforms.items():
+        lines += [f"      {name}:", *(f"      - {s}" for s in selectors)]
+    lines.append("packages:")
+    lines += [f"- {c}" for c in sorted({s for ss in platforms.values() for s in ss if s.startswith("conda: ")})]
+    lines += entries
+    path = tmp_path / "pixi.lock"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+FILES = "https://files.pythonhosted.org/packages/aa"
+PURE = (
+    f"pypi: {FILES}/purewheel-3.1-py3-none-any.whl",
+    pypi_entry(f"{FILES}/purewheel-3.1-py3-none-any.whl", "purewheel", "3.1"),
+)
+FAST = (f"pypi: {FILES}/fastlib-2.0.0.tar.gz", pypi_entry(f"{FILES}/fastlib-2.0.0.tar.gz", "fastlib", "2.0.0"))
+
+
+def results(lock, pythons, platforms, name):
+    """The statuses of package `name` (by its locked files, no lookup) on those targets."""
+    rows = [r for r in check([parse_pixi_lock(lock)], build_targets(pythons, platforms)) if r.package.name == name]
+    return [{t.platform: s.value for t, s in r.results.items()} for r in rows]
+
+
+def test_pixi_platforms_sharing_a_subdir_are_one_group(tmp_path):
+    # linux-64-cuda (subdir linux-64) installs fastlib, linux-64 doesn't: pip on linux x86_64 can be either, so
+    # fastlib still counts there (cuda-python's cuda_pathfinder locks linux-64-cuda-12 and -13 like this).
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), PURE[0]], "linux-64-cuda": [python("linux-64"), PURE[0], FAST[0]]},
+        [PURE[1], FAST[1]],
+        subdirs={"linux-64-cuda": "linux-64"},
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "fastlib") == [{"linux-x86_64": "source"}]
+
+
+def test_pixi_two_versions_on_platforms_sharing_a_subdir(tmp_path):
+    old = f"{FILES}/forked-0.9.tar.gz"
+    new = f"{FILES}/forked-1.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {old}"], "glibc-2-17": [python("linux-64"), f"pypi: {new}"]},
+        [pypi_entry(old, "forked", "0.9"), pypi_entry(new, "forked", "1.0")],
+        subdirs={"glibc-2-17": "linux-64"},
+    )
+    # Two packages (the merge key has the version), and neither is hidden on linux x86_64.
+    assert results(lock, ["3.13"], ["linux-x86_64"], "forked") == [{"linux-x86_64": "source"}] * 2
+
+
+def test_pixi_platform_markers(tmp_path):
+    # purewheel is locked on osx-arm64 only: n/a on each other locked platform's markers.
+    platforms = {s: [python(s)] for s in ("linux-64", "linux-aarch64", "win-64", "osx-64")}
+    platforms["osx-arm64"] = [python("osx-arm64"), PURE[0]]
+    lock = write_pixi(tmp_path, platforms, [PURE[1]])
+    assert results(
+        lock, ["3.13"], ["linux-x86_64", "linux-aarch64", "win-amd64", "macos-x86_64", "macos-arm64"], "purewheel"
+    ) == [
+        {
+            "linux-x86_64": "n/a",
+            "linux-aarch64": "n/a",
+            "win-amd64": "n/a",
+            "macos-x86_64": "n/a",
+            "macos-arm64": "wheel",
+        }
+    ]
+    # win-arm64 isn't locked, so it counts there
+    assert results(lock, ["3.13"], ["win-arm64"], "purewheel") == [{"win-arm64": "wheel"}]
+
+
+def test_pixi_platform_named_by_its_subdir(tmp_path):
+    lock = write_pixi(
+        tmp_path,
+        {"gpu": [python("linux-64")], "osx-arm64": [python("osx-arm64"), PURE[0]]},
+        [PURE[1]],
+        subdirs={"gpu": "linux-64"},
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "n/a"}]
+
+
+OPENSSL = "conda: https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.0-h725018a_0.conda"
+
+
+def test_pixi_platform_without_python_hides_nothing(tmp_path):
+    # No conda python on win-64: which Python pixi locked for isn't known, so purewheel isn't hidden there.
+    lock = write_pixi(tmp_path, {"linux-64": [python("linux-64"), PURE[0]], "win-64": [OPENSSL]}, [PURE[1]])
+    assert results(lock, ["3.13"], ["win-amd64"], "purewheel") == [{"win-amd64": "wheel"}]
+
+
+def test_pixi_python_is_the_python_package_only(tmp_path):
+    dateutil = "conda: https://conda.anaconda.org/conda-forge/noarch/python-dateutil-2.9.0-pyhd8ed1ab_1.conda"
+    abi = "conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.14-8_cp314.conda"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), dateutil, abi], "osx-arm64": [python("osx-arm64"), PURE[0]]},
+        [PURE[1]],
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "n/a"}]
+    assert results(lock, ["3.14"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "wheel"}]
+
+
+def test_pixi_one_release_from_two_indexes_is_skipped(tmp_path):
+    private = "https://private.example.com/files/fastlib-2.0.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), FAST[0]], "osx-arm64": [python("osx-arm64"), f"pypi: {private}"]},
+        [FAST[1], pypi_entry(private, "fastlib", "2.0.0", "  index: https://private.example.com/simple")],
+    )
+    (pkg,) = [p for p in parse_pixi_lock(lock).packages if p.name == "fastlib"]
+    assert (pkg.skip, pkg.files) == ("private index", None)  # neither index may be asked for the other's package
+
+
+@pytest.mark.parametrize(
+    "host,indexes,skip",
+    [
+        ("https://files.pythonhosted.org/packages/aa", ["https://private.example.com/simple"], None),
+        # Only PyPI's own file host counts as PyPI
+        ("https://files.pythonhosted.org.example.com/aa", ["https://private.example.com/simple"], "private index"),
+        ("https://mirror-files.pythonhosted.org/aa", ["https://private.example.com/simple"], "private index"),
+        # With PyPI the only index, a file elsewhere is a direct URL; with another index too, it may be internal
+        ("https://example.com/aa", ["https://pypi.org/simple"], "url"),
+        ("https://example.com/aa", ["https://pypi.org/simple", "https://private.example.com/simple"], "private index"),
+        ("https://example.com/aa", ["https://private.example.com/simple", "https://pypi.org/simple/"], "private index"),
+    ],
+)
+def test_pixi_where_a_package_came_from(tmp_path, host, indexes, skip):
+    location = f"{host}/fastlib-2.0.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {location}"]},
+        [pypi_entry(location, "fastlib", "2.0.0")],
+        indexes=indexes,
+    )
+    (pkg,) = [p for p in parse_pixi_lock(lock).packages if p.name == "fastlib"]
+    assert pkg.skip == skip
+
+
+def test_pixi_git_revisions_stay_apart(tmp_path):
+    a = "git+https://github.com/example/gitdep.git#aaaa"
+    b = "git+https://github.com/example/gitdep.git#bbbb"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {a}"], "osx-arm64": [python("osx-arm64"), f"pypi: {b}"]},
+        [pypi_entry(a, "gitdep"), pypi_entry(b, "gitdep")],
+    )
+    assert [(p.name, p.skip) for p in parse_pixi_lock(lock).packages if p.name == "gitdep"] == [("gitdep", "git")] * 2
+
+
+def test_pixi_conda_packages_are_skipped_once_by_name(tmp_path):
+    cffi = "conda: https://conda.anaconda.org/conda-forge/{}/cffi-{}-py313h0_0.conda"
+    lock = write_pixi(
+        tmp_path,
+        {
+            "linux-64": [python("linux-64"), cffi.format("linux-64", "1.17.1")],
+            "osx-arm64": [python("osx-arm64"), cffi.format("osx-arm64", "2.0.0")],
+        },
+        [],
+    )
+    assert [(p.name, p.skip) for p in parse_pixi_lock(lock).packages] == [("cffi", "conda"), ("python", "conda")]
+
+
+def test_find_lockfile_order_with_pixi_lock(fixtures, tmp_path):
+    (tmp_path / "pixi.lock").write_text(
+        (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert find_lockfile(tmp_path).name == "requirements.txt"  # pixi.lock comes last
+    assert find_lockfile(tmp_path, pixi=True).name == "pixi.lock"
+    (source,) = load_inputs([str(tmp_path)])
+    assert (source.kind, source.passed_over) == ("requirements", tmp_path / "pixi.lock")
+    (source,) = load_inputs([str(tmp_path)], "test")
+    assert (source.kind, source.passed_over) == ("pixi", None)
+
+
+def test_pixi_platform_with_unknown_python_vouches_for_its_packages(tmp_path):
+    # linux-64-cuda builds its Python from source, so its version isn't known: it may be 3.12 like linux-64, and it
+    # installs psycopg2, so psycopg2 isn't hidden on linux x86_64 for 3.12.
+    psycopg2 = f"{FILES}/psycopg2-2.9.10.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {
+            "linux-64": [python("linux-64", "3.12.3")],
+            "linux-64-cuda": ["conda_source: python[abcd1234] @ ./python", f"pypi: {psycopg2}"],
+            "win-64": [python("win-64", "3.12.3")],
+        },
+        ["- conda_source: python[abcd1234] @ ./python", pypi_entry(psycopg2, "psycopg2", "2.9.10")],
+        subdirs={"linux-64-cuda": "linux-64"},
+    )
+    assert results(lock, ["3.12"], ["linux-x86_64", "win-amd64"], "psycopg2") == [
+        {"linux-x86_64": "source", "win-amd64": "n/a"}
+    ]
+
+
+def test_pixi_platforms_sharing_a_subdir_with_different_pythons(tmp_path):
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64", "3.12.3"), PURE[0]], "linux-64-py313": [python("linux-64")]},
+        [PURE[1]],
+        subdirs={"linux-64-py313": "linux-64"},
+    )
+    # Two groups: purewheel is installed for 3.12 and not for 3.13 on linux x86_64.
+    rows = check([parse_pixi_lock(lock)], build_targets(["3.12", "3.13"], ["linux-x86_64"]))
+    assert [(t.python, s.value) for r in rows for t, s in r.results.items() if r.package.name == "purewheel"] == [
+        ("3.12", "wheel"),
+        ("3.13", "n/a"),
+    ]
+
+
+def test_pixi_lock_that_isnt_utf8(tmp_path):
+    lock = tmp_path / "pixi.lock"
+    lock.write_bytes(b"version: 7\nplatforms:\n- name: linux-\xff64\n")
+    with pytest.raises(SourceError, match=r"^pixi.lock: not valid UTF-8 \(byte 36\)"):
+        parse_pixi_lock(lock)
+
+
+@pytest.mark.parametrize(
+    "lines,expected",
+    [
+        ("--no-binary :all:\nfastlib==2.0.0\npurewheel==3.1\n", {"fastlib": (True, False), "purewheel": (True, False)}),
+        ("--no-binary=:all:\nfastlib==2.0.0\n", {"fastlib": (True, False)}),
+        ("--only-binary :all:\nfastlib==2.0.0\n", {"fastlib": (False, True)}),
+        ("--only-binary=:all:\nfastlib==2.0.0\n", {"fastlib": (False, True)}),
+        (
+            "--no-binary my_pkg,purewheel\nmy-pkg==1.0\npurewheel==3.1\nfastlib==2.0.0\n",
+            {"my-pkg": (True, False), "purewheel": (True, False), "fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all:\n--only-binary purewheel\n--no-binary :none:\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (False, False), "purewheel": (False, True)},
+        ),
+        (
+            "--only-binary fastlib\n--no-binary fastlib\n--no-binary :none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all: --only-binary purewheel\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (False, True)},
+        ),
+        (
+            "--no-binary :none:,fastlib\nfastlib==2.0.0\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            "--no-binary fastlib,:none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            "--no-binary :all:,:none:\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            (
+                "--no-index --no-binary fastlib\n"
+                "--index-url https://example.com/simple --only-binary purewheel\n"
+                "fastlib==2.0.0\npurewheel==3.1\n"
+            ),
+            {"fastlib": (True, False), "purewheel": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib, :none:"\nfastlib==2.0.0\n',
+            {"fastlib": (True, False)},
+        ),
+        (
+            '--no-binary "fastlib, purewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            '--only-binary="fastlib,purewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (False, True), "purewheel": (False, True)},
+        ),
+        (
+            "--no-binary 'fastlib,:none:'\nfastlib==2.0.0\n",
+            {"fastlib": (False, False)},
+        ),
+        (
+            '--no-binary "fastlib,\\\npurewheel"\npurewheel==3.1\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\nnowheels"\nnowheels==0.9\n',
+            {"nowheels": (False, True)},
+        ),
+        (
+            "--no-binary fastlib,\\\npurewheel\npurewheel==3.1\n",
+            {"purewheel": (True, False)},
+        ),
+        (
+            "--only-binary fastlib,\\\nnowheels\nnowheels==0.9\n",
+            {"nowheels": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib, \\\npurewheel"\nfastlib==2.0.0\npurewheel==3.1\n',
+            {"fastlib": (True, False), "purewheel": (False, False)},
+        ),
+        (
+            "# comment ending with \\\npurewheel==3.1\n",
+            {"purewheel": (False, False)},
+        ),
+        (
+            '--no-binary "fastlib,\\\\\npurewheel"\npurewheel==3.1\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\\\nnowheels"\nnowheels==0.9\n',
+            {"nowheels": (False, True)},
+        ),
+        (
+            '--no-binary "fastlib,\\\\\r\npurewheel"\r\npurewheel==3.1\r\n',
+            {"purewheel": (True, False)},
+        ),
+        (
+            '--only-binary "fastlib,\\\\\r\nnowheels"\r\nnowheels==0.9\r\n',
+            {"nowheels": (False, True)},
+        ),
+    ],
+)
+def test_requirements_binary_format_control(tmp_path, lines, expected):
+    req = tmp_path / "requirements.txt"
+    req.write_bytes(lines.encode())  # as written: write_text would turn \r\n into \r\r\n on Windows
+    pkgs = by_name(parse_requirements(req))
+    assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
+
+
+def test_requirements_binary_format_control_with_includes(tmp_path):
+    (tmp_path / "base.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "override.txt").write_text("--only-binary purewheel\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r base.txt\nfastlib==2.0.0\n-r override.txt\n", encoding="utf-8")
+    pkgs = by_name(parse_requirements(req))
+    assert (pkgs["fastlib"].no_binary, pkgs["fastlib"].only_binary) == (True, False)
+    assert (pkgs["purewheel"].no_binary, pkgs["purewheel"].only_binary) == (False, True)
+
+
+def test_requirements_binary_format_control_reapplied_on_repeated_includes(tmp_path):
+    (tmp_path / "options.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("--only-binary nowheels\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "-r options.txt\n--no-binary :none:\n-r options.txt\n"
+        "-c constraints.txt\n--only-binary :none:\n-c constraints.txt\n"
+        "fastlib==2.0.0\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    pkgs = parse_requirements(req).packages
+    assert [p.name for p in pkgs] == ["purewheel", "fastlib", "nowheels"]
+    by = {p.name: (p.no_binary, p.only_binary) for p in pkgs}
+    assert by == {
+        "purewheel": (True, False),
+        "fastlib": (True, False),
+        "nowheels": (False, True),
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("--no-b :all:", (True, False)),
+        ("--no-bin=:all:", (True, False)),
+        ("--only-b :all:", (False, True)),
+        ("--o=:all:", (False, True)),
+        ("--no- :all:", (False, False)),  # --no-index too: pip refuses it
+        ("--only-final", (False, False)),
+    ],
+)
+def test_requirements_binary_options_abbreviated(tmp_path, line, expected):
+    # optparse, which reads pip's requirements files, takes an unambiguous prefix of a long option
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"{line}\nsix==1.16.0\n", encoding="utf-8")
+    (six,) = parse_requirements(req).packages
+    assert (six.no_binary, six.only_binary) == expected

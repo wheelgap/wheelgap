@@ -147,7 +147,9 @@ gaps are found, for informational runs; bad input still exits `2`. Add
 
 **Reading `--json`:** notes go to stderr, so stdout holds only the JSON.
 `packages` has one entry per package with its `name`, `version`, `error` and
-`results`. `results` is keyed by target label: just the platform
+`results`; a range that picks a different release for different `-p` versions
+has one entry per release, with `n/a` for the targets that use the other.
+`results` is keyed by target label: just the platform
 (`"linux-aarch64"`) when one Python is checked, or Python and platform
 (`"3.13 linux-aarch64"`) with several. Rather than building the key, look it up
 in the top-level `targets` list, which gives each target's `label`, `python` and
@@ -160,7 +162,7 @@ Python example). Each result is one of:
 | `source` | only an sdist, so pip or uv compiles it at install time |
 | `missing` | no wheel and no sdist, so the install fails |
 | `unknown` | couldn't be looked up; the package's `error` says why |
-| `n/a` | not installed on this target (environment markers exclude it) |
+| `n/a` | not installed on this target (environment markers exclude it), or this entry is another release's (see above) |
 | `bundled` | Pyodide ships its own build (with `--pyodide-lock`) |
 
 `skipped` lists packages that weren't checked (such as editable, path or Git

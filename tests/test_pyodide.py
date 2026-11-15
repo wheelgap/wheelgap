@@ -26,6 +26,16 @@ def test_parse_keeps_only_packages_by_canonical_name(lock):
     assert parsed.packages == {"fastlib": "2.0.0", "markupsafe": "3.0.2"}
 
 
+def test_cli_names_a_release_read_from_the_lock_filename(capsys, fake_pypi, fixtures, tmp_path):
+    data = json.loads((fixtures / "pyodide-lock.json").read_text(encoding="utf-8"))
+    del data["info"]["version"]
+    path = tmp_path / "pyodide-lock-0.29.5.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    code, out, _ = run(capsys, "fastlib==2.0.0", "-p", "3.13", "-t", "pyodide", "--pyodide-lock", str(path))
+    assert code == 0
+    assert "1 package comes from Pyodide 0.29.5's own builds: fastlib 2.0.0" in out
+
+
 def test_bundled_package_counts_as_available(capsys, fake_pypi, lock):
     code, out, _ = run(
         capsys, "fastlib==2.0.0", "nowheels==0.9", "-p", "3.13", "-t", "pyodide", "--pyodide-lock", lock, "--all"

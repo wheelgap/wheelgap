@@ -1,0 +1,43 @@
+name: Lockfile corpus
+
+# Weekly: read the current uv.lock, poetry.lock, pdm.lock, pylock.toml and Pipfile.lock of the open-source projects in
+# tests/fixtures/real/sources.toml, from each project's default branch, with scripts/check_real_lockfiles.py (#227).
+# CI's tests read pinned copies offline; this catches a lockfile format that has moved on since. It fails, naming
+# the project and saying whether wheelgap misread it or the project changed it; the run's summary page lists what
+# went wrong.
+#
+# Read-only and no secrets: it only reads the repo and public files on raw.githubusercontent.com.
+
+on:
+  schedule:
+    - cron: "23 7 * * 1" # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Read each project's current lockfile
+        run: |
+          set -o pipefail
+          uv run --python 3.14 python scripts/check_real_lockfiles.py | tee corpus.log
+      - name: Summarise
+        if: always()
+        run: |
+          [ -s corpus.log ] || exit 0  # failed before the script reported: the log says why
+          {
+            echo "### Real lockfiles, from each project's default branch"
+            echo
+            # The script prints lockfile text with repr() and no backticks; the longer fence is a second guard.
+            echo '``````'
+            head -c 60000 corpus.log
+            echo '``````'
+          } >> "$GITHUB_STEP_SUMMARY"

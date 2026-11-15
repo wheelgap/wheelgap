@@ -16,11 +16,42 @@ inputs:
     description: Also write the gap table to the job summary page (true or false; skipped when args include --json).
     required: false
     default: "true"
+  compare-to:
+    description: >
+      "base" to fail only when the pull request makes the lockfile worse than on its base branch, or a git ref to
+      compare with (e.g. origin/main). args must then start with the lockfile, followed by -p and -t only, e.g.
+      "uv.lock -p 3.13 -t linux-aarch64,musl-aarch64". "base" works on pull_request events with actions/checkout's
+      default merge commit. Empty (the default) checks the lockfile as usual.
+    required: false
+    default: ""
+  comment:
+    description: >
+      With compare-to, also post a pull request comment when something got worse, and update it on later runs
+      (true or false). Needs the pull-requests write permission, and is refused on pull_request_target and
+      workflow_run events; see the README.
+    required: false
+    default: "false"
+  github-token:
+    description: The token for the pull request comment.
+    required: false
+    default: ${{ github.token }}
+  comment-author:
+    description: >
+      The login the token comments as, e.g. my-app[bot], for a GitHub App's token. Only that login's comment is
+      updated. Leave it empty for the default token (github-actions[bot]) or a personal token (its user).
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: With compare-to, the path of the Markdown report that went to the job summary.
+    value: ${{ steps.compare.outputs.report }}
 
 runs:
   using: composite
   steps:
     - name: Run wheelgap
+      if: inputs.compare-to == ''
       shell: bash
       env:
         WHEELGAP_ARGS: ${{ inputs.args }}
@@ -29,7 +60,13 @@ runs:
       # WHEELGAP_ARGS is deliberately unquoted so it splits into separate arguments.
       run: |
         set +e
-        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap $WHEELGAP_ARGS
+        # --github-annotations marks each gap on its lockfile line in the PR diff. It goes first, like the summary
+        # run's flags, so a `--` in args can't turn it into a package name; but `diff` must stay the first argument
+        # to run `wheelgap diff`, which has no annotations.
+        set -- $WHEELGAP_ARGS
+        annotate=--github-annotations
+        [ "${1:-}" = diff ] && annotate=
+        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap $annotate $WHEELGAP_ARGS
         code=$?
         # The summary is a second, never-failing run; the step's result is the real run's exit code.
         # Exit code 2 means bad input, which the log above already explains. The extra flags go first
@@ -40,3 +77,172 @@ runs:
             && [[ "$report" == "### wheelgap"* ]] && printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
         fi
         exit "$code"
+
+    - name: Compare with the base
+      id: compare
+      if: inputs.compare-to != ''
+      shell: bash
+      env:
+        WHEELGAP_ARGS: ${{ inputs.args }}
+        WHEELGAP_SUMMARY: ${{ inputs.summary }}
+        WHEELGAP_COMPARE_TO: ${{ inputs.compare-to }}
+        WHEELGAP_COMMENT: ${{ inputs.comment }}
+        WHEELGAP_TOKEN: ${{ inputs.comment == 'true' && inputs.github-token || '' }}
+        WHEELGAP_COMMENT_AUTHOR: ${{ inputs.comment-author }}
+        # From the event, through env only: never interpolated into the script.
+        WHEELGAP_EVENT: ${{ github.event_name }}
+        WHEELGAP_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        WHEELGAP_PR: ${{ github.event.pull_request.number }}
+      run: |
+        set +e -f  # no globbing when args are split below
+        token=$WHEELGAP_TOKEN
+        unset WHEELGAP_TOKEN  # only gh gets the token, not wheelgap or Python
+        # fail's messages are fixed text: they never quote args, refs or anything else a pull request could set.
+        fail() { echo "::error::wheelgap: $1"; exit 2; }
+        sha='^[0-9a-f]{40}([0-9a-f]{24})?$'
+        comment=$(printf '%s' "$WHEELGAP_COMMENT" | tr '[:upper:]' '[:lower:]')
+        case "$comment" in
+          true | false) ;;
+          *) fail "comment must be true or false" ;;
+        esac
+        author=$WHEELGAP_COMMENT_AUTHOR
+        [ -z "$author" ] || [[ "$author" =~ ^[A-Za-z0-9_-]+(\[bot\])?$ ]] \
+          || fail "comment-author must be a GitHub login, such as my-app[bot]"
+        # These run the base branch's workflow with a write token on a pull request's files, so reading the
+        # pull request's lockfile there could put other files' contents (a requirements -r include, a symlink)
+        # in the comment.
+        case "$WHEELGAP_EVENT" in
+          pull_request_target | workflow_run)
+            [ "$comment" = true ] && fail "comment: true is refused on pull_request_target and workflow_run events; use pull_request" ;;
+        esac
+        set -- $WHEELGAP_ARGS
+        lockfile=${1:-}
+        case "$lockfile" in
+          "" | -* | /* | diff) fail "args must start with the lockfile's path in the checkout, e.g. uv.lock -p 3.13 -t linux-aarch64" ;;
+        esac
+        shift
+        [ -f "$lockfile" ] || fail "args must start with the lockfile's path in the checkout, and that file must exist"
+        # `wheelgap diff` is the subcommand only when there's no file or folder named diff here.
+        [ -e diff ] && fail "a file or folder named diff in the working directory stops wheelgap diff from running"
+        lockfile=${lockfile#./}
+        head=$WHEELGAP_HEAD_SHA
+        [[ "$head" =~ $sha ]] || head=$GITHUB_SHA
+        [[ "$head" =~ $sha ]] || head=
+        py=
+        for candidate in python3 python; do
+          "$candidate" -c "import sys; sys.exit(sys.version_info < (3, 9))" 2>/dev/null && py=$candidate && break
+        done
+        [ -n "$py" ] || fail "needs Python 3.9 or later on PATH"
+        helper=$GITHUB_ACTION_PATH/scripts/action_compare.py
+        dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/wheelgap-compare.XXXXXX")
+
+        write_report() {
+          "$py" "$helper" report --lockfile "$lockfile" "${base[@]}" --head "$head" --markdown "$dir/report.md" \
+            --payload "$dir/comment.json" "$@"
+        }
+
+        comment_on() {
+          if ! [[ "${WHEELGAP_PR:-}" =~ ^[0-9]+$ ]]; then
+            echo "::notice::wheelgap: no pull request to comment on, so the report is only in the job summary"
+            return
+          fi
+          # The token goes only to this server, and only over https.
+          server=${GITHUB_SERVER_URL:-https://github.com}
+          if [[ "$server" =~ ^https://([A-Za-z0-9.-]+(:[0-9]+)?)/?$ ]]; then
+            server=${BASH_REMATCH[1]}
+          else
+            echo "::warning::wheelgap: GITHUB_SERVER_URL isn't an https URL, so no comment was posted. The job summary has the report."
+            return
+          fi
+          # gh's output stays out of the log (a comment's body quotes the pull request), and its errors are only
+          # searched for the HTTP status.
+          gh_() { GH_HOST=$server GH_TOKEN=$token GH_ENTERPRISE_TOKEN=$token gh "$@" 2>> "$dir/gh.err"; }
+          warn() {
+            status=$(grep -oE 'HTTP [0-9]{3}' "$dir/gh.err" 2>/dev/null | tail -n 1)
+            if [ "$status" = "HTTP 403" ]; then
+              echo "::warning::wheelgap: couldn't $1 (HTTP 403). The token needs pull-requests: write, which pull requests from forks don't get, and Dependabot's only when the workflow asks for it. The job summary has the report."
+            else
+              echo "::warning::wheelgap: couldn't $1${status:+ ($status)}. The job summary has the report."
+            fi
+          }
+          # Only the token's own comments are edited: comment-author, else a personal token's user, else the
+          # GITHUB_TOKEN's bot.
+          me=$author
+          if [ -z "$me" ]; then
+            me=$(gh_ api user --jq .login)
+            [[ "$me" =~ ^[A-Za-z0-9_-]+$ ]] || me='github-actions[bot]'
+          fi
+          : > "$dir/gh.err"
+          comments="repos/$GITHUB_REPOSITORY/issues/$WHEELGAP_PR/comments"
+          if ! gh_ api --paginate "$comments?per_page=100" > "$dir/comments.json" \
+            || ! id=$("$py" "$helper" pick --comments "$dir/comments.json" --login "$me" --lockfile "$lockfile"); then
+            warn "list the pull request's comments, so none was posted"
+          elif [[ "$id" =~ ^[0-9]+$ ]]; then
+            # Edited whatever the result, so it never shows an older run's answer (head commit in the report).
+            gh_ api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input "$dir/comment.json" > /dev/null \
+              || warn "update the pull request comment"
+          elif [ "$result" -eq 1 ]; then
+            gh_ api -X POST "$comments" --input "$dir/comment.json" > /dev/null || warn "post the pull request comment"
+          fi
+        }
+
+        # The report to the summary, the output and the comment; then exit with the result.
+        publish() {
+          result=$1
+          [ -f "$dir/report.md" ] || fail "the compare-to report couldn't be written"
+          echo "report=$dir/report.md" >> "$GITHUB_OUTPUT"
+          if [ "$WHEELGAP_SUMMARY" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            cat "$dir/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          [ "$comment" = true ] && comment_on
+          exit "$result"
+        }
+
+        # Like fail, but also says why in the summary and in an existing comment, which would otherwise keep an
+        # older run's answer.
+        refuse() {
+          echo "::error::wheelgap: $1"
+          write_report --problem "$1" > /dev/null
+          publish 2
+        }
+
+        if [ "$WHEELGAP_COMPARE_TO" = base ]; then
+          base=(--base-branch)
+          # Not pull_request_target, which checks out the base branch: the comparison would be with itself.
+          [ "$WHEELGAP_EVENT" = pull_request ] || fail "compare-to: base needs a pull_request event; pass a git ref for other events"
+          [[ "$WHEELGAP_HEAD_SHA" =~ $sha ]] || fail "the pull_request event has no head commit"
+          # actions/checkout's default for pull_request is the merge commit GitHub made of the pull request's head
+          # onto its base branch (GITHUB_SHA). Its first parent is that base, so the diff is exactly what merging
+          # changes. Its parents are listed in the commit itself, so a shallow checkout has them.
+          parents=($(git cat-file commit HEAD 2>/dev/null | awk '/^$/ { exit } /^parent / { print $2 }'))
+          [ "$(git rev-parse HEAD 2>/dev/null)" = "${GITHUB_SHA:-}" ] && [ "${#parents[@]}" -eq 2 ] \
+            && [ "${parents[1]}" = "$WHEELGAP_HEAD_SHA" ] && [[ "${parents[0]}" =~ $sha ]] \
+            || refuse "compare-to: base needs actions/checkout's default merge commit of the pull request; pass a git ref otherwise"
+          ref=${parents[0]}
+          base=(--base "${ref:0:7}" --base-branch)
+          if ! git cat-file -e "$ref^{commit}" 2>/dev/null; then
+            # A shallow checkout (actions/checkout's default) doesn't have it.
+            git fetch --quiet --no-tags --depth=1 origin "$ref" 2>/dev/null \
+              || refuse "couldn't fetch the base commit; check out with fetch-depth: 0"
+          fi
+        else
+          ref=$WHEELGAP_COMPARE_TO
+          [[ "$ref" =~ ^[^-:[:space:]][^:[:space:]]*$ ]] || fail "compare-to must be base or a git ref (no spaces or colons)"
+          base=(--base "$ref")
+        fi
+        # REF:./PATH is relative to this directory, as the lockfile is. A file or folder of that name would be read
+        # instead of git's copy, so refuse one.
+        old="$ref:./$lockfile"
+        [ -e "$old" ] && fail "a file or folder is named like the git ref and lockfile, so git's copy wouldn't be read"
+        # wheelgap's stderr quotes the lockfiles (and git's messages), so it reaches the log only with anything the
+        # runner would read as a workflow command defused.
+        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap diff "$old" "$lockfile" "$@" --json > "$dir/diff.json" 2> "$dir/diff.err"
+        code=$?
+        "$py" "$helper" log "$dir/diff.err" || echo "::error::wheelgap: couldn't show wheelgap's messages"
+        # The helper's exit code is the result: 0 or 1 only when diff's exit code and report agree, else 2.
+        write_report --diff-json "$dir/diff.json" --exit-code "$code"
+        result=$?
+        case "$result" in
+          0 | 1) publish "$result" ;;
+          *) publish 2 ;;
+        esac

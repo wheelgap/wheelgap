@@ -1,0 +1,143 @@
+version: 7
+platforms:
+- name: linux-64
+- name: osx-arm64
+- name: win-64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.0-h26f9b46_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+      - conda_source: localpkg[3f2a1b0c] @ .
+      - pypi: https://files.pythonhosted.org/packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/cc/dd/purewheel-3.1-py3-none-any.whl
+      - pypi: https://example.com/simple/internal/internal-1.0-py3-none-any.whl
+      - pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567
+      osx-arm64:
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/openssl-3.6.0-h5503f6c_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/python-3.13.9-hfc2f54d_101_cp313.conda
+      - conda_source: localpkg[3f2a1b0c] @ .
+      - pypi: https://files.pythonhosted.org/packages/ee/ff/fastlib-2.0.0.tar.gz
+      - pypi: https://files.pythonhosted.org/packages/cc/dd/purewheel-3.1-py3-none-any.whl
+      - pypi: https://example.com/simple/internal/internal-1.0-py3-none-any.whl
+      - pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567
+      win-64:
+      - conda: https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.0-h725018a_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/win-64/python-3.13.9-h09917c8_101_cp313.conda
+      - conda_source: localpkg[3f2a1b0c] @ .
+      - pypi: https://files.pythonhosted.org/packages/ee/ff/fastlib-2.0.0.tar.gz
+      - pypi: https://files.pythonhosted.org/packages/cc/dd/purewheel-3.1-py3-none-any.whl
+      - pypi: https://example.com/simple/internal/internal-1.0-py3-none-any.whl
+      - pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567
+      - pypi: https://files.pythonhosted.org/packages/11/22/winonly-311-cp313-cp313-win_amd64.whl
+  test:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.0-h26f9b46_0.conda
+  sha256: 7d6f7a8e0b9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e
+  md5: 0123456789abcdef0123456789abcdef
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - ca-certificates
+  license: Apache-2.0
+  license_family: Apache
+  purls: []
+  run_exports:
+    weak:
+    - openssl >=3.6.0,<4.0a0
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+  sha256: 1f2e3d4c5b6a79881726354453627180918273645546372819203a4b5c6d7e8f
+  md5: fedcba9876543210fedcba9876543210
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - openssl >=3.5.4,<4.0a0
+  license: Python-2.0
+  purls: []
+  run_exports: {}
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/openssl-3.6.0-h5503f6c_0.conda
+  sha256: 2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819
+  md5: 00112233445566778899aabbccddeeff
+  depends:
+  - __osx >=11.0
+  license: Apache-2.0
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/python-3.13.9-hfc2f54d_101_cp313.conda
+  sha256: 3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a
+  md5: 112233445566778899aabbccddeeff00
+  depends:
+  - __osx >=11.0
+  - openssl >=3.5.4,<4.0a0
+  license: Python-2.0
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.0-h725018a_0.conda
+  sha256: 4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b
+  md5: 2233445566778899aabbccddeeff0011
+  depends:
+  - ucrt >=10.0.20348.0
+  license: Apache-2.0
+  purls: []
+- conda: https://conda.anaconda.org/conda-forge/win-64/python-3.13.9-h09917c8_101_cp313.conda
+  sha256: 5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c
+  md5: 33445566778899aabbccddeeff001122
+  depends:
+  - openssl >=3.5.4,<4.0a0
+  - ucrt >=10.0.20348.0
+  license: Python-2.0
+  purls: []
+- conda_source: localpkg[3f2a1b0c] @ .
+  version: 0.1.0
+  build: pyh4616a5c_0
+  subdir: noarch
+  depends:
+  - python >=3.13
+- pypi: https://example.com/simple/internal/internal-1.0-py3-none-any.whl
+  name: internal
+  version: '1.0'
+  sha256: 6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d
+  index: https://example.com/simple
+  requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/11/22/winonly-311-cp313-cp313-win_amd64.whl
+  name: winonly
+  version: '311'
+  sha256: 7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e
+  requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz
+  name: nowheels
+  version: '0.9'
+  sha256: 8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f
+- pypi: https://files.pythonhosted.org/packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl
+  name: fastlib
+  version: 2.0.0
+  sha256: 91a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80
+  requires_dist:
+  - purewheel>=3 ; sys_platform != 'emscripten'
+  - winonly ; sys_platform == 'win32'
+  requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/cc/dd/purewheel-3.1-py3-none-any.whl
+  name: purewheel
+  version: '3.1'
+  sha256: a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091
+- pypi: https://files.pythonhosted.org/packages/ee/ff/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  sha256: b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2
+  requires_dist:
+  - purewheel>=3 ; sys_platform != 'emscripten'
+  - winonly ; sys_platform == 'win32'
+  requires_python: '>=3.10'
+- pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567
+  name: gitdep
+  requires_dist:
+  - purewheel

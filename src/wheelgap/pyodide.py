@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import sys
 import urllib.error
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
@@ -24,6 +26,43 @@ PYODIDE_ABI = {(3, 12): "2024_0", (3, 13): "2025_0", (3, 14): "2026_0"}
 
 class PyodideLockError(ValueError):
     pass
+
+
+# A Pyodide release in a URL path (`.../pyodide/v0.29.5/full/...`) or a lock's file name.
+_RELEASE = re.compile(r"v?(\d+\.\d+\.\d+)")
+_RELEASE_FILENAMES = (
+    re.compile(r"pyodide-lock[._-]v?(\d+\.\d+\.\d+)\.json"),
+    re.compile(r"pyodide[._-]v?(\d+\.\d+\.\d+)[._-]lock\.json"),
+    re.compile(r"v?(\d+\.\d+\.\d+)[._-]pyodide-lock\.json"),  # the tracker's 0.29.5-pyodide-lock.json
+)
+
+
+def _release_from_source(source: str) -> str | None:
+    """The Pyodide release a lock's URL or file name names, when info.version is missing.
+
+    A path only counts on Pyodide's own release URLs (`cdn.jsdelivr.net/pyodide/v0.29.5/...` and
+    `github.com/pyodide/pyodide/releases/download/0.29.5/...`): elsewhere a number in the path may be another
+    project's release or a mirror's own numbering. Otherwise only a lock file named `pyodide-lock-0.29.5.json`
+    (and the like) counts. When the path and the file name disagree, neither is trusted.
+    """
+    from_path = None
+    if source.lower().startswith(("http://", "https://")):
+        url = urlsplit(source)
+        host, parts = (url.hostname or "").lower(), url.path.split("/")
+        name = parts[-1]
+        release = None
+        if host == "cdn.jsdelivr.net" and parts[1:2] == ["pyodide"] and len(parts) > 3:
+            release = parts[2]
+        elif host == "github.com" and parts[1:5] == ["pyodide", "pyodide", "releases", "download"] and len(parts) > 6:
+            release = parts[5]
+        if release is not None and (match := _RELEASE.fullmatch(release)):
+            from_path = match.group(1)
+    else:
+        name = Path(source).name
+    from_name = next((m.group(1) for pattern in _RELEASE_FILENAMES if (m := pattern.fullmatch(name))), None)
+    if from_path and from_name and from_path != from_name:
+        return None
+    return from_path or from_name
 
 
 @dataclass(frozen=True)
@@ -65,7 +104,8 @@ def parse_pyodide_lock(data: dict, source: str) -> PyodideLock:
         and "name" in p
         and "version" in p
     }
-    return PyodideLock(source, str(info.get("version", "?")), (major, minor), abi, bundled)
+    version = info.get("version") or _release_from_source(source) or "?"
+    return PyodideLock(source, str(version), (major, minor), abi, bundled)
 
 
 def load_pyodide_lock(spec: str) -> PyodideLock:

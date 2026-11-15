@@ -67,6 +67,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # --group dev: the runtime and dev dependencies, which run on every CI platform. The docs group (MkDocs) is
+      # only installed on Linux to build the site, so its gaps elsewhere (such as watchdog on musl) don't matter.
       - uses: ./
         with:
-          args: uv.lock -p 3.11,3.14,3.14t -t all
+          args: uv.lock -p 3.11,3.14,3.14t -t all --group dev

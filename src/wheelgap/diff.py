@@ -31,16 +31,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
+import re
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
 from . import __version__
 from .api import Result, _check_lockfile, make_targets
 from .check import CELL, Status, applies, reachable
+from .logsafe import guarded_output
 from .sources import Source
-from .targets import Target
+from .targets import DEFAULT_GLIBC, DEFAULT_MACOS, DEFAULT_MUSL, Target, next_python_note, resolve_distro
 
 # Higher is worse. UNKNOWN only orders entries of the same package on one target (see the module docstring).
 RANK = {
@@ -224,6 +230,59 @@ def summary(n_worse: int, n_new: int) -> str:
     return ", ".join(parts) + "."
 
 
+class GitInputError(Exception):
+    """A REF:PATH input git can't read, or no git to read it with."""
+
+
+# A Windows drive path (C:\\x, C:/x) has a colon but isn't a ref.
+_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def git_ref_input(arg: str) -> tuple[str, str] | None:
+    """(REF, PATH) when `arg` isn't an existing path and looks like REF:PATH (origin/main:uv.lock), else None."""
+    if os.path.exists(arg) or _DRIVE.match(arg):
+        return None
+    ref, sep, path = arg.partition(":")
+    if not sep or not ref or not path or path.endswith(("/", "\\")):
+        return None
+    return ref, path
+
+
+def _git_blob(ref: str, path: str) -> subprocess.CompletedProcess[bytes]:
+    # `git cat-file blob`: plumbing, so no textconv, filters or pager, and a tree (a folder) is refused rather
+    # than listed. An argument list, never a shell, and --end-of-options keeps a ref that starts with `-` from
+    # being read as an option.
+    try:
+        return subprocess.run(
+            ["git", "cat-file", "blob", "--end-of-options", f"{ref}:{path}"], capture_output=True, check=False
+        )
+    except FileNotFoundError:
+        raise GitInputError(f"{ref}:{path} looks like a git ref, but git isn't on PATH") from None
+
+
+def read_git_ref(ref: str, path: str, into: Path) -> str:
+    """Write the file at REF:PATH to a file named like PATH in `into` (so its format is detected) and return it.
+
+    The pyproject.toml next to it at that ref comes along when there is one: an older poetry.lock takes its
+    direct dependencies from there, so leaving it behind would change the answer for that side.
+    """
+    done = _git_blob(ref, path)
+    if done.returncode != 0:
+        message = done.stderr.decode(errors="replace").strip() or f"git exited {done.returncode}"
+        raise GitInputError(f"can't read {ref}:{path} from git: {message}")
+    side = into / str(len(list(into.iterdir())))
+    side.mkdir()
+    posix = path.replace("\\", "/")
+    out = side / posixpath.basename(posix)
+    out.write_bytes(done.stdout)
+    if out.name != "pyproject.toml":
+        folder = posixpath.dirname(posix)
+        project = _git_blob(ref, f"{folder}/pyproject.toml" if folder else "pyproject.toml")
+        if project.returncode == 0:  # none at that ref is normal: nothing to bring along
+            (side / "pyproject.toml").write_bytes(project.stdout)
+    return str(out)
+
+
 def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -> int:
     for stream in (sys.stdout, sys.stderr):
         # As in cli.main: write UTF-8 to a non-UTF-8 pipe (Windows cp1252) instead of crashing on ✓ and →.
@@ -234,31 +293,69 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
                 reconfigure(encoding="utf-8", errors="replace")
             else:
                 reconfigure(errors="replace")
+    with guarded_output():  # as in cli.main: lockfile text must never run as a workflow command in a CI log
+        return _main(argv, prog)
+
+
+def _main(argv: list[str] | None, prog: str) -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__.splitlines()[0])
-    p.add_argument("old", metavar="OLD", help="the lockfile before the change (or a directory)")
-    p.add_argument("new", metavar="NEW", help="the lockfile after the change (or a directory)")
+    p.add_argument(
+        "old",
+        metavar="OLD",
+        help="the lockfile before the change (or a directory, or git's REF:PATH, e.g. origin/main:uv.lock)",
+    )
+    p.add_argument("new", metavar="NEW", help="the lockfile after the change (or a directory, or REF:PATH)")
     p.add_argument(
         "-p",
         "--python",
         action="append",
         default=[],
         metavar="VER",
-        help="target Python, e.g. 3.13 or 3.14t (repeatable; default: the running Python)",
+        help="target Python, e.g. 3.13, 3.14t, or next / next-t for the newest CPython wheelgap knows "
+        "(repeatable; default: the running Python)",
     )
     p.add_argument(
         "-t", "--target", action="append", default=[], metavar="PLATFORM", help="target platform (repeatable)"
     )
+    p.add_argument("--glibc", metavar="X.Y", help=f"glibc version for linux-* targets (default: {DEFAULT_GLIBC})")
+    p.add_argument("--musl", metavar="X.Y", help=f"musl version for musl-* targets (default: {DEFAULT_MUSL})")
+    p.add_argument(
+        "--distro",
+        metavar="NAME",
+        help="default glibc/musl version from a distro, e.g. ubuntu-22.04 (does not select -t)",
+    )
+    p.add_argument("--macos", metavar="X.Y", help=f"minimum macOS for macos-* targets (default: {DEFAULT_MACOS})")
     p.add_argument("--json", action="store_true", help="print one JSON object instead of the text report")
     args = p.parse_args(argv)
     try:
-        targets = make_targets(args.python or None, args.target or None)
+        # Match cli.py precedence: explicit --glibc / --musl wins over --distro.
+        glibc, musl = DEFAULT_GLIBC, DEFAULT_MUSL
+        if args.distro is not None:
+            key, version = resolve_distro(args.distro)
+            if key == "glibc":
+                glibc = version
+            else:
+                musl = version
+        if args.glibc is not None:
+            glibc = args.glibc
+        if args.musl is not None:
+            musl = args.musl
+        targets = make_targets(
+            args.python or None, args.target or None, glibc=glibc, musl=musl, macos=args.macos or DEFAULT_MACOS
+        )
+        if note := next_python_note(args.python):
+            print(f"wheelgap: note: {note}", file=sys.stderr)
         sides = []
-        for path in (args.old, args.new):
-            results, source = _check_lockfile(path, targets, online=False, offline=False)
-            packages = merge(results, targets)
-            add_skipped(packages, source, targets)
-            sides.append(packages)
-    except Exception as e:  # unknown targets, unreadable or malformed lockfiles
+        with tempfile.TemporaryDirectory(prefix="wheelgap-diff-") as tmp:
+            for path in (args.old, args.new):
+                ref = git_ref_input(path)
+                if ref is not None:
+                    path = read_git_ref(*ref, Path(tmp))
+                results, source = _check_lockfile(path, targets, online=False, offline=False)
+                packages = merge(results, targets)
+                add_skipped(packages, source, targets)
+                sides.append(packages)
+    except Exception as e:  # unknown targets, unreadable or malformed lockfiles, a REF:PATH git can't read
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
         if args.json:  # as the main command does, so scripts needn't parse stderr
             print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))

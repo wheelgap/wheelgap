@@ -1,10 +1,13 @@
 import json
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from wheelgap.api import Result, make_targets
 from wheelgap.check import Status
-from wheelgap.diff import main, merge, worse
+from wheelgap.diff import git_ref_input, main, merge, worse
 
 TARGET = ["-p", "3.13", "-t", "linux-x86_64"]
 TWO_TARGETS = ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"]
@@ -65,6 +68,102 @@ def test_diff_labels_targets_with_python_when_there_are_several(fake_pypi, tmp_p
         "  3.13 linux-x86_64: ✓ → ● source",
         "  3.14 linux-x86_64: ✓ → ● source",
     ]
+
+
+def test_diff_takes_next(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, "ranged==1.5\n", "ranged==1.9\n")
+    assert main([old, new, "-p", "next", "-t", "linux-x86_64", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert [t["python"] for t in json.loads(out)["targets"]] == ["3.15"]
+    assert "wheelgap: note: next is Python 3.15, the newest CPython this wheelgap version knows" in err
+
+
+# Platform flags (#286): the new release's only Linux wheel is manylinux_2_34, the old one's is manylinux_2_28, so the
+# move is fine at the default glibc (2.36) but worse when the deployment floor is lower, as on RHEL 8 (glibc 2.28).
+NEW_GLIBC_PAIR = ("glibclag==1.0\n", "glibclag==1.1\n")
+GLIBCLAG_WORSE = [
+    "glibclag 1.0 → 1.1",
+    "  linux-x86_64: ✓ → ● source",
+    "1 package got worse.",
+]
+
+
+def test_diff_default_glibc_ignores_a_manylinux_floor_the_target_is_above(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+
+def test_diff_glibc_flag_counts_a_lost_manylinux_wheel(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--glibc", "2.28"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+
+
+def test_diff_musl_flag_counts_a_lost_musllinux_wheel(fake_pypi, tmp_path, capsys):
+    # The new release's only musl wheel is musllinux_1_2, the old one's is musllinux_1_1.
+    old, new = write_pair(tmp_path, "musllag==1.0\n", "musllag==1.1\n")
+    assert main([old, new, "-p", "3.13", "-t", "musl-x86_64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert main([old, new, "-p", "3.13", "-t", "musl-x86_64", "--musl", "1.1"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "musllag 1.0 → 1.1",
+        "  musl-x86_64: ✓ → ● source",
+        "1 package got worse.",
+    ]
+
+
+def test_diff_macos_flag_counts_a_wheel_above_the_floor(fake_pypi, tmp_path, capsys):
+    # The new release's only macOS wheel is macosx_14_0, the old one's is macosx_13_0.
+    old, new = write_pair(tmp_path, "maclag==1.0\n", "maclag==1.1\n")
+    assert main([old, new, "-p", "3.13", "-t", "macos-arm64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert main([old, new, "-p", "3.13", "-t", "macos-arm64", "--macos", "13.0"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "maclag 1.0 → 1.1",
+        "  macos-arm64: ✓ → ● source",
+        "1 package got worse.",
+    ]
+
+
+def test_diff_distro_supplies_the_libc_version(fake_pypi, tmp_path, capsys):
+    # rhel-8 is glibc 2.28, so it must see what --glibc 2.28 sees; the alias rocky-8 resolves the same way.
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--distro", "rhel-8"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+    assert main([old, new, *TARGET, "--distro", "rocky-8", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    (item,) = data["worse"]
+    assert item["name"] == "glibclag" and item["targets"]["linux-x86_64"]["new_status"] == "source"
+
+
+def test_diff_distro_does_not_select_targets(fake_pypi, tmp_path, capsys):
+    # --distro supplies a libc version only: with -t win-amd64 the Linux glibc floor is never checked (glibclag is
+    # source on both sides there). Had --distro selected linux-x86_64, the move would be reported.
+    old, new = write_pair(tmp_path, *NEW_GLIBC_PAIR)
+    assert main([old, new, "-p", "3.13", "-t", "win-amd64", "--distro", "rhel-8"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+
+
+def test_diff_explicit_libc_wins_over_distro(fake_pypi, tmp_path, capsys):
+    glibc_dir = tmp_path / "glibc"
+    musl_dir = tmp_path / "musl"
+    glibc_dir.mkdir()
+    musl_dir.mkdir()
+    old, new = write_pair(glibc_dir, *NEW_GLIBC_PAIR)
+    assert main([old, new, *TARGET, "--distro", "ubuntu-24.04", "--glibc", "2.28"]) == 1
+    assert capsys.readouterr().out.splitlines() == GLIBCLAG_WORSE
+    old_m, new_m = write_pair(musl_dir, "musllag==1.0\n", "musllag==1.1\n")
+    assert main([old_m, new_m, "-p", "3.13", "-t", "musl-x86_64", "--distro", "alpine", "--musl", "1.1"]) == 1
+    assert "musllag 1.0 → 1.1" in capsys.readouterr().out
+
+
+def test_diff_unknown_distro_exits_2(fake_pypi, tmp_path, capsys):
+    old, new = write_pair(tmp_path, "purewheel==3.1\n", "purewheel==3.1\n")
+    assert main([old, new, *TARGET, "--distro", "not-a-distro"]) == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("wheelgap: error: TargetError: ") and "unknown distro 'not-a-distro'" in err
 
 
 def test_diff_counts_a_package_it_can_no_longer_check_as_worse(fake_pypi, tmp_path, capsys):
@@ -363,3 +462,163 @@ def test_diff_json_unknown_version_is_an_empty_list(fake_pypi, tmp_path, capsys)
     assert main([old, new, *TARGET, "--json"]) == 1
     (item,) = json.loads(capsys.readouterr().out)["new"]
     assert item["versions"] == [] and item["targets"]["linux-x86_64"] == {"status": "unknown"}
+
+
+# REF:PATH inputs (#199): `wheelgap diff origin/main:uv.lock uv.lock` reads the old side with `git show`.
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git isn't installed")
+UV_OLD = uv_lock(['{ name = "purewheel" }']) + UV_PUREWHEEL
+UV_NEW = (
+    uv_lock(
+        [
+            """{ name = "purewheel", version = "3.1", source = { registry = "https://pypi.org/simple" }, """
+            """marker = "sys_platform == 'win32'" }""",
+            f"""{{ name = "purewheel", version = "3.2", source = {GIT_SOURCE}, """
+            """marker = "sys_platform != 'win32'" }""",
+        ]
+    )
+    + UV_PUREWHEEL
+    + UV_GIT
+)
+
+
+def git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    """A git repo whose HEAD has UV_OLD as uv.lock, with UV_NEW in the working copy."""
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "uv.lock").write_text(UV_OLD)
+    git("add", "uv.lock", cwd=tmp_path)
+    git("commit", "-q", "-m", "old", cwd=tmp_path)
+    (tmp_path / "uv.lock").write_text(UV_NEW)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@needs_git
+def test_diff_reads_a_git_ref(fake_pypi, repo, capsys):
+    assert main(["HEAD:uv.lock", "uv.lock", *TWO_TARGETS]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "purewheel 3.1 → 3.1, 3.2",
+        "  linux-x86_64: ✓ → skipped (git)",
+        "1 package got worse.",
+    ]
+    # The same ref on both sides: nothing changed, and no temporary file is left in the repo.
+    assert main(["HEAD:uv.lock", "HEAD:./uv.lock", *TWO_TARGETS]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]
+    assert sorted(p.name for p in repo.iterdir()) == [".git", "uv.lock"]
+
+
+@needs_git
+def test_diff_reads_a_git_ref_json(fake_pypi, repo, capsys):
+    assert main(["HEAD:uv.lock", "uv.lock", *TWO_TARGETS, "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert [item["name"] for item in data["worse"]] == ["purewheel"]
+    assert data["summary"] == {"worse": 1, "new": 0}
+
+
+@needs_git
+@pytest.mark.parametrize(
+    ("ref", "message"),
+    [
+        ("nosuchbranch:uv.lock", "invalid object name 'nosuchbranch'"),
+        ("HEAD:poetry.lock", "path 'poetry.lock' does not exist in 'HEAD'"),
+        # A ref that looks like an option stays a ref: git doesn't write the file.
+        ("--output=out.txt:uv.lock", "can't read --output=out.txt:uv.lock from git"),
+    ],
+)
+def test_diff_bad_git_ref_exits_2(fake_pypi, repo, capsys, ref, message):
+    assert main([*TARGET, "--", ref, "uv.lock"]) == 2  # `--`: argparse would read --output=... as its own option
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("wheelgap: error: GitInputError: ") and message in err
+    assert sorted(p.name for p in repo.iterdir()) == [".git", "uv.lock"]  # git wrote nothing
+
+
+@needs_git
+def test_diff_bad_git_ref_json_error(fake_pypi, repo, capsys):
+    assert main(["nosuchbranch:uv.lock", "uv.lock", *TARGET, "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["type"] == "GitInputError"
+
+
+def test_diff_git_ref_without_git_exits_2(fake_pypi, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing-here"))
+    assert main(["origin/main:uv.lock", str(tmp_path), *TARGET]) == 2
+    assert "origin/main:uv.lock looks like a git ref, but git isn't on PATH" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        ("origin/main:uv.lock", ("origin/main", "uv.lock")),
+        ("HEAD~1:sub/dir/poetry.lock", ("HEAD~1", "sub/dir/poetry.lock")),
+        ("uv.lock", None),
+        ("HEAD:", None),
+        (":uv.lock", None),
+        ("HEAD:sub/", None),
+        ("C:\\proj\\uv.lock", None),
+        ("C:/proj/uv.lock", None),
+    ],
+)
+def test_git_ref_input(arg, expected):
+    assert git_ref_input(arg) == expected
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="':' isn't allowed in a Windows file name (a:uv.lock is on drive A:)"
+)
+def test_git_ref_input_prefers_an_existing_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a:uv.lock").mkdir()
+    assert git_ref_input("a:uv.lock") is None
+
+
+POETRY_1X_LOCK = """\
+[[package]]
+name = "click"
+version = "8.1.7"
+description = ""
+optional = false
+python-versions = ">=3.7"
+files = [{file = "click-8.1.7-py3-none-any.whl", hash = "sha256:00"}]
+
+[package.dependencies]
+colorama = {version = "*", markers = "platform_system == \\"Windows\\""}
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+description = ""
+optional = false
+python-versions = "*"
+files = [{file = "colorama-0.4.6.tar.gz", hash = "sha256:00"}]
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.11"
+content-hash = "0"
+"""
+
+
+@needs_git
+def test_diff_git_ref_brings_the_pyproject_along(fake_pypi, tmp_path, monkeypatch, capsys):
+    # A Poetry lock older than 2.1 takes its direct dependencies (here colorama, which click only needs on
+    # Windows) from the pyproject.toml beside it. Without it at the ref, colorama would look like a new gap.
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "*"\ncolorama = "*"\n', encoding="utf-8"
+    )
+    git("add", "poetry.lock", "pyproject.toml", cwd=tmp_path)
+    git("commit", "-q", "-m", "lock", cwd=tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert main(["HEAD:poetry.lock", "poetry.lock", *TARGET]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing got worse."]

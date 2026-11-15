@@ -18,6 +18,13 @@ UNTAGGED_DEBIAN = {"3.6": "bullseye", "3.7": "bookworm", "3.8": "bookworm"} | {f
 # A patch or pre-release tag (python:3.12.7-slim) stops being rebuilt once the next one ships, so it can still be on
 # an older release than its X.Y tag (3.12.7-slim is bookworm): those keep the --glibc default.
 _MINOR_TAG_RE = re.compile(r"^\d+\.\d+(?:-|$)", re.ASCII)
+# The Debian release each X.Y-rc tag that stopped being rebuilt at X.Y's release is on (python:3.11-rc-slim is
+# bullseye), from Docker Hub on 2026-11-14: each -rc-slim digest matches its -rc-slim-<release> one. Older -rc tags are
+# on releases with no glibc here (3.9-rc is buster), and a still-built one (3.16-rc) keeps the --glibc default.
+RC_DEBIAN = {"3.10": "bullseye", "3.11": "bullseye", "3.12": "bookworm", "3.13": "bookworm"} | {
+    "3.14": "trixie",
+    "3.15": "trixie",
+}
 _ALPINE_RE = re.compile(r"^alpine(\d+)\.(\d+)", re.ASCII)
 # docker --platform -> wheelgap arch
 ARCHES = {
@@ -35,7 +42,16 @@ ARCHES = {
     "linux/i386": "i686",  # containerd normalises it to linux/386
 }
 WINDOWS_VARIANTS = ("windowsservercore", "nanoserver")
-IMAGE_NAMES = ("python", "library/python", "docker.io/library/python", "docker.io/python")
+# splitDockerDomain maps index.docker.io to docker.io before adding the official library/ prefix.
+# https://github.com/distribution/reference/blob/v0.6.0/normalize.go#L123-L170
+IMAGE_NAMES = (
+    "python",
+    "library/python",
+    "docker.io/library/python",
+    "docker.io/python",
+    "index.docker.io/library/python",
+    "index.docker.io/python",
+)
 UV_IMAGE = "ghcr.io/astral-sh/uv"
 UV_ARCHES = {"x86_64", "aarch64"}
 # Arches the official python images are published for, by Debian release (trixie and alpine have them all).
@@ -57,7 +73,10 @@ OLD_DEBIAN_TAGS = {
     ("3.9", "bookworm"),
 }
 
-_TAG_RE = re.compile(r"^(\d+)\.(\d+)(?:\.\d+)?(?:(?:a|b|rc)\d+)?(?:-(.+))?$", re.ASCII)
+# X.Y, X.Y.Z or a pre-release (3.15.0a1, 3.13rc1), then the variant; or the official images' floating X.Y-rc tags
+# (python:3.16-rc, 3.16-rc-slim-trixie), which follow the newest pre-release of X.Y. Astral's uv images have had
+# them too (uv:python3.14-rc-alpine, python3.14-rc-bookworm-slim).
+_TAG_RE = re.compile(r"^(\d+)\.(\d+)(?:(-rc)(?=-|$)|(?:\.\d+)?(?:(?:a|b|rc)\d+)?)(?:-(.+))?$", re.ASCII)
 _UV_TAG_PREFIX_RE = re.compile(r"^(?:\d+\.\d+(?:\.\d+)?-)?python", re.ASCII)
 _DOCKER_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")  # distribution/reference's tag grammar
 
@@ -466,7 +485,12 @@ def _heredoc_rules(syntax: str | None) -> int | None:
 
 
 def _from_lines(text: str) -> list[str]:
-    """The arguments of every FROM instruction in order, with line continuations joined as Docker joins them.
+    """The arguments of every FROM instruction in order, with line continuations joined as Docker joins them."""
+    return [args for _, args in _from_instructions(text)]
+
+
+def _from_instructions(text: str) -> list[tuple[int, str]]:
+    """(line number, arguments) of every FROM instruction in order, the line being where the instruction starts.
 
     Heredoc bodies (`RUN <<EOF` ... `EOF`) are skipped, so a line in one is never read as an instruction.
     Follows Parse in BuildKit's parser.go at commit cedaeca8850a2bb536bbd1db72419f3cf491bdb5: each body starts
@@ -486,11 +510,12 @@ def _from_lines(text: str) -> list[str]:
     rules = _heredoc_rules(syntax)
     esc = re.escape(escape)
     continued = re.compile(rf"(?<!{esc}){esc}[ \t]*$")  # one escape char at the end, not two
-    found = []
+    found: list[tuple[int, str]] = []
     parts: list[str] = []  # an instruction continued onto the next line
+    start = 0  # the line the instruction being read starts on
     heredocs: deque[tuple[str, bool]] = deque()  # (delimiter, strip_tabs) of the bodies still to skip, in order
 
-    def finish(instruction: str, joined: bool) -> None:
+    def finish(instruction: str, joined: bool, line_number: int) -> None:
         # Docker splits the keyword off on ASCII whitespace only, so `FROM<U+00A0>python` isn't a FROM to it.
         words = re.split(r"[ \t\v\f\r]+", instruction, maxsplit=1)
         if words[0].upper() != "FROM" and re.match(r"(?i)FROM\s", words[0]):
@@ -507,7 +532,7 @@ def _from_lines(text: str) -> list[str]:
         if words and words[0].upper() == "FROM":
             if len(words) == 1:
                 raise DockerfileError("FROM with no image")
-            found.append(words[1])
+            found.append((line_number, words[1]))
 
     def heredocs_in(instruction: str) -> deque[tuple[str, bool]]:
         docs = deque(_heredocs(instruction, escape))
@@ -529,7 +554,7 @@ def _from_lines(text: str) -> list[str]:
             )
         return docs
 
-    for line in lines:
+    for number, line in enumerate(lines, 1):
         if heredocs:  # a body line: never an instruction, a comment or a continuation
             name, strip_tabs = heredocs[0]
             if (line.lstrip("\t") if strip_tabs else line) == name:
@@ -542,15 +567,17 @@ def _from_lines(text: str) -> list[str]:
         if not parts and stripped.startswith("#"):
             continue  # a comment never continues, even if it ends in the escape char
         if m := continued.search(line):
+            if not parts:
+                start = number
             parts.append(line[: m.start()])
             continue
         instruction = "".join([*parts, line])  # Docker joins continued lines with nothing in between
         # splitCommand: strings.TrimSpace, https://github.com/moby/buildkit/blob/cedaeca/frontend/dockerfile/parser/split_command.go
-        finish(instruction.strip(_GO_SPACES), joined=bool(parts))
+        finish(instruction.strip(_GO_SPACES), joined=bool(parts), line_number=start if parts else number)
         heredocs = heredocs_in(instruction)
         parts = []
     if parts:  # the file ended mid-continuation: Docker still reads what's there
-        finish("".join(parts).strip(_GO_SPACES), joined=len(parts) > 1)
+        finish("".join(parts).strip(_GO_SPACES), joined=len(parts) > 1, line_number=start)
         heredocs = heredocs_in("".join(parts))
     if heredocs:
         raise DockerfileError(f"unterminated heredoc <<{heredocs[0][0]} (BuildKit rejects it)")
@@ -633,17 +660,24 @@ def final_image(text: str) -> tuple[str, str | None]:
     any chain of stages) to a real image. Like Docker, a stage keeps the platform of the stage it
     builds on: a `--platform` on `FROM base` doesn't change what `base` was built for.
     """
-    stages: dict[str, tuple[str, str | None]] = {}
-    lines = _from_lines(text)
+    image, platform, _ = final_from(text)
+    return image, platform
+
+
+def final_from(text: str) -> tuple[str, str | None, int]:
+    """final_image, plus the line of the FROM instruction that names that image."""
+    stages: dict[str, tuple[str, str | None, int]] = {}
+    lines = _from_instructions(text)
     if not lines:
         raise DockerfileError("no FROM line found")
-    for args in lines[:-1]:
+    for number, args in lines[:-1]:
         image, platform, stage = _split_from(args)
         if (base := stages.get(image)) is not None:  # AS names are lowercased, references aren't
-            image, platform = base
+            image, platform, number = base
         if stage:
-            stages[stage] = (image, platform)
-    image, platform, _ = _split_from(lines[-1])
+            stages[stage] = (image, platform, number)
+    number, args = lines[-1]
+    image, platform, _ = _split_from(args)
     if (base := stages.get(image)) is not None:
         return base
     if stages and not any(c in image for c in ":/@$") and image.lower() not in (*IMAGE_NAMES, "scratch"):
@@ -651,7 +685,7 @@ def final_image(text: str) -> tuple[str, str | None]:
         raise DockerfileError(
             f"FROM {image}: not an earlier stage ({known}) or an official python image, pass -p/-t instead"
         )
-    return image, platform
+    return image, platform, number
 
 
 def parse_image(image: str, platform: str | None = None) -> ImageTarget:
@@ -682,7 +716,12 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
             raise DockerfileError(f"{image}: the tag must specify a Python version like python3.13-alpine")
         raise DockerfileError(f"{image}: the tag must start with a Python version like 3.13")
     python = f"{m.group(1)}.{m.group(2)}"
-    variant = m.group(3).split("-") if m.group(3) else []  # Docker Hub tags are case-sensitive: -SLIM doesn't exist
+    # An X.Y-rc tag stops being rebuilt once X.Y is released, so like a patch tag it can be on an older Debian than
+    # its X.Y tag (see _MINOR_TAG_RE).
+    rc = bool(m.group(3))
+    minor_tag = bool(_MINOR_TAG_RE.match(tag)) and not rc
+    rc_release = False  # the Debian release came from RC_DEBIAN, whose images kept every arch they were built for
+    variant = m.group(4).split("-") if m.group(4) else []  # Docker Hub tags are case-sensitive: -SLIM doesn't exist
 
     release = None
     if alpine := next((part for part in variant if part.startswith("alpine")), None):
@@ -699,8 +738,15 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
         if unknown:
             raise DockerfileError(f"{image}: unknown image variant '{'-'.join(unknown)}'")
         release = next((part for part in variant if part in DEBIAN_GLIBC), None)
-        if release is None and name in IMAGE_NAMES and _MINOR_TAG_RE.match(tag):
+        if release is None and name in IMAGE_NAMES and minor_tag:
             release = UNTAGGED_DEBIAN.get(python)
+        elif release is None and name in IMAGE_NAMES and rc:
+            if python in RC_DEBIAN:
+                release, rc_release = RC_DEBIAN[python], True
+            elif (int(m.group(1)), int(m.group(2))) < (3, 10):
+                raise DockerfileError(
+                    f"{image} is on a Debian release older than bullseye: pass -t and --glibc instead"
+                )
         glibc = DEBIAN_GLIBC.get(release) if release else None
 
     arch = "x86_64"
@@ -711,7 +757,8 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
         if name == UV_IMAGE and arch not in UV_ARCHES:
             raise DockerfileError(f"{image}: Astral's uv images are only published for linux/amd64 and linux/arm64")
         if name in IMAGE_NAMES and release in DEBIAN_ARCHES:
-            frozen = not _MINOR_TAG_RE.match(tag) or (python, release) in OLD_DEBIAN_TAGS
+            # An X.Y-rc tag may be live or long stale, so it gets only the arches both kinds are published for.
+            frozen = not _MINOR_TAG_RE.match(tag) or (python, release) in OLD_DEBIAN_TAGS or rc_release
             if arch not in (OLD_DEBIAN_ARCHES if frozen else DEBIAN_ARCHES[release]):
                 if UNTAGGED_DEBIAN.get(python) == "trixie":
                     hint = f" ({python}-trixie is)"  # the X.Y tag: a patch tag has no trixie twin
@@ -719,6 +766,10 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
                     hint = f" ({python}-bookworm is)"
                 else:
                     hint = ""
+                if rc and arch in OLD_DEBIAN_ARCHES:  # 3.14-rc-bookworm has s390x, 3.15-rc-bookworm doesn't
+                    raise DockerfileError(
+                        f"{image} may not be published for {platform}: older -rc builds have it, newer ones don't{hint}"
+                    )
                 raise DockerfileError(f"{image} isn't published for {platform}{hint}")
     return ImageTarget(python, f"{family}-{arch}", glibc, musl)
 

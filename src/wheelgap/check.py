@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
-from packaging.version import InvalidVersion
+from packaging.version import InvalidVersion, Version
 
 try:  # packaging's parsed-marker node types (private, so guarded: without them every comparison is unknown)
     from packaging._parser import Value as _Value
@@ -19,7 +21,7 @@ try:  # packaging's parsed-marker node types (private, so guarded: without them 
 except ImportError:  # pragma: no cover
     _Value = _Variable = None  # type: ignore[assignment,misc]
 
-from .sources import Edge, Package, Source, uv_extra_names, uv_group_names, uv_selected_roots
+from .sources import Edge, Package, PoetryExtras, Source, uv_extra_names, uv_group_names, uv_selected_roots
 from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
 
 
@@ -87,24 +89,36 @@ class Row:
         return any(s is not Status.NOT_NEEDED for s in self.results.values())
 
 
+# A wheel's tags, or None if its filename doesn't parse. --explain asks again for every file on every target,
+# so parse each name once. lru_cache is thread-safe (also on free-threaded Python). The bound counts entries,
+# a few MB with realistic names (about 4 MB, keys included), and keeps a long-running process (wheelgap-mcp)
+# from growing without limit; one release's wheels fit many times over.
+@lru_cache(maxsize=16384)
+def _parsed_tags(filename: str) -> frozenset[Tag] | None:
+    try:
+        return parse_wheel_filename(filename)[3]
+    except InvalidWheelFilename:
+        return None
+
+
 def wheel_tags(files: list[str]) -> list[frozenset[Tag]]:
-    out = []
-    for f in files:
-        if not f.endswith(".whl"):
-            continue
-        try:
-            out.append(parse_wheel_filename(f)[3])
-        except InvalidWheelFilename:
-            continue
-    return out
+    return [tags for f in files if f.endswith(".whl") and (tags := _parsed_tags(f)) is not None]
 
 
 def has_sdist(files: list[str]) -> bool:
     return any(f.endswith(SDIST_SUFFIXES) for f in files)
 
 
-def _installable(files: list[str], target: Target) -> bool:
-    return any(target.accepts(t) for t in wheel_tags(files)) or (has_sdist(files) and target.builds_sdists)
+def _installable(
+    files: list[str],
+    target: Target,
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
+) -> bool:
+    if not no_binary and any(target.accepts(t) for t in wheel_tags(files)):
+        return True
+    return not only_binary and has_sdist(files) and target.builds_sdists
 
 
 def status_for(
@@ -112,6 +126,9 @@ def status_for(
     target: Target,
     _wheels: list[frozenset[Tag]] | None = None,
     yanked: frozenset[str] = frozenset(),
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
 ) -> Status:
     if files is None:
         return Status.UNKNOWN
@@ -119,12 +136,14 @@ def status_for(
         # `yanked` is only non-empty for a release pinned with ==. Like pip, ignore its yanked files
         # unless every file this target could use is yanked; then pip installs them anyway (PEP 592).
         live = [f for f in files if f not in yanked]
-        if _installable(live, target):
+        if _installable(live, target, no_binary=no_binary, only_binary=only_binary):
             files = live
         _wheels = None
-    wheels = _wheels if _wheels is not None else wheel_tags(files)
+    wheels = [] if no_binary else (_wheels if _wheels is not None else wheel_tags(files))
     if any(target.accepts(t) for t in wheels):
         return Status.WHEEL
+    if only_binary:
+        return Status.MISSING
     return Status.SOURCE if has_sdist(files) and target.builds_sdists else Status.MISSING
 
 
@@ -189,14 +208,13 @@ def _platform_reason(plat: str, target: Target) -> str:
 
 def rejection(filename: str, target: Target) -> str | None:
     """Why `target` can't install this wheel, or None if it can."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return "unparseable wheel filename"
     if target.accepts(wheel):
         return None
     platforms = sorted({t.platform for t in wheel})
-    if "any" in platforms or set(platforms) & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         if target.freethreaded:
             stable = [t for t in wheel if t.abi == "abi3t"]
             if stable:  # PEP 803: the free-threaded stable ABI, cpXY-abi3t works on CPython X.Y+ only
@@ -227,13 +245,12 @@ _OS_PREFIX: dict[str, tuple[str, ...]] = {
 
 def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     """Sort key: right platform first, then same arch, then same OS, then nearest Python version."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return (3, 99, filename)
     platforms = {t.platform for t in wheel}
     family, arch = PLATFORMS[target.platform]
-    if "any" in platforms or platforms & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         group = 0
     elif any(p.endswith(arch) or (p.endswith("universal2") and family == "macos") for p in platforms):
         group = 1
@@ -246,10 +263,81 @@ def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     return (group, distance, filename)
 
 
-def explain(files: list[str], target: Target) -> list[tuple[str, str]]:
-    """(filename, reason) for every wheel `target` rejects, the closest misses first."""
-    out = [(f, r) for f in files if f.endswith(".whl") and (r := rejection(f, target))]
+def explain(
+    files: list[str],
+    target: Target,
+    yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
+    *,
+    no_binary: bool = False,
+    only_binary: bool = False,
+) -> list[tuple[str, str]]:
+    """(filename, reason) for every wheel `target` rejects, the closest misses first.
+
+    A wheel the target accepts but status_for() leaves out because it's yanked (the release has other files the
+    target can use) is listed with the reason "yanked", and with `no_binary` an accepted wheel is listed as
+    "ignored (--no-binary)".
+    """
+    skips_yanked = bool(yanked) and _installable(
+        [f for f in files if f not in yanked], target, no_binary=no_binary, only_binary=only_binary
+    )
+    out = []
+    for f in files:
+        if not f.endswith(".whl"):
+            continue
+        reason = rejection(f, target)
+        if reason is None:
+            if no_binary:
+                reason = "ignored (--no-binary)"
+            elif skips_yanked and f in yanked:
+                reason = "yanked"
+        if reason:
+            out.append((f, reason))
+    if requires_python_rejected:
+        for f, reason in requires_python_rejected.items():
+            if f.endswith(".whl"):  # a wheel the target can't use anyway says why, not that a newer Python fits
+                out.append((f, rejection(f, target) or reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
+
+
+# How many rejected wheels --explain's text (and wheelgap-mcp's check_package) lists per cell.
+EXPLAIN_LIMIT = 8
+
+
+def explain_lines(
+    files: list[str],
+    target: Target,
+    *,
+    yanked: frozenset[str] = frozenset(),
+    requires_python_rejected: dict[str, str] | None = None,
+    limit: int | None = None,
+    dim: Callable[[str], str] = lambda text: text,
+    align: bool = False,
+    no_binary: bool = False,
+    only_binary: bool = False,
+) -> list[str]:
+    """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
+    `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
+
+    The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
+    unaligned (one space-separated "file  reason" per line) and with no limit.
+    """
+    rejected = explain(files, target, yanked, requires_python_rejected, no_binary=no_binary, only_binary=only_binary)
+    out = [] if rejected else [dim("no wheels published for this version")]
+    shown = rejected[:limit]
+    width = max((len(f) for f, _ in shown), default=0) if align else 0
+    out += [f"{f.ljust(width)}  {dim(reason)}" for f, reason in shown]
+    if len(rejected) > len(shown):
+        out.append(dim(f"… and {len(rejected) - len(shown)} more (--json lists them all)"))
+    if has_sdist(files):
+        if not target.builds_sdists:
+            out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+        elif only_binary:
+            out.append(dim("there is an sdist, but --only-binary forbids building from source"))
+    for f, reason in (requires_python_rejected or {}).items():
+        if f.endswith(SDIST_SUFFIXES):
+            out.append(dim(f"there is an sdist, but it {reason}"))
+    return out
 
 
 _marker_cache: dict[str, Marker | None] = {}
@@ -262,6 +350,8 @@ _marker_cache: dict[str, Marker | None] = {}
 # false on macOS (so it doesn't). Only a definite False hides a package. Target.unknown_markers adds
 # platform_machine on 32-bit x86 and Arm, where it depends on the machine rather than the Python.
 _UNKNOWABLE = frozenset({"extra", "extras", "dependency_groups", "platform_release", "platform_version"})
+_FULL_VERSION_MARKERS = frozenset({"python_full_version", "implementation_version"})
+_RELEASE = re.compile(r"\d+(?:\.\d+)+")
 _atom_cache: dict[tuple[str, Target], bool | None] = {}
 
 
@@ -271,8 +361,41 @@ def _quote(text: str) -> str | None:
     return f"'{text}'" if "'" not in text else None  # both kinds of quote: can't re-serialise safely
 
 
-def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool | None:
-    """One comparison: True/False, or None when it involves something we can't know."""
+def _evaluate_atom(
+    text: str,
+    node: tuple,
+    target: Target,
+    base_env: dict,
+    full_names: frozenset[str],
+    *,
+    lock_file: bool,
+) -> bool | None:
+    try:
+        marker = Marker(text)
+        evaluate = (lambda env: marker.evaluate(env, context="lock_file")) if lock_file else marker.evaluate
+        if not full_names:
+            return evaluate(base_env)
+        prefix = f"{target.major}.{target.minor}."
+        probes = [f"{prefix}0", f"{prefix}999999"]
+        # Also every X.Y.Z the value names, however it's written ('3.13.1.*', 'v3.13.2', '3.13.1;3.13.2'): == and
+        # in can hold at exactly one patch release.
+        for item in node:
+            if isinstance(item, _Value):
+                for found in _RELEASE.findall(item.value):
+                    release = Version(found).release
+                    if release[:2] == (target.major, target.minor) and len(release) >= 3:
+                        probes.append(".".join(map(str, release[:3])))
+        outcomes = {evaluate({**base_env, **{name: patch for name in full_names}}) for patch in probes}
+        return outcomes.pop() if len(outcomes) == 1 else None
+    except Exception:  # undefined names, odd comparisons: unknown rather than a confident answer
+        return None
+
+
+def _atom(
+    node: tuple, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+) -> bool | None:
+    """One comparison: True/False, or None when it involves something we can't know (or, with no target, anything
+    but a Poetry extra)."""
     if _Variable is None or _Value is None:
         return None  # packaging's internals changed: treat every comparison as unknown (never hide)
     parts: list[str] = []
@@ -288,24 +411,52 @@ def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool 
             parts.append(quoted)
         else:
             parts.append(str(n.value))  # the operator
-    if not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
+    if poetry_extras is not None and names == {"extra"}:
+        return _poetry_extra(node, poetry_extras)
+    if target is None or not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
         return None
     text = " ".join(parts)
+    full_names = (_FULL_VERSION_MARKERS & names) - (environment or {}).keys()
     if environment is not None:
-        try:
-            return Marker(text).evaluate({**target.marker_env, **environment}, context="lock_file")
-        except Exception:
-            return None
+        return _evaluate_atom(
+            text,
+            node,
+            target,
+            {**target.marker_env, **environment},
+            full_names,
+            lock_file=True,
+        )
     key = (text, target)
     if key not in _atom_cache:
-        try:
-            _atom_cache[key] = Marker(text).evaluate(target.marker_env)
-        except Exception:  # undefined names, odd comparisons: unknown rather than a confident answer
-            _atom_cache[key] = None
+        _atom_cache[key] = _evaluate_atom(
+            text,
+            node,
+            target,
+            target.marker_env,
+            full_names,
+            lock_file=False,
+        )
     return _atom_cache[key]
 
 
-def _evaluate3(markers: list, target: Target, environment: dict | None = None) -> bool | None:
+def _poetry_extra(node: tuple, extras: PoetryExtras) -> bool | None:
+    """An `extra` comparison as Poetry evaluates a lock's markers: `extra` stands for the set of extras selected, so
+    `extra == "api"` holds if api is one of them and `extra != "api"` if it isn't (SingleMarker.validate in
+    https://github.com/python-poetry/poetry-core/blob/2.5.0/src/poetry/core/version/markers.py, called from
+    Transaction.calculate_operations in Poetry 2.5's src/poetry/puzzle/transaction.py). A name that isn't one of the
+    project's extras, or any other operator, is unknown."""
+    known, selected = extras
+    if len(node) != 3 or str(node[1].value) not in ("==", "!="):
+        return None
+    value = node[2] if isinstance(node[0], _Variable) else node[0]
+    if not isinstance(value, _Value) or (name := canonicalize_name(value.value)) not in known:
+        return None
+    return (name in selected) == (str(node[1].value) == "==")
+
+
+def _evaluate3(
+    markers: list, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+) -> bool | None:
     """Kleene evaluation of packaging's parsed marker list: `and` binds tighter than `or`."""
     groups: list[list[bool | None]] = [[]]
     for item in markers:
@@ -314,13 +465,65 @@ def _evaluate3(markers: list, target: Target, environment: dict | None = None) -
         elif item == "and":
             continue
         elif isinstance(item, list):
-            groups[-1].append(_evaluate3(item, target, environment))
+            groups[-1].append(_evaluate3(item, target, environment, poetry_extras))
         else:
-            groups[-1].append(_atom(item, target, environment))
+            groups[-1].append(_atom(item, target, environment, poetry_extras))
     results: list[bool | None] = []
     for group in groups:
         results.append(False if False in group else None if None in group else True)
     return True if True in results else None if None in results else False
+
+
+def _parsed_marker(marker: str) -> Marker | None:
+    if marker not in _marker_cache:
+        try:
+            _marker_cache[marker] = Marker(marker)
+        except InvalidMarker:
+            _marker_cache[marker] = None
+    return _marker_cache[marker]
+
+
+def poetry_marker_holds(marker: str, target: Target | None, extras: PoetryExtras) -> bool:
+    """Whether a Poetry 2.x lock marker can hold on `target` with these extras (see _poetry_extra). With no target,
+    whether it can hold on any target: only its extra comparisons are known then."""
+    m = _parsed_marker(marker)
+    if m is None:
+        return True  # can't parse it: assume the package is needed rather than hide a gap
+    try:
+        return _evaluate3(m._markers, target, poetry_extras=extras) is not False
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
+        return True
+
+
+def poetry_extras_decide(marker: str, extras: PoetryExtras) -> tuple[bool | None, bool]:
+    """How the selected extras decide a Poetry 2.x lock marker. If it's only `extra` comparisons on the project's
+    extras (`extra == "a" or extra == "b"`), the selection alone decides it: (True or False, False). Anything else
+    (`sys_platform == "win32" or extra == "a"`) also depends on how the package is reached, which Poetry 2.0-2.2 (and
+    installer.re-resolve) read differently from the lock, so it's (None, ruled_out): evaluated per target with every
+    extra unknown, a superset, where ruled_out says whether the selection rules out one of its extra comparisons."""
+    m = _parsed_marker(marker)
+    if m is None or _Variable is None:
+        return None, False
+    atoms: list[tuple] = []
+
+    def walk(items: list) -> None:
+        for item in items:
+            if isinstance(item, list):
+                walk(item)
+            elif isinstance(item, tuple):
+                atoms.append(item)
+
+    try:
+        walk(m._markers)
+        decided = [
+            _poetry_extra(atom, extras) if {n.value for n in atom if isinstance(n, _Variable)} == {"extra"} else None
+            for atom in atoms
+        ]
+        if atoms and all(d is not None for d in decided):
+            return _evaluate3(m._markers, None, poetry_extras=extras) is not False, False
+        return None, False in decided
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
+        return None, False
 
 
 def marker_holds(
@@ -332,12 +535,7 @@ def marker_holds(
 ) -> bool:
     if not marker:
         return True
-    if marker not in _marker_cache:
-        try:
-            _marker_cache[marker] = Marker(marker)
-        except InvalidMarker:
-            _marker_cache[marker] = None
-    m = _marker_cache[marker]
+    m = _parsed_marker(marker)
     if m is None:
         return True  # can't parse it: assume the package is needed rather than hide a gap
     try:
@@ -363,6 +561,32 @@ def marker_holds(
 # How a package was reached: the index of the package that depends on it, the name of the
 # dependency group that lists it, or None for a root or a top-level requirement.
 Parent = int | str | None
+
+
+def _narrow_candidates(
+    source: Source,
+    candidates: list[int],
+    version: str | None,
+    edge_source: dict[str, object] | None,
+    *,
+    allow_range: bool = False,
+) -> list[int]:
+    """Narrow candidate package indices by version (and range for Poetry) and uv edge `source`."""
+    if version:
+        # uv edges carry an exact version; Poetry edges a range (numpy = ">=1.26").
+        matched = [i for i in candidates if source.packages[i].version == version]
+        if not matched and allow_range:
+            try:
+                spec = SpecifierSet(version)
+                matched = [i for i in candidates if _in_range(source.packages[i].version, spec)]
+            except InvalidSpecifier:  # Poetry's "*" or "^1.2": no narrowing
+                matched = []
+        candidates = matched or candidates  # retain conservative fallback for incomplete lock metadata
+    if edge_source is not None and source.uv_packages is not None:
+        uv_packages = source.uv_packages
+        sourced = [i for i in candidates if uv_packages[i].get("source") == edge_source]
+        candidates = sourced or candidates
+    return candidates
 
 
 def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
@@ -404,10 +628,12 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
         for dependency in dependencies:
             if not marker_holds(dependency.get("marker"), target, extras=extras, groups=groups):
                 continue
-            candidates = by_name.get(canonicalize_name(dependency["name"]), [])
-            if version := dependency.get("version"):
-                exact = [i for i in candidates if source.packages[i].version == version]
-                candidates = exact or candidates  # retain conservative fallback for incomplete lock metadata
+            candidates = _narrow_candidates(
+                source,
+                by_name.get(canonicalize_name(dependency["name"]), []),
+                dependency.get("version"),
+                dependency.get("source"),
+            )
             requested = frozenset(
                 canonicalize_name(extra) for extra in dependency.get("extra", dependency.get("extras", []))
             )
@@ -453,22 +679,16 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
         by_name.setdefault(p.key, []).append(i)
 
     def follow(edge: Edge) -> list[int]:
-        name, version, marker = edge
+        name, version, marker, edge_source = edge
         if not marker_holds(marker, target):
             return []
-        candidates = by_name.get(canonicalize_name(name), [])
-        if version is not None:
-            # uv edges carry an exact version; Poetry edges a range (numpy = ">=1.26").
-            exact = [i for i in candidates if source.packages[i].version == version]
-            if exact:
-                return exact
-            try:
-                spec = SpecifierSet(version)
-                ranged = [i for i in candidates if _in_range(source.packages[i].version, spec)]
-            except InvalidSpecifier:  # Poetry's "*" or "^1.2": no narrowing
-                ranged = []
-            candidates = ranged or candidates
-        return candidates
+        return _narrow_candidates(
+            source,
+            by_name.get(canonicalize_name(name), []),
+            version,
+            edge_source,
+            allow_range=True,
+        )
 
     parents: dict[int, Parent] = dict.fromkeys(source.roots)
     queue: deque[int] = deque()
@@ -524,7 +744,7 @@ def applies(pkg: Package, target: Target) -> bool:
 
 
 def check(sources: list[Source], targets: list[Target]) -> list[Row]:
-    rows = []
+    rows: list[Row] = []
     for source in sources:
         paths: dict[Target, dict[int, list[str]]] = {target: {} for target in targets}
         installed = (
@@ -538,15 +758,31 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
-            files = None if pkg.error else pkg.files
-            wheels = wheel_tags(files) if files is not None else []
-            row = Row(pkg)
+            resolved_rows: dict[int, Row] = {}
+            parsed: dict[int, list[frozenset[Tag]]] = {}
             for t in targets:
+                resolved = pkg.resolutions.get(f"{t.major}.{t.minor}", pkg)
+                if id(resolved) not in resolved_rows:
+                    resolved_rows[id(resolved)] = Row(resolved, dict.fromkeys(targets, Status.NOT_NEEDED))
+                    parsed[id(resolved)] = wheel_tags(resolved.files) if resolved.files is not None else []
+                row = resolved_rows[id(resolved)]
+                files = None if resolved.error else resolved.files
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
-                row.results[t] = status_for(files, t, wheels, pkg.yanked) if needed else Status.NOT_NEEDED
+                row.results[t] = (
+                    status_for(
+                        files,
+                        t,
+                        parsed[id(resolved)],
+                        resolved.yanked,
+                        no_binary=resolved.no_binary,
+                        only_binary=resolved.only_binary,
+                    )
+                    if needed
+                    else Status.NOT_NEEDED
+                )
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i] if source.uv_selection is not None else dependency_path(source, installed[t], i)
                     )
-            rows.append(row)
+            rows.extend(resolved_rows.values())
     return rows
