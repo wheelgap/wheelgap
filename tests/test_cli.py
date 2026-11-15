@@ -3275,3 +3275,24 @@ def test_requirements_no_binary_and_only_binary(capsys, tmp_path, fake_pypi):
     pkgs = {p["name"]: p for p in json.loads(out)["packages"]}
     assert pkgs["purewheel"]["results"] == {"linux-x86_64": "missing"}
     assert pkgs["nowheels"]["results"] == {"linux-x86_64": "missing"}
+
+
+@pytest.mark.parametrize("markdown", [False, True])
+def test_empty_requirements_says_no_packages_to_check(capsys, fake_pypi, tmp_path, markdown):
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", *(["--markdown"] if markdown else []))
+    assert code == 0
+    assert ("### wheelgap: no packages to check" if markdown else "No packages to check.") in out
+    assert "have a wheel" not in out and "has a wheel" not in out
+
+
+def test_only_editable_requirements_says_no_packages_to_check(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("-e .\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0
+    lines = [line for line in out.splitlines() if line.strip()]
+    skipped = next(i for i, line in enumerate(lines) if "skipped" in line)
+    assert lines.index("No packages to check.") > skipped  # the reason comes first
+    assert "All 0" not in out

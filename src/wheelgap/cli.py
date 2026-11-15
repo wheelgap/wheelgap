@@ -1040,6 +1040,8 @@ def render_markdown(
     if gaps:
         noun = "package" if len(rows) == 1 else "packages"
         out = [f"### wheelgap: {len(gaps)} of {len(rows)} {noun} {'has' if len(gaps) == 1 else 'have'} gaps", ""]
+    elif not rows:  # "every package" reads like a success when the run checked nothing
+        out = ["### wheelgap: no packages to check", ""]
     else:
         out = [
             f"### wheelgap: every package has a wheel for {'all ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}"
@@ -1880,6 +1882,9 @@ def _main(argv: list[str]) -> int:
         print(style.dim(f"could not check {r.package.name}: {r.package.error}"))
 
     n_t = len(targets)
+    if not rows:  # "All 0 packages have a wheel" reads like a success when the run checked nothing
+        print(style.dim("No packages to check."))
+        return 0
     if not gaps:
         what = "The 1 package has" if len(rows) == 1 else f"All {len(rows)} packages have"
         every = f"{'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}{apart_from_ignored(rows)}"
