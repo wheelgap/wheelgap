@@ -29,10 +29,11 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Compare wheelgap with pip
-        # The latest pip, on purpose: the check is against what pip does today.
+        # The latest pip, on purpose: the check is against what pip does today. --no-dev keeps the dev group's
+        # pinned pip out of the environment, so --with pip resolves the newest release.
         run: |
           set -o pipefail
-          uv run --python 3.14 --with pip python scripts/check_against_pip.py | tee accuracy.log
+          uv run --python 3.14 --no-dev --with pip python scripts/check_against_pip.py | tee accuracy.log
       - name: Summarise
         if: always()
         run: |
