@@ -28,6 +28,13 @@ def test_make_targets_next_is_the_newest_python():
     assert [t.python for t in targets] == ["3.14", "3.15t"]
 
 
+def test_make_targets_rejects_free_threaded_before_3_13():
+    with pytest.raises(wheelgap.TargetError, match=r"free-threading starts at Python 3\.13 \(not 3\.12t\)"):
+        wheelgap.make_targets("3.12t")
+    with pytest.raises(wheelgap.TargetError, match="free-threading starts at Python 3.13"):
+        wheelgap.make_targets(python=["3.13", "cp312t"], platforms="linux")
+
+
 @pytest.mark.parametrize("python", ["", " , "])
 def test_make_targets_uses_running_python_for_empty_input(python):
     assert wheelgap.make_targets(python=python) == wheelgap.make_targets()

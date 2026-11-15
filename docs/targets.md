@@ -93,7 +93,8 @@ remains a list of platforms.
 ## Python versions
 
 `-p` takes versions such as `3.13`, repeated or comma-separated. A trailing `t` means a free-threaded build
-(`3.14t`), which correctly rejects `abi3` wheels.
+(`3.14t`), which correctly rejects `abi3` wheels. After 0.9.0, a `t` on a version before 3.13 (`3.12t`) is an input
+error (exit 2), because free-threading starts at Python 3.13.
 
 Without `-p`, the Python comes from `--dockerfile`, then `python` in `[tool.wheelgap]`, then a `.python-version` file
 next to the lockfile (or `pyproject.toml`), and otherwise the Python wheelgap is running on.

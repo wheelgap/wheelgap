@@ -860,6 +860,38 @@ def test_empty_python_in_config_is_an_error(capsys, fixtures, tmp_path, as_json)
         assert not out
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_free_threaded_python_before_3_13_is_an_error(capsys, fixtures, fake_pypi, as_json):
+    # No cp312t wheel can exist: this used to report every compiled package as a source build and exit 1.
+    args = [str(fixtures / "uvproj"), "-p", "3.12t", "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "wheelgap: error: free-threading starts at Python 3.13 (not 3.12t)" in err
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "message": "free-threading starts at Python 3.13 (not 3.12t)",
+            "type": "TargetError",
+        }
+    else:
+        assert not out
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("where", ["config", "python-version"])
+def test_free_threaded_python_before_3_13_in_project_files_is_an_error(capsys, fixtures, tmp_path, where):
+    project = project_with_lock(tmp_path, fixtures)
+    if where == "config":
+        (project / "pyproject.toml").write_text('[tool.wheelgap]\npython = ["3.13", "3.12t"]\n', encoding="utf-8")
+    else:
+        (project / ".python-version").write_text("3.12t\n", encoding="utf-8")
+    code, out, err = run(capsys, str(project), "-t", "linux-x86_64")
+    assert code == 2
+    assert "wheelgap: error: free-threading starts at Python 3.13 (not 3.12t)" in err
+    assert not out
+
+
 def test_text_summary_lists_only_targets_with_gaps(capsys, fixtures):
     code, out, _ = run(
         capsys,

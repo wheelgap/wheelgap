@@ -109,6 +109,20 @@ def test_next_python_note(pythons, expected):
     assert next_python_note(pythons) == expected
 
 
+@pytest.mark.parametrize("spec", ["3.12t", "cp312t", "312t", "3.9t", " 3.12T ", "2.7t"])
+def test_parse_python_rejects_free_threaded_before_3_13(spec):
+    # No cp312t wheel can exist, so every package would look like a source build.
+    with pytest.raises(TargetError, match=r"free-threading starts at Python 3\.13 \(not \d\.\d+t\)"):
+        parse_python(spec)
+    with pytest.raises(TargetError, match="free-threading starts at Python 3.13"):
+        build_targets([f"3.13,{spec}"], ["linux"])
+
+
+def test_parse_python_keeps_free_threaded_from_3_13():
+    assert parse_python("3.13t") == (3, 13, True)
+    assert parse_python("3.12") == (3, 12, False)
+
+
 def test_parse_python_rejects_garbage():
     with pytest.raises(TargetError):
         parse_python("latest")
