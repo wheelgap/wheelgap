@@ -29,6 +29,9 @@ from wheelgap.dockerfile import (
         ("python:3.11-slim-bullseye", ImageTarget("3.11", "linux-x86_64", glibc="2.31")),
         ("python:3.13.1-alpine3.22 AS runtime", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("docker.io/library/python:3.12", ImageTarget("3.12", "linux-x86_64", glibc="2.41")),
+        # index.docker.io is the legacy registry host; Docker rewrites it to docker.io (normalize.go)
+        ("index.docker.io/library/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
+        ("index.docker.io/python:3.13-alpine", ImageTarget("3.13", "musl-x86_64", musl="1.2")),
         ("--platform= python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # empty value: the default
         ("-- python:3.13", ImageTarget("3.13", "linux-x86_64", glibc="2.41")),  # BuildKit drops a bare --
         ("--platform=linux/arm64 -- python:3.13-alpine", ImageTarget("3.13", "musl-aarch64", musl="1.2")),
@@ -286,6 +289,11 @@ def test_scratch_after_stages_keeps_the_usual_error(tmp_path):
     text = "FROM python:3.13-alpine AS build\nRUN pip wheel . -w /w\nFROM scratch\nCOPY --from=build /w /w\n"
     with pytest.raises(DockerfileError, match="scratch: only the official python images"):
         read_dockerfile(_dockerfile(tmp_path, text))
+
+
+def test_index_docker_io_in_multi_stage(tmp_path):
+    text = "FROM python:3.12 AS base\nFROM index.docker.io/library/python:3.13\n"
+    assert read_dockerfile(_dockerfile(tmp_path, text)) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
 
 
 _HEREDOC_LIKE_LINES = [
