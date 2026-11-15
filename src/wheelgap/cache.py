@@ -221,12 +221,32 @@ def _own_files(folder: Path) -> Iterator[os.DirEntry[str]]:
                 yield entry
 
 
+def _clear_folder(folder: Path, *, best_effort: bool = False) -> int:
+    """Delete wheelgap's own files and remove an empty cache folder, never following a link. With
+    best_effort, a file that can't be deleted is skipped instead of stopping the rest."""
+    if not _own_folder(folder):
+        return 0
+    skip = OSError if best_effort else FileNotFoundError  # another run may have removed it
+    count = 0
+    for entry in _own_files(folder):
+        with contextlib.suppress(skip):
+            os.unlink(entry.path)
+            count += bool(_ENTRY.fullmatch(entry.name))
+    with contextlib.suppress(skip):
+        (folder / "last-prune").unlink()  # a link here is removed itself, not its target
+    with contextlib.suppress(OSError):  # not empty: another run saved meanwhile, or someone else's file
+        folder.rmdir()
+    return count
+
+
 def prune(max_age: float = MAX_AGE) -> None:
-    """Delete entries older than max_age, which load_files would ignore anyway. Runs at most once a day:
-    a `last-prune` marker next to the entries holds the time of the last run in its mtime. Only wheelgap's
+    """Delete current entries older than max_age, at most once a day, and all obsolete pinned-v1 entries.
+    A `last-prune` marker in the current folder holds the time of its last run in its mtime. Only wheelgap's
     own files are touched, never through a link, and nothing here ever fails a run."""
     try:
         folder = cache_dir()
+        with contextlib.suppress(OSError):
+            _clear_folder(folder.parent / "pinned-v1", best_effort=True)  # obsolete: entries of any age
         if not _own_folder(folder):
             return
         marker = folder / "last-prune"
@@ -246,20 +266,12 @@ def prune(max_age: float = MAX_AGE) -> None:
 
 
 def clear() -> tuple[Path, int]:
-    """--clear-cache: delete wheelgap's files in the cache folder, then the folder if that leaves it empty.
-    Returns the folder and how many entries were removed. A folder that's a link is refused, not followed."""
+    """--clear-cache: delete wheelgap's files in the current and obsolete pinned-v1 cache folders.
+    Returns the current folder and the total number of entries removed. Links are never followed."""
     folder = cache_dir()
-    if not folder.exists() and not folder.is_symlink():
-        return folder, 0
-    if not _own_folder(folder):
+    if (folder.exists() or folder.is_symlink()) and not _own_folder(folder):
         raise OSError(f"{folder} is a link or not a folder, so wheelgap won't clear it; remove it yourself")
-    count = 0
-    for entry in _own_files(folder):
-        with contextlib.suppress(FileNotFoundError):  # another run may have removed it
-            os.unlink(entry.path)
-            count += bool(_ENTRY.fullmatch(entry.name))
-    with contextlib.suppress(FileNotFoundError):
-        (folder / "last-prune").unlink()  # a link here is removed itself, not its target
-    with contextlib.suppress(OSError):  # not empty: another run saved meanwhile, or someone else's file
-        folder.rmdir()
+    count = _clear_folder(folder)
+    with contextlib.suppress(OSError):  # an obsolete folder we can't empty never fails --clear-cache
+        count += _clear_folder(folder.parent / "pinned-v1", best_effort=True)
     return folder, count

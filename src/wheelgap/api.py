@@ -33,7 +33,6 @@ from .targets import (
     DEFAULT_PLATFORMS,
     Target,
     build_targets,
-    single_python,
 )
 
 _OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
@@ -90,6 +89,7 @@ class Result:
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
     no_binary: bool = False
     only_binary: bool = False
+    _resolutions: dict[str, Package] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -111,18 +111,18 @@ class Result:
     @cached_property
     def rejected(self) -> dict[Target, list[tuple[str, str]]]:
         """Per SOURCE or MISSING target, (filename, reason) for every wheel it can't use, the closest misses first."""
-        files = list(self.files)
         return {
             t: explain(
-                files,
+                list(p.files or ()),
                 t,
-                self.yanked,
-                self.requires_python_rejected,
+                p.yanked,
+                p.requires_python_rejected,
                 no_binary=self.no_binary,
                 only_binary=self.only_binary,
             )
             for t, s in self.statuses.items()
             if s in _EXPLAINED
+            for p in [self._resolutions.get(f"{t.major}.{t.minor}", self)]
         }
 
     @cached_property
@@ -130,20 +130,20 @@ class Result:
         """Per SOURCE or MISSING target, the text --explain prints under it, one "file  reason" per line, unaligned
         and with every rejected wheel (or "no wheels published for this version"), plus "there is an sdist, but
         ... can't build packages from source" where that applies."""
-        files = list(self.files)
         return {
             t: "\n".join(
                 explain_lines(
-                    files,
+                    list(p.files or ()),
                     t,
-                    yanked=self.yanked,
-                    requires_python_rejected=self.requires_python_rejected,
+                    yanked=p.yanked,
+                    requires_python_rejected=p.requires_python_rejected,
                     no_binary=self.no_binary,
                     only_binary=self.only_binary,
                 )
             )
             for t, s in self.statuses.items()
             if s in _EXPLAINED
+            for p in [self._resolutions.get(f"{t.major}.{t.minor}", self)]
         }
 
     def to_dict(self, explain: bool = False) -> dict[str, object]:
@@ -183,16 +183,19 @@ def _result(
         pkg.name,
         pkg.version,
         statuses,
-        tuple(pkg.files or ()),
-        pkg.error,
+        tuple(dict.fromkeys(f for variant in pkg.variants for f in variant.files or ())),
+        # With several Pythons, a lookup that went wrong records its error on each resolution, not on pkg.
+        pkg.error or next((variant.error for variant in pkg.variants if variant.error), None),
         # Locks for different Pythons can ship different versions: report the first, and a difference in any.
         applied[0].packages[pkg.key] if applied else None,
         any(bundled_version_differs(pkg, lock) for lock in applied),
         {t: tuple(via[t]) for t, s in statuses.items() if s in _EXPLAINED and t in via},
-        pkg.yanked,
-        pkg.requires_python_rejected,
+        # A file's yanked flag and its Requires-Python reason are the same for every Python, so these are the union.
+        frozenset(f for variant in pkg.variants for f in variant.yanked),
+        {f: why for variant in pkg.variants for f, why in variant.requires_python_rejected.items()},
         pkg.no_binary,
         pkg.only_binary,
+        pkg.resolutions,
     )
 
 
@@ -227,9 +230,17 @@ def check_packages(
     pkgs = [Package(p, None) if isinstance(p, str) else Package(p[0], p[1]) for p in packages]
     for p in pkgs:
         p.origin = "api"
-    fill_all(pkgs, workers=workers, python=single_python(targets))
+    fill_all(pkgs, workers=workers, pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)))
     return [
-        _result(p, {t: status_for(None if p.error else p.files, t, yanked=p.yanked) for t in targets}, pyodide_locks)
+        _result(
+            p,
+            {
+                t: status_for(None if resolved.error else resolved.files, t, yanked=resolved.yanked)
+                for t in targets
+                for resolved in [p.resolutions.get(f"{t.major}.{t.minor}", p)]
+            },
+            pyodide_locks,
+        )
         for p in pkgs
     ]
 

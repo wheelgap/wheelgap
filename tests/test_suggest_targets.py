@@ -390,10 +390,10 @@ def test_multi_stage_dockerfile(tmp_path):
 
 
 def test_dockerfile_it_cant_read(tmp_path):
-    (tmp_path / "Dockerfile").write_text("ARG BASE=python:3.13\nFROM $BASE\n")
+    (tmp_path / "Dockerfile").write_text("ARG BASE\nFROM $BASE\n")
     found = suggest(tmp_path)
     assert found.targets == []
-    assert unreadable(found) == [("Dockerfile", None, "$BASE: build arguments are not supported")]
+    assert unreadable(found) == [("Dockerfile", None, "ARG BASE has no default: a --build-arg value isn't read")]
 
 
 def test_glibc_is_left_out_when_the_sources_disagree(tmp_path, capsys):

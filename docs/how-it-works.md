@@ -64,9 +64,10 @@ macOS, wheelgap creates the folder and its entries readable by you only.
 
 `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor
 saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache`
-deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow
-a link. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the
-Python API.
+deletes all of them (add inputs to check them right after). Both also remove obsolete entries from the sibling
+`pinned-v1` folder regardless of age, and remove that folder if it is empty. `--clear-cache` includes those entries in
+its removed count. Both touch only wheelgap's own files, and never follow a link. Unpinned names, version ranges and
+`--index-url` lookups aren't cached, and neither are lookups from the Python API.
 
 After 0.9.0, the same folder also keeps, for 24 hours each:
 

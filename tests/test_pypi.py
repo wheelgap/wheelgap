@@ -415,7 +415,9 @@ def test_pin_requires_python_read_from_cache(fake_pypi, capsys, tmp_path, monkey
     assert "pythonranged-2.0-py3-none-any.whl  requires Python >=3.10" in out
 
 
-@pytest.mark.parametrize("python,expected", [("3.9", "3.9"), ("3.13,3.13t", "3.13"), ("3.9,3.13", None)])
+@pytest.mark.parametrize(
+    "python,expected", [("3.9", ("3.9",)), ("3.13,3.13t", ("3.13",)), ("3.9,3.13", ("3.9", "3.13"))]
+)
 def test_range_requires_python_package_api_forwarding(fake_pypi, monkeypatch, python, expected):
     from wheelgap import api
 
@@ -429,7 +431,7 @@ def test_range_requires_python_package_api_forwarding(fake_pypi, monkeypatch, py
     targets = wheelgap.make_targets(python=python, platforms="linux,windows")
     (result,) = wheelgap.check_packages(["purewheel"], targets, workers=2)
     assert result.ok
-    assert calls == [{"workers": 2, "python": expected}]
+    assert calls == [{"workers": 2, "pythons": expected}]
 
 
 def test_version_range_checks_the_newest_matching_release(fake_pypi, tmp_path):

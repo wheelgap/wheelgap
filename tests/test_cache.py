@@ -354,6 +354,181 @@ def test_clear_cache_with_no_cache_folder(capsys, lookup_cache):
 ENTRY_NAME = "0" * 64 + ".json"
 
 
+@pytest.fixture
+def legacy_cache(monkeypatch, tmp_path):
+    legacy = tmp_path / "wheelgap" / "pinned-v1"
+    legacy.mkdir(parents=True)
+    current = legacy.with_name("pinned-v2")
+    monkeypatch.setattr(cache, "cache_dir", lambda: current)
+    return legacy, current
+
+
+@pytest.mark.parametrize("operation", ["prune", "clear"])
+@pytest.mark.parametrize("current_exists", [False, True])
+def test_legacy_cache_is_removed_regardless_of_age(monkeypatch, legacy_cache, operation, current_exists):
+    legacy, current = legacy_cache
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cache, "_now", lambda: now)
+    for name, saved in [(ENTRY_NAME, 0), ("1" * 64 + ".json", now), (".tmp-old.json", now), ("last-prune", now)]:
+        entry = legacy / name
+        entry.write_text("{}", encoding="utf-8")
+        os.utime(entry, (saved, saved))
+    if current_exists:
+        current.mkdir()
+        entry = current / ENTRY_NAME
+        entry.write_text("{}", encoding="utf-8")
+        os.utime(entry, (now, now))
+
+    if operation == "clear":
+        assert cache.clear() == (current, 2 + current_exists)
+        assert not current.exists()
+    else:
+        cache.prune()
+        assert (current / ENTRY_NAME).exists() == current_exists
+    assert not legacy.exists()
+
+
+def test_legacy_cache_is_removed_even_when_current_prune_is_recent(monkeypatch, legacy_cache):
+    legacy, current = legacy_cache
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cache, "_now", lambda: now)
+    (legacy / ENTRY_NAME).write_text("{}", encoding="utf-8")
+    current.mkdir()
+    expired = current / ENTRY_NAME
+    expired.write_text("{}", encoding="utf-8")
+    os.utime(expired, (0, 0))
+    marker = current / "last-prune"
+    marker.touch()
+    os.utime(marker, (now, now))
+
+    cache.prune()
+    assert not legacy.exists()
+    assert expired.exists()  # the current cache still follows the daily prune interval
+
+
+@pytest.mark.parametrize("operation", ["prune", "clear"])
+@pytest.mark.parametrize("protected", ["foreign-file", "directory", "entry-link", "temporary-link"])
+def test_legacy_cache_cleanup_keeps_foreign_files_and_links(tmp_path, legacy_cache, operation, protected):
+    legacy, current = legacy_cache
+    owned = legacy / ("1" * 64 + ".json")
+    owned.write_text("{}", encoding="utf-8")
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    names = {"foreign-file": "notes.json", "temporary-link": ".tmp-link.json"}
+    kept = legacy / names.get(protected, ENTRY_NAME)
+    if protected == "foreign-file":
+        kept.write_text("keep", encoding="utf-8")
+    elif protected == "directory":
+        kept.mkdir()
+    else:
+        try:
+            kept.symlink_to(victim)
+        except OSError:
+            pytest.skip("can't create symlinks here")
+
+    if operation == "clear":
+        assert cache.clear() == (current, 1)
+    else:
+        cache.prune()
+    assert not owned.exists()
+    assert list(legacy.iterdir()) == [kept]
+    assert victim.read_text(encoding="utf-8") == "keep"
+    if protected.endswith("link"):
+        assert kept.is_symlink()
+
+
+@pytest.mark.parametrize("operation", ["prune", "clear"])
+def test_legacy_cache_cleanup_never_follows_a_linked_folder(tmp_path, legacy_cache, operation):
+    legacy, current = legacy_cache
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / ENTRY_NAME
+    victim.write_text("keep", encoding="utf-8")
+    legacy.rmdir()
+    try:
+        legacy.symlink_to(elsewhere, target_is_directory=True)
+    except OSError:
+        pytest.skip("can't create symlinks here")
+
+    current.mkdir()
+    entry = current / ENTRY_NAME
+    entry.write_text("{}", encoding="utf-8")
+    os.utime(entry, (0, 0))
+    if operation == "clear":
+        assert cache.clear() == (current, 1)
+    else:
+        cache.prune()
+    assert not entry.exists()
+    assert legacy.is_symlink()
+    assert list(elsewhere.iterdir()) == [victim]
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_legacy_cache_prune_error_does_not_prevent_current_prune(monkeypatch, legacy_cache):
+    legacy, current = legacy_cache
+    current.mkdir()
+    entry = current / ENTRY_NAME
+    entry.write_text("{}", encoding="utf-8")
+    os.utime(entry, (0, 0))
+    own_files = cache._own_files
+
+    def unreadable_legacy(folder):
+        if folder == legacy:
+            raise PermissionError("unreadable legacy cache")
+        return own_files(folder)
+
+    monkeypatch.setattr(cache, "_own_files", unreadable_legacy)
+    cache.prune()
+    assert not entry.exists()
+
+
+def test_legacy_cache_clear_error_does_not_fail_clear(monkeypatch, legacy_cache):
+    legacy, current = legacy_cache
+    (legacy / ENTRY_NAME).write_text("{}", encoding="utf-8")
+    current.mkdir()
+    (current / ENTRY_NAME).write_text("{}", encoding="utf-8")
+    own_files = cache._own_files
+
+    def unreadable_legacy(folder):
+        if folder == legacy:
+            raise PermissionError("unreadable legacy cache")
+        return own_files(folder)
+
+    monkeypatch.setattr(cache, "_own_files", unreadable_legacy)
+    assert cache.clear() == (current, 1)
+    assert not current.exists()
+    assert (legacy / ENTRY_NAME).exists()
+
+
+@pytest.mark.parametrize("operation", ["prune", "clear"])
+def test_legacy_cache_entry_that_cannot_be_deleted_does_not_stop_the_rest(monkeypatch, legacy_cache, operation):
+    legacy, current = legacy_cache
+    blocked = legacy / ENTRY_NAME
+    others = [legacy / (digit * 64 + ".json") for digit in "12"]
+    for entry in [blocked, *others]:
+        entry.write_text("{}", encoding="utf-8")
+    unlink = os.unlink
+
+    def held_open(path, *args, **kwargs):
+        if Path(path) == blocked:
+            raise PermissionError("in use by another process")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", held_open)
+    if operation == "clear":
+        assert cache.clear() == (current, 2)  # the entries it did remove are still counted
+    else:
+        cache.prune()
+    assert list(legacy.iterdir()) == [blocked]
+
+
+def test_clear_cache_reports_legacy_entries_when_current_cache_is_missing(capsys, legacy_cache):
+    legacy, current = legacy_cache
+    (legacy / ENTRY_NAME).write_text("{}", encoding="utf-8")
+    assert run(capsys, "--clear-cache") == (0, "", f"wheelgap: removed 1 cached lookup from {current}\n")
+    assert not legacy.exists()
+
+
 def test_prune_deletes_only_its_own_old_files(monkeypatch, lookup_cache):
     now = 1_800_000_000.0
     monkeypatch.setattr(cache, "_now", lambda: now)

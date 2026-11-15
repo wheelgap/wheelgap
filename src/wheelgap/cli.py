@@ -1417,6 +1417,13 @@ def _main(argv: list[str]) -> int:
         if args.dockerfile:
             # The image beats pyproject.toml; flags still win.
             image = read_dockerfile(Path(args.dockerfile))
+            if not quiet:
+                for name, value in image.build_args:
+                    print(
+                        f"wheelgap: note: {args.dockerfile}: FROM uses the default of ARG {name}={value}; "
+                        "pass -p/-t if the build sets --build-arg",
+                        file=sys.stderr,
+                    )
             docker_musl = image.platform.startswith("musl-")
             if docker_musl and args.target:
                 args.target = [musl_docker_names(item) for item in args.target]

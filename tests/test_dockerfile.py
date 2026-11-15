@@ -166,6 +166,131 @@ def test_read_dockerfile_legacy_docker_hub_in_final_stage(tmp_path):
     assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
 
 
+def test_read_dockerfile_expands_a_global_arg_default(tmp_path, capsys):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG PYTHON_VERSION=3.12\nFROM python:${PYTHON_VERSION}-slim\n", encoding="utf-8")
+    image = read_dockerfile(path)
+    assert image == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+    assert image.build_args == (("PYTHON_VERSION", "3.12"),)
+    assert capsys.readouterr().err == ""  # the CLI notes it, once, naming the file
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+def test_cli_notes_the_global_arg_default_it_used(tmp_path, capsys, fake_pypi, quiet):
+    path = tmp_path / "Dockerfile"
+    path.write_text(
+        "ARG NODE=22\nARG PYTHON_VERSION=3.12\nFROM node:${NODE} AS assets\nFROM python:${PYTHON_VERSION}-slim\n",
+        encoding="utf-8",
+    )
+    main(["purewheel", "--dockerfile", str(path), "--json", *(["--quiet"] if quiet else [])])
+    err = capsys.readouterr().err
+    note = f"wheelgap: note: {path}: FROM uses the default of ARG PYTHON_VERSION=3.12"
+    assert (note in err) is not quiet
+    assert "NODE" not in err  # only the final image's FROM counts
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM --platform=$BUILDPLATFORM golang:1.22 AS build\nFROM python:3.13-slim\n",
+        "ARG NODE\nFROM node:${NODE} AS assets\nFROM python:3.13-slim\n",
+        "ARG A=1 B=2\nFROM node:${A} AS assets\nFROM python:3.13-slim\n",
+    ],
+)
+def test_build_arguments_only_matter_in_the_final_images_from(tmp_path, dockerfile):
+    # An earlier stage that isn't the final image's base can use any build argument, as before.
+    path = tmp_path / "Dockerfile"
+    path.write_text(dockerfile, encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
+
+
+def test_build_argument_problem_in_the_final_images_base_stage(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG PY\nFROM python:${PY}-slim AS base\nFROM base\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match="ARG PY has no default"):
+        read_dockerfile(path)
+
+
+def test_global_arg_naming_the_final_stage_is_noted(tmp_path):
+    # The default picks the stage; a --build-arg could pick another, so it's noted.
+    path = tmp_path / "Dockerfile"
+    path.write_text(
+        "ARG B=builder\nFROM python:3.12 AS builder\nFROM python:3.13 AS other\nFROM ${B}\n", encoding="utf-8"
+    )
+    image = read_dockerfile(path)
+    assert image == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+    assert image.build_args == (("B", "builder"),)
+
+
+def test_base_stage_global_arg_default_is_used(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text(
+        "ARG PY=3.12\nFROM python:${PY}-slim AS base\nFROM --platform=$BUILDPLATFORM base\n", encoding="utf-8"
+    )
+    image = read_dockerfile(path)
+    assert image == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+    assert image.build_args == (("PY", "3.12"),)
+
+
+def test_read_dockerfile_expands_a_global_arg_default_in_platform(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG ARCH=linux/arm64\nFROM --platform=${ARCH} python:3.13-alpine AS runtime\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "musl-aarch64", musl="1.2")
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "message"),
+    [
+        ("ARG PYTHON_VERSION\nFROM python:${PYTHON_VERSION}-slim\n", "has no default"),
+        ('ARG PYTHON_VERSION="3.12"\nFROM python:${PYTHON_VERSION}-slim\n', "defaults with quotes"),
+        ("ARG PYTHON_VERSION=3.1${SUFFIX}\nFROM python:${PYTHON_VERSION}-slim\n", "defaults with quotes"),
+        ("ARG ARCH=linux/amd64\nFROM --platform=${ARCH:-linux/amd64} python:3.13\n", "build arguments"),
+        ("FROM --platform=$BUILDPLATFORM python:3.13\n", "build arguments"),
+        ("FROM python:${PY}-slim\nARG PY=3.13\n", "build arguments"),  # an ARG after FROM isn't used in FROM
+        # Docker declares two variables here; wheelgap would read "1 B=2" as A's default, so it says so instead.
+        ("ARG A=1 B=2\nFROM python:${A}-slim\n", "one NAME=value"),
+        # The second ARG sets PY to 3.12 in Docker: wheelgap can't split it, so it mustn't use the first one's 3.11.
+        ("ARG PY=3.11\nARG PY=3.12 OTHER=1\nFROM python:${PY}-slim\n", "one NAME=value"),
+        ("ARG PYTHON_VERSION=3.12 \\\n    PYTHON_VERSION=3.13\nFROM python:${PYTHON_VERSION}-slim\n", "continuation"),
+        # A heredoc body before the first FROM isn't a run of instructions: no ARG in it is a global one.
+        ("RUN <<EOF\nARG PYTHON_VERSION=3.12\nEOF\nFROM python:${PYTHON_VERSION}-slim\n", "build arguments"),
+    ],
+)
+def test_read_dockerfile_global_arg_errors(tmp_path, dockerfile, message):
+    path = tmp_path / "Dockerfile"
+    path.write_text(dockerfile, encoding="utf-8")
+    with pytest.raises(DockerfileError, match=message):
+        read_dockerfile(path)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        "ARG VERSION\n",
+        'ARG LABEL="my app"\n',
+        "ARG A=1 B=2\n",
+        "ARG BUILD_DATE=x \\\n    y\n",
+    ],
+)
+def test_read_dockerfile_ignores_a_global_arg_no_from_uses(tmp_path, args):
+    # An ARG wheelgap can't read only matters when FROM uses a build argument; this image is the same either way.
+    path = tmp_path / "Dockerfile"
+    path.write_text(f"{args}FROM python:3.13-slim\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.13", "linux-x86_64", glibc="2.41")
+
+
+def test_read_dockerfile_global_arg_keyword_in_any_case(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("arg PYTHON_VERSION=3.12\nfrom python:${PYTHON_VERSION}-slim\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+
+
+def test_read_dockerfile_global_arg_redeclared_takes_the_last(tmp_path):
+    path = tmp_path / "Dockerfile"
+    path.write_text("ARG PY\nARG PY=3.12\nFROM python:${PY}-slim\n", encoding="utf-8")
+    assert read_dockerfile(path) == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
+
+
 def test_no_from(tmp_path):
     path = tmp_path / "Dockerfile"
     path.write_text("RUN echo hi\n")

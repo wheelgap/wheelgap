@@ -61,6 +61,7 @@ wheelgap pixi.lock --environment test -p 3.13 -t linux-x86_64,macos-arm64
 wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 
 # Take the Python and platform from the final stage of a Dockerfile
+# (a global `ARG PYTHON_VERSION=3.13` before the first FROM works too)
 wheelgap --dockerfile Dockerfile
 
 # Machine-readable, for scripts and CI

@@ -113,6 +113,26 @@ def test_check_package(fake_pypi):
     assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
 
 
+def test_check_package_pin_respects_requires_python_per_target(fake_pypi):
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package",
+            name="pythonranged",
+            version="2.0",
+            python="3.9,3.13",
+            targets=["linux-x86_64"],
+            explain=True,
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["results"] == {"3.9 linux-x86_64": "missing", "3.13 linux-x86_64": "wheel"}
+    assert data["rejected"] == {
+        "3.9 linux-x86_64": [{"file": "pythonranged-2.0-py3-none-any.whl", "reason": "requires Python >=3.10"}]
+    }
+    assert data["gaps"] == ["3.9 linux-x86_64"]
+
+
 def test_python_next(fake_pypi, fixtures):
     (_, reply) = run(init(), call("check_package", name="purewheel", python="3.14,next-t", targets=["linux-x86_64"]))
     assert reply["result"]["structuredContent"]["results"] == {
