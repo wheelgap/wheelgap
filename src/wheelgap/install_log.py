@@ -33,14 +33,20 @@ _TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")  # GitHu
 _NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 # pip's own lines, not a build's output (which pip indents further): `Collecting cryptography==43.0.0 (from ...)`,
 # `Collecting cryptography>=42`, `Collecting x @ https://...`; `  Downloading cryptography-43.0.0.tar.gz (686 kB)`,
-# `  Using cached https://.../cryptography-43.0.0.tar.gz`.
-_COLLECT = re.compile(rf" {{0,2}}Collecting ({_NAME})(?:\[[^\]]*\])?(.*)$")
+# `  Using cached https://.../cryptography-43.0.0.tar.gz`. `Collecting` only at column 0: under `pip install -v` the pip
+# that installs a build's dependencies logs its own, indented, `  Collecting numpy>=2`, which isn't this run's numpy.
+# Its indented `    Using cached numpy-2.1.0-...` still counts, so this run's numpy then has more than one version.
+_COLLECT = re.compile(rf"Collecting ({_NAME})(?:\[[^\]]*\])?(.*)$")
 _PIN = re.compile(r"\s*===?\s*([^\s,;*]+)(?:\s|$)")
 _FILE = re.compile(r" {0,4}(?:Downloading|Using cached) (\S+)")
 # pip's resolver, when it tries more than one release of a package (backtracking).
 _BACKTRACK = re.compile(rf"INFO: pip is (?:still )?looking at multiple versions of ({_NAME})(?:\[[^\]]*\])? ")
-# pip's `Looking in indexes: https://pypi.org/simple, https://private.example/simple`, when it's given an index.
+# pip's `Looking in indexes: https://pypi.org/simple, https://private.example/simple`, when it's given an index, and
+# `Looking in links: /wheels, https://example.com/wheels` for --find-links (with or without --no-index).
 _INDEXES = re.compile(r"\s*Looking in indexes: (.+)$")
+_LINKS = re.compile(r"\s*Looking in links: (.+)$")
+# The end of a pip run that installed what it was asked to; the next run in the same log starts afresh.
+_INSTALLED = re.compile(r"Successfully installed ")
 _PYPI_SIMPLE = "https://pypi.org/simple"
 _USERINFO = re.compile(r"//[^/@]*@")  # pip hides the password, but not always the user name
 # pip, for each package it builds: `Building wheel for X (pyproject.toml) ... error`, then
@@ -64,6 +70,7 @@ _UV_NAME_VERSION = re.compile(rf"({_NAME})(?:==(\S+))?")
 
 _UNCLEAR = "unclear"  # the log collects the package again without a version after naming one
 _DIRECT = "direct"  # the log installs the package from a URL or a path, not from an index
+_EARLIER = "earlier"  # the package's last `Collecting` line is from an earlier pip run in the log
 
 
 def read_log(path: str) -> str:
@@ -104,10 +111,11 @@ def _decode(f: BinaryIO) -> str:
 def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]:
     """The (name, version) of each package the log says failed to build, in the order the log names them. The version
     is the one uv names, else the one the `Collecting`, `Downloading` and `Using cached` lines since the package's last
-    `Collecting` line name. A failure whose version the log doesn't make clear is an error, and so is a pip log that
-    used another index than PyPI, unless `other_index` (wheelgap itself checks another index, as with --index-url)."""
-    # canonical name -> the versions named since its last `Collecting` line (Version -> as written), or _UNCLEAR or
-    # _DIRECT
+    `Collecting` line name, in the same pip run (a run ends at `Successfully installed`). A failure whose version the
+    log doesn't make clear is an error, and so is a pip log that used another index than PyPI or --find-links, unless
+    `other_index` (wheelgap itself checks another index, as with --index-url)."""
+    # canonical name -> the versions named since its last `Collecting` line (Version -> as written), or _UNCLEAR,
+    # _DIRECT or _EARLIER
     versions: dict[str, dict[Version, str] | str] = {}
     # The first package pip's resolver tried more than one release of. Backtracking on one package changes the
     # versions its dependencies are collected at, and pip doesn't log a candidate again when it goes back to it.
@@ -138,6 +146,12 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
                 f"--from-log: the log collects {name} again without a version after naming one, so which "
                 f"version failed isn't clear; refusing to guess (check {name}==VERSION directly)"
             )
+        if seen == _EARLIER:
+            raise SourceError(
+                f"--from-log: the log's last `Collecting` line for {name} is from an earlier pip run (before its "
+                "`Successfully installed`), so which version failed isn't clear; refusing to guess (check "
+                f"{name}==VERSION directly, or give wheelgap the log of one pip run)"
+            )
         if seen == _DIRECT:
             raise SourceError(
                 f"--from-log: the log installs {name} from a URL or a path, not from an index, so it can't be checked"
@@ -164,7 +178,7 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
 
     def named(key: str, version: str) -> None:
         seen = versions.setdefault(key, {})
-        if seen == _UNCLEAR:
+        if seen in (_UNCLEAR, _EARLIER):
             versions[key] = seen = {}
         if isinstance(seen, dict):  # a URL or a path stays one, whatever file it downloads
             seen.setdefault(Version(version), version)
@@ -204,6 +218,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
                     f"--from-log: the log used another index than PyPI ({', '.join(others)}), so its packages may "
                     "not be PyPI's; pass that index with --index-url to check it"
                 )
+        if (m := _LINKS.match(line)) and not other_index:
+            links = ", ".join(_USERINFO.sub("//", url.strip()) for url in m.group(1).split(","))
+            raise SourceError(
+                f"--from-log: the log used --find-links ({links}), so its packages may not be PyPI's; pass the "
+                "index they came from with --index-url to check it"
+            )
+        if _INSTALLED.match(line):
+            # A later run's failure without its own `Collecting` line must not take this run's version.
+            for key in versions:
+                versions[key] = _EARLIER
         if m := _COLLECT.match(line):
             key, rest = canonicalize_name(m.group(1)), m.group(2)
             if (pin := _PIN.match(rest)) and _is_version(pin.group(1)):

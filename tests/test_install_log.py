@@ -148,6 +148,65 @@ def test_a_download_doesnt_turn_a_url_into_an_index_version():
         failed_builds(text + BUILD_FAILED)
 
 
+def test_a_build_dependency_install_under_pip_v_doesnt_reset_the_version():
+    # Under `pip install -v`, the pip that installs oldscipy's build dependencies logs its own, indented, lines: its
+    # numpy isn't the numpy==1.26.4 that failed.
+    text = (
+        "Collecting numpy==1.26.4\n"
+        "  Using cached numpy-1.26.4.tar.gz (15.8 MB)\n"
+        "Collecting oldscipy==1.0\n"
+        "  Using cached oldscipy-1.0.tar.gz (40 MB)\n"
+        "  Running command pip subprocess to install build dependencies\n"
+        "  Collecting numpy>=2\n"
+        "    Using cached numpy-2.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (16.0 MB)\n"
+        "  Installing collected packages: numpy\n"
+        "  Successfully installed numpy-2.1.0\n"
+        "  Installing build dependencies ... done\n"
+        "Building wheels for collected packages: numpy\n"
+        "  Building wheel for numpy (pyproject.toml) ... error\n"
+        "  ERROR: Failed building wheel for numpy\n"
+        "Failed to build numpy\n"
+    )
+    with pytest.raises(SourceError, match="pip tried more than one version of numpy"):
+        failed_builds(text)
+    # Without the subprocess's own download, it's the version this run collected.
+    without = text.replace(
+        "    Using cached numpy-2.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (16.0 MB)\n", ""
+    )
+    assert failed_builds(without) == [("numpy", "1.26.4")]
+
+
+RUN_1 = """\
+Collecting nowheels==1.0
+  Downloading nowheels-1.0.tar.gz (5 kB)
+Building wheels for collected packages: nowheels
+  Building wheel for nowheels (pyproject.toml) ... done
+Successfully built nowheels
+Installing collected packages: nowheels
+Successfully installed nowheels-1.0
+"""
+
+
+@pytest.mark.parametrize(
+    "run_2",
+    [
+        # `pip install -q -U nowheels` hides `Collecting`
+        "  ERROR: Failed building wheel for nowheels\nERROR: Failed to build installable wheels for some "
+        "pyproject.toml based projects (nowheels)\n",
+        # `pip install .` logs `Processing`
+        "Processing /home/me/nowheels\n  Installing build dependencies ... done\n" + BUILD_FAILED,
+    ],
+)
+def test_a_version_from_an_earlier_pip_run_is_refused(run_2):
+    with pytest.raises(SourceError, match="last `Collecting` line for nowheels is from an earlier pip run"):
+        failed_builds(RUN_1 + run_2)
+
+
+def test_a_later_pip_run_that_collects_the_package_again_gives_its_version():
+    run_2 = "Collecting nowheels\n  Downloading nowheels-1.1.tar.gz (5 kB)\n" + BUILD_FAILED
+    assert failed_builds(RUN_1 + run_2) == [("nowheels", "1.1")]
+
+
 INDEXES = "Looking in indexes: https://pypi.org/simple, https://__token__:****@private.example/simple\n"
 
 
@@ -157,6 +216,21 @@ def test_another_index_is_refused():
         failed_builds(INDEXES + log("pip23-laggard.log"))
     assert "token" not in str(e.value)
     assert failed_builds(INDEXES + log("pip23-laggard.log"), other_index=True) == [("laggard", "1.0")]
+
+
+@pytest.mark.parametrize(
+    "links",
+    [
+        "Looking in links: /wheels, https://alice@files.example/wheels\n",
+        # --no-index: pip prints no `Looking in indexes:`, only the links
+        "Looking in links: /wheels\n",
+    ],
+)
+def test_find_links_is_refused(links):
+    with pytest.raises(SourceError, match=r"the log used --find-links \(/wheels") as e:
+        failed_builds(links + log("pip23-laggard.log"))
+    assert "alice" not in str(e.value)
+    assert failed_builds(links + log("pip23-laggard.log"), other_index=True) == [("laggard", "1.0")]
 
 
 def test_uv_lines_count_only_after_uvs_prefixes():
