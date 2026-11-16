@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Pip installation reports from `pip install --dry-run --report report.json` can now be checked as pinned inputs, with non-PyPI and unknown-origin packages skipped and a note about the report's originating environment. (#423, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
+- wheelgap now reads a pip installation report (`pip install --dry-run --report report.json`) and checks exactly the packages pip resolved, without installing them. A report holds what pip resolved for the machine it ran on, so wheelgap checks it only on that target (same platform, machine, Python and implementation) and refuses any other, since another target can install other packages. Packages pip didn't get from PyPI (VCS checkouts, local paths, direct URLs, another index) are skipped, and a report whose packages all came from a mirror such as Artifactory or devpi is an error, not an empty pass. (#423, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 
 ## 0.12.0 (2026-11-16)
 

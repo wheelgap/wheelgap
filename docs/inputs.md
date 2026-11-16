@@ -19,7 +19,7 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`Pipfile.lock`](#pipfilelock) | no | no |
 | [`pixi.lock`](#pixilock) | no | no |
 | [requirements files](#requirements-files) | no | with `--deps` |
-| [pip installation report](#pip-installation-report) | no | no |
+| [pip installation report](#pip-installation-report) (after 0.12.0) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | with `--deps` |
 | [package names](#package-names) | no | with `--deps` |
 

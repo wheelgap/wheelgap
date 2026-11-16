@@ -26,7 +26,15 @@ from .deps import resolve_deps
 from .offline import require_offline
 from .pyodide import PyodideLock, bundled_version_differs, bundles, check_locks
 from .pypi import fill_all, recheck_lock
-from .sources import Package, Source, SourceError, find_lockfile, load_file, pythons_outside_lock
+from .sources import (
+    Package,
+    Source,
+    SourceError,
+    check_report_targets,
+    find_lockfile,
+    load_file,
+    pythons_outside_lock,
+)
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -358,6 +366,8 @@ def check_lockfile(
     pyodide_locks work as in check_packages(), and are checked before the lockfile is read.
     environment picks a pixi.lock environment (default: `default`); in a project directory it makes pixi.lock the
     lockfile read. Naming one for any other lockfile raises SourceError.
+    A pip installation report (`pip install --dry-run --report`) is resolved for one environment, so it raises
+    SourceError unless every target matches that environment's platform, machine, Python and implementation.
     """
     return _check_lockfile(
         path, targets, online=online, offline=offline, pyodide_locks=pyodide_locks, environment=environment
@@ -389,6 +399,7 @@ def _check_lockfile(
     source: Source = load_file(lockfile, environment)
     if environment is not None and source.kind != "pixi":
         raise SourceError(f"{lockfile}: environment applies to pixi.lock only")
+    check_report_targets(source, targets)
     if offline:
         require_offline([source], "offline=True", undo="set offline=False")
     fill_all(source.packages, refresh=online, pythons=tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets)))

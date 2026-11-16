@@ -2025,10 +2025,21 @@ def parse_pip_report(path: Path) -> Source:
     """pip install --dry-run --report JSON: pinned installation results, not a cross-platform lockfile."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError as e:  # nested too deeply for the json module
+        raise SourceError(f"{path.name}: invalid pip installation report: nested too deeply") from e
     except (OSError, ValueError) as e:
         raise SourceError(f"{path.name}: invalid pip installation report: {e}") from e
-    if not isinstance(data, dict) or data.get("version") != "1" or not isinstance(data.get("install"), list):
-        raise SourceError(f"{path.name}: expected a pip installation report with version '1' and an install list")
+    if not isinstance(data, dict) or "version" not in data or "install" not in data:
+        raise SourceError(
+            f"{path.name}: isn't a pip installation report (no `version` and `install` keys); "
+            "make one with `pip install --dry-run --report report.json`"
+        )
+    if data["version"] != "1":
+        raise SourceError(
+            f"{path.name}: pip installation report version {data['version']!r} isn't supported (only '1')"
+        )
+    if not isinstance(data["install"], list):
+        raise SourceError(f"{path.name}: the pip installation report's `install` isn't a list")
     environment = data.get("environment")
     if environment is not None and (
         not isinstance(environment, dict)
@@ -2038,6 +2049,7 @@ def parse_pip_report(path: Path) -> Source:
     source = Source(path.name, pip_report_env=environment if environment is not None else {})
     seen: dict[str, str] = {}
     public = True
+    mirrors: set[str] = set()  # hosts other than PyPI's that pip downloaded from (not as a direct URL)
     for number, entry in enumerate(data["install"], 1):
         if not isinstance(entry, dict) or not isinstance(entry.get("metadata"), dict):
             raise SourceError(f"{path.name}: install entry {number} has no metadata")
@@ -2061,8 +2073,12 @@ def parse_pip_report(path: Path) -> Source:
         url = info.get("url")
         if url is not None and not isinstance(url, str):
             raise SourceError(f"{path.name}: {name} has invalid download URL")
-        parsed = urlparse(url) if url else None
-        public_file = bool(parsed and parsed.scheme == "https" and parsed.hostname == "files.pythonhosted.org")
+        try:
+            parsed = urlparse(url) if url else None
+            host = parsed.hostname if parsed else None
+        except ValueError as e:
+            raise SourceError(f"{path.name}: {name} has invalid download URL") from e
+        public_file = bool(parsed and parsed.scheme == "https" and host == "files.pythonhosted.org")
         skip = None
         if info.get("vcs_info") is not None:
             skip = "git"
@@ -2071,11 +2087,49 @@ def parse_pip_report(path: Path) -> Source:
         elif not public_file or entry.get("is_direct"):
             # An absent URL gives no positive evidence this pin came from PyPI.
             skip = "url"
+            if host and host != "files.pythonhosted.org" and not entry.get("is_direct"):
+                mirrors.add(host)
         if not public_file:
             public = False
         source.packages.append(Package(name, version, skip=skip, origin=path.name))
+    if mirrors and all(p.skip for p in source.packages):
+        # pip read another index (an Artifactory or devpi mirror, say): checking nothing would look like a pass.
+        raise SourceError(
+            f"{path.name}: nothing to check: pip downloaded these packages from {', '.join(sorted(mirrors))}, "
+            "not PyPI (files.pythonhosted.org), and wheelgap reads only the packages a report got from PyPI"
+        )
     source.pypi_only = public
     return source
+
+
+# The markers that decide which packages pip installs on a target; a pip report holds the values it resolved for.
+_REPORT_MARKERS = ("sys_platform", "platform_machine", "python_version", "implementation_name")
+
+
+def check_report_targets(source: Source, targets: Iterable[Target]) -> None:
+    """SourceError unless every target is the environment a pip installation report was resolved for.
+
+    pip resolves a report for the machine it runs on, so on any other target it can install other packages
+    (Windows-only dependencies, say) and leave some of these out: checking one there would give wrong answers.
+    """
+    if source.kind != "pip-report":
+        return
+    env = source.pip_report_env or {}
+    if not all(env.get(key) for key in _REPORT_MARKERS):
+        raise SourceError(
+            f"{source.label}: the pip installation report doesn't say which environment pip resolved it for "
+            f"(its `environment` needs {', '.join(_REPORT_MARKERS)}), so wheelgap can't tell which target it fits; "
+            "make the report with `pip install --dry-run --report`"
+        )
+    report = {**env, "python_version": ".".join(env["python_version"].split(".")[:2])}
+    other = [t.label(True) for t in targets if any(report[key] != t.marker_env.get(key) for key in _REPORT_MARKERS)]
+    if other:
+        where = ", ".join(f"{key} {env[key]}" for key in _REPORT_MARKERS)
+        raise SourceError(
+            f"{source.label}: pip resolved this report for one environment ({where}), and other targets can "
+            f"install other packages, so it can't be checked on {', '.join(other)}: check that target only, "
+            "or make a report on each target"
+        )
 
 
 READERS = {

@@ -58,6 +58,7 @@ from .sources import (
     Source,
     SourceError,
     UvSelection,
+    check_report_targets,
     load_inputs,
     parse_dist,
     pythons_outside_lock,
@@ -1719,20 +1720,7 @@ def _main(argv: list[str]) -> int:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         sources = [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
         for source in sources:
-            if source.kind == "pip-report" and not quiet:
-                report_env = source.pip_report_env or {}
-                dimensions = ("python_version", "sys_platform", "platform_machine")
-                if not report_env or any(
-                    report_env.get(key) != target.marker_env.get(key)
-                    for target in targets
-                    for key in dimensions
-                    if key in report_env
-                ):
-                    print(
-                        f"wheelgap: note: {source.label}: pip's installation report contains packages resolved "
-                        "for its generating environment only; other targets may install additional dependencies",
-                        file=sys.stderr,
-                    )
+            check_report_targets(source, targets)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
