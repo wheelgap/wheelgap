@@ -63,6 +63,10 @@ wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 # ...and everything they install too, with the path to each gap
 wheelgap mcp==2.3.0 --deps -t win-arm64 --explain
 
+# Check pip's resolved package pins without installing (after 0.12.0)
+python -m pip install --dry-run --ignore-installed --report report.json -r requirements.txt
+wheelgap report.json -p 3.14 -t linux-aarch64
+
 # Before a release: do the wheels you're about to upload cover every target
 # the last release had one for?
 wheelgap --dist dist -p 3.13 -t win-arm64,linux-aarch64

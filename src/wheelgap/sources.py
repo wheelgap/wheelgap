@@ -185,6 +185,8 @@ class Source:
     pypi_only: bool = False
     # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
     passed_over: Path | None = None
+    # A pip installation report captures one generating environment, not a cross-platform dependency graph.
+    pip_report_env: dict[str, str] | None = None
     # Requirements for --deps to resolve: package names on the command line, selected pyproject.toml
     # requirements, or a requirements file's requirement lines.
     specs: list[str] = field(default_factory=list)
@@ -2019,6 +2021,63 @@ def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
     return Source(path.name, pkgs + sorted(skipped.values(), key=lambda p: p.key))
 
 
+def parse_pip_report(path: Path) -> Source:
+    """pip install --dry-run --report JSON: pinned installation results, not a cross-platform lockfile."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SourceError(f"{path.name}: invalid pip installation report: {e}") from e
+    if not isinstance(data, dict) or data.get("version") != "1" or not isinstance(data.get("install"), list):
+        raise SourceError(f"{path.name}: expected a pip installation report with version '1' and an install list")
+    environment = data.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in environment.items())
+    ):
+        raise SourceError(f"{path.name}: invalid pip report environment")
+    source = Source(path.name, pip_report_env=environment if environment is not None else {})
+    seen: dict[str, str] = {}
+    public = True
+    for number, entry in enumerate(data["install"], 1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("metadata"), dict):
+            raise SourceError(f"{path.name}: install entry {number} has no metadata")
+        metadata = entry["metadata"]
+        name = package_name(path, metadata.get("name"))
+        version = metadata.get("version")
+        if not isinstance(version, str):
+            raise SourceError(f"{path.name}: {name} has no version")
+        try:
+            Version(version)
+        except InvalidVersion as e:
+            raise SourceError(f"{path.name}: {name} has an invalid version {version!r}") from e
+        key = canonicalize_name(name)
+        if key in seen:
+            raise SourceError(f"{path.name}: duplicate install entry for {name}")
+        seen[key] = version
+        info = entry.get("download_info")
+        if info is not None and not isinstance(info, dict):
+            raise SourceError(f"{path.name}: {name} has invalid download_info")
+        info = info or {}
+        url = info.get("url")
+        if url is not None and not isinstance(url, str):
+            raise SourceError(f"{path.name}: {name} has invalid download URL")
+        parsed = urlparse(url) if url else None
+        public_file = bool(parsed and parsed.scheme == "https" and parsed.hostname == "files.pythonhosted.org")
+        skip = None
+        if info.get("vcs_info") is not None:
+            skip = "git"
+        elif info.get("dir_info") is not None or (parsed and parsed.scheme == "file"):
+            skip = "path"
+        elif not public_file or entry.get("is_direct"):
+            # An absent URL gives no positive evidence this pin came from PyPI.
+            skip = "url"
+        if not public_file:
+            public = False
+        source.packages.append(Package(name, version, skip=skip, origin=path.name))
+    source.pypi_only = public
+    return source
+
+
 READERS = {
     "pyproject": parse_pyproject,
     "uv": parse_uv_lock,
@@ -2027,6 +2086,7 @@ READERS = {
     "pdm": parse_pdm_lock,
     "pipfile": parse_pipfile_lock,
     "requirements": parse_requirements,
+    "pip-report": parse_pip_report,
     "pixi": parse_pixi_lock,
 }
 PARSERS = {
@@ -2075,10 +2135,12 @@ def file_kind(path: Path) -> str:
         return "uv"
     if name.endswith((".txt", ".in")):
         return "requirements"
+    if name.endswith(".json"):
+        return "pip-report"
     raise SourceError(
         f"don't know how to read {path} "
         "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, requirements.lock, "
-        "requirements.txt or pyproject.toml)"
+        "requirements.txt, pip report.json or pyproject.toml)"
     )
 
 
@@ -2154,7 +2216,7 @@ def load_inputs(inputs: list[str], environment: str | None = None) -> list[Sourc
                 sources[-1].passed_over = p / "pixi.lock"
         elif p.is_file():
             sources.append(load_file(p, environment))
-        elif "/" in item or item.endswith((".lock", ".txt", ".toml")):
+        elif "/" in item or item.endswith((".lock", ".txt", ".toml", ".json")):
             raise SourceError(f"{item}: no such file")
         else:
             adhoc.packages.append(requirement_to_package(item, "command line"))

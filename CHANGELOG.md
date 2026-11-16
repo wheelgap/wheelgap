@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Pip installation reports from `pip install --dry-run --report report.json` can now be checked as pinned inputs, with non-PyPI and unknown-origin packages skipped and a note about the report's originating environment. (#423, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 ## 0.12.0 (2026-11-16)
 
 New: **`--deps --explain`** now gives the way out by default: each gap ends with the nearest newer release that has the wheel, or the last older one that did, and `--deps` works on requirements files and `pyproject.toml` as well as package names. Gap tables name the direct dependency behind a transitive gap (`cryptography (via mcp)`), and `--explain` links each gap to the package's issue tracker (`ask for a wheel: <url>`). For maintainers, the Action's **`dist`** input is a release gate: it runs the new **`--dist DIR`** on the files about to be uploaded and fails the job, before the upload step, when they drop a platform the previous release on PyPI had a wheel for. **`--write-constraints FILE`** writes `--suggest`'s answers as a pip/uv constraints file. Also: `--badge PATH` for a README badge, `--build-arg` for a Dockerfile's ARG values, the way out in the Action's pull request comment, `dependencies: true` and `last_with_wheel` in the MCP server's `check_package`, `deps=True` in the Python API, and an on-disk cache for `--deps`.
