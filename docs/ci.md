@@ -8,7 +8,7 @@ Python is checked.
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.11.0
+- uses: wheelgap/wheelgap@v0.12.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -24,7 +24,7 @@ drops ARM wheels. The gap table also goes to the run's summary page.
 | `comment` | `"false"` | with `compare-to`: also post one pull request comment when something got worse, and edit it on later runs |
 | `github-token` | `${{ github.token }}` | the token for the pull request comment |
 | `comment-author` | `""` | the login the token comments as, such as `my-app[bot]`, for a GitHub App's token |
-| `dist` | `""` | after 0.11.0: a folder like `dist` with the release about to be uploaded, run as `--dist` instead of a lockfile check; see [below](#before-a-release) |
+| `dist` | `""` | a folder like `dist` with the release about to be uploaded, run as `--dist` instead of a lockfile check; see [below](#before-a-release) |
 
 The Action also has a `report` output: with `compare-to`, the path of the Markdown report that went to the job
 summary.
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: wheelgap/wheelgap@v0.11.0
+      - uses: wheelgap/wheelgap@v0.12.0
         with:
           args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64,musl-aarch64
           compare-to: base
@@ -84,7 +84,7 @@ jobs:
   were. The token is only sent to the `https://` host in `GITHUB_SERVER_URL` (GitHub Enterprise Server included); if
   that isn't an `https://` URL, no comment is posted and the step warns. Package names and versions come from the pull
   request, so they're escaped and can't add links, @mentions or Markdown to the comment.
-- **After 0.11.0.** The comment includes the [release suggestions](output.md#suggest) for packages that got worse:
+- **Release suggestions.** The comment also includes the [release suggestions](output.md#suggest) for packages that got worse:
   the nearest newer version that restores the wheels, or the last older version that had them. Lookups are limited to
   packages known to come from PyPI. If a lookup fails, the comment still reports the gap and the check's result is unchanged.
 - **Permissions.** Commenting needs `pull-requests: write` for the token (`github-token`, by default the workflow's
@@ -108,7 +108,7 @@ summary for the comparison, and can comment on the pull request.
 - uses: actions/checkout@v7
   with:
     fetch-depth: 0  # so git can read the base branch's lockfile
-- uses: wheelgap/wheelgap@v0.11.0
+- uses: wheelgap/wheelgap@v0.12.0
   with:
     args: diff origin/${{ github.base_ref }}:uv.lock uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
     summary: "false"
@@ -143,7 +143,7 @@ Markdown report to the summary page:
 ```yaml
 - run: |
     set -o pipefail
-    pipx run --spec wheelgap==0.11.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+    pipx run --spec wheelgap==0.12.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
 ## pre-commit
@@ -151,7 +151,7 @@ Markdown report to the summary page:
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.11.0
+    rev: v0.12.0
     hooks:
       - id: wheelgap
 ```
@@ -174,7 +174,7 @@ wheelgap:
         - uv.lock
         - pyproject.toml
   script:
-    - uvx wheelgap@0.11.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
+    - uvx wheelgap@0.12.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
   artifacts:
     when: always
     reports:
@@ -197,14 +197,14 @@ for how cells map to test results.
 ## Before a release {#before-a-release}
 
 The other place a dropped platform gets caught is right before upload. After `python -m build` or `uv build`,
-[`--dist`](cli.md#dist) (after 0.11.0) checks the `dist/` folder itself against the last release on PyPI and fails
+[`--dist`](cli.md#dist) checks the `dist/` folder itself against the last release on PyPI and fails
 when a target it had a wheel for got no wheel this time — the regression cryptography shipped when 46.0.4 lost the
 Windows on ARM wheels that every release since 46.0.0 had:
 
 ```yaml
 - name: Build
   run: uv build
-- uses: wheelgap/wheelgap@main  # a release after 0.11.0, once there is one
+- uses: wheelgap/wheelgap@v0.12.0
   with:
     dist: dist
     args: -p 3.13 -t win-arm64,linux-aarch64,musl-aarch64

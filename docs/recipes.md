@@ -66,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: wheelgap/wheelgap@v0.11.0
+      - uses: wheelgap/wheelgap@v0.12.0
         with:
           args: uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
           compare-to: base
@@ -191,7 +191,7 @@ or input error.
 
 ## README badge
 
-**After 0.11.0.** [`--badge PATH`](cli.md#badge) writes a [shields.io endpoint](https://shields.io/badges/endpoint-badge)
+[`--badge PATH`](cli.md#badge) writes a [shields.io endpoint](https://shields.io/badges/endpoint-badge)
 file saying how many of your targets have wheels for everything (`8/8 targets`). Publish it from CI, even when the
 check fails, and point a badge at it. With GitHub Pages:
 
@@ -264,7 +264,7 @@ uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --json > wheel
 - `uvx wheelgap@latest` runs the newest release from PyPI. Plain
   `uvx wheelgap` can run an older one: uv uses a version installed with
   `uv tool install` unless a version is requested, and may reuse one from its
-  cache. Pin a release, such as `uvx wheelgap@0.11.0`, when the result must not
+  cache. Pin a release, such as `uvx wheelgap@0.12.0`, when the result must not
   change between runs, and check `--help` on the same command for the flags
   that release has. `pipx run wheelgap` works too.
 - Always pass `-p` and `-t`. Without them, the Python comes from

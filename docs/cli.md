@@ -13,7 +13,7 @@ Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ign
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
-`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.11.0**
+`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.12.0**
 aren't in a release yet.
 
 ## Targets
@@ -68,7 +68,7 @@ final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--mus
 
 ### `--build-arg` {#build-arg}
 
-**After 0.11.0.** `--build-arg NAME=VALUE` (repeatable, with `--dockerfile`): the value `docker build --build-arg`
+`--build-arg NAME=VALUE` (repeatable, with `--dockerfile`): the value `docker build --build-arg`
 gives a global ARG, so `FROM python:${PYTHON_VERSION}-slim` is read with the Python the build picks. It replaces the
 ARG's default, or gives a value to an ARG with none; values follow the same rules as defaults (no quotes, escapes or
 `$`). A name no ARG before the first `FROM` declares is ignored, as Docker ignores it there, with a note. See
@@ -144,7 +144,7 @@ directory's `pixi.lock` the lockfile read. Naming one for any other input is an 
 
 ### `--dist` {#dist}
 
-**After 0.11.0.** Check the files you're about to upload — the `dist/` folder `python -m build` or `uv build` leaves —
+Check the files you're about to upload — the `dist/` folder `python -m build` or `uv build` leaves —
 as the release they make: for each target, whether one of the wheels installs there or the build falls back to the
 sdist, with the same statuses and `--explain` reasons as a lockfile row. It takes no other inputs; the project's name
 and version come from the wheel and sdist filenames, and a folder that mixes projects or versions is refused.
@@ -162,13 +162,13 @@ since PyPI's project of that name may not be yours. If the previous release coul
 comparison didn't run; both notes show even with `-q`, so a gate that didn't compare never passes silently.
 ### `--deps` {#deps}
 
-For package names on the command line or (after 0.11.0) requirements files and dependencies declared in
+For package names on the command line, requirements files and dependencies declared in
 `pyproject.toml`, also check what they install.
 For a project file, this includes any extras you select with `--extra` or `--all-extras`. wheelgap resolves the
 tree for each target from PyPI's metadata: for each requirement, the newest release that meets every constraint on it,
 supports the target's Python and isn't yanked (a yanked release only for an `==` pin), following markers and extras as
 pip evaluates them on that target. `--explain` shows the path to each gap (`via: mcp → PyJWT → cryptography`), and
-`--json --explain` has it as `via`. After 0.11.0, `--explain` with `--deps` also turns on [`--suggest`](#suggest),
+`--json --explain` has it as `via`. `--explain` with `--deps` also turns on [`--suggest`](#suggest),
 so each gap ends with the release to move to (`--no-suggest` turns it off). A release picked differently for two Pythons is a row for each.
 
 With a requirements file, each requirement line is a root — pinned or not, with its markers and extras — and `-r`
@@ -277,14 +277,14 @@ summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks
 flag. With `--markdown`, it renders suggestions as a Markdown list under the explanation. With `--json`, adds `suggest` to each package with a gap. See
 [Newer releases](output.md#suggest).
 
-**After 0.11.0.** With `--deps --explain` it's on by default, since `--deps` already looks every package in the tree
+With `--deps --explain` it's on by default, since `--deps` already looks every package in the tree
 up on PyPI: each gap ends with the way out, the nearest newer release with the wheel or the last older one that had
 it. That's only when `--deps` resolved every input; with a lockfile or an already-pinned requirements file among them,
 it stays opt-in, since those packages' names weren't sent to PyPI. `--no-suggest` turns it off.
 
 ### `--write-constraints` {#write-constraints}
 
-**After 0.11.0.** `--write-constraints FILE` (with `--explain --suggest`, or `--deps --explain`, which turns `--suggest` on): also write what `--suggest` found to a
+`--write-constraints FILE` (with `--explain --suggest`, or `--deps --explain`, which turns `--suggest` on): also write what `--suggest` found to a
 pip/uv constraints file, one pin per package:
 
 ```text
@@ -321,7 +321,7 @@ a pull request comment. See [Output](output.md#markdown).
 
 ### `--badge` {#badge}
 
-**After 0.11.0.** `--badge PATH`: also write a [shields.io endpoint](https://shields.io/badges/endpoint-badge) file
+`--badge PATH`: also write a [shields.io endpoint](https://shields.io/badges/endpoint-badge) file
 to `PATH`, alongside the usual output, with how many of the checked targets have wheels for everything:
 `{"schemaVersion": 1, "label": "wheels", "message": "7/8 targets", "color": "yellow"}`. A target counts when nothing on
 it is `source` or `missing` (a gap `--ignore` accepts there doesn't count against it; an `--advisory` target's gaps

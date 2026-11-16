@@ -25,7 +25,7 @@ All five are read-only. They look packages up on PyPI, or on the index in
 
 - `check_package`: one package, the latest release or a given version, on each
   target. `explain: true` adds why each target with a gap can't use its
-  wheels, and (after 0.11.0) `dependencies: true` checks what it installs too.
+  wheels, and `dependencies: true` checks what it installs too.
 - `check_lockfile`: the same answer as `wheelgap PATH --json`, `[tool.wheelgap]`
   settings included: the packages with gaps, the ones it skipped (git, path and
   private-index packages, which aren't checked) and any notes. It also returns
@@ -37,7 +37,7 @@ All five are read-only. They look packages up on PyPI, or on the index in
   `-alpine` or adding `--platform=linux/arm64`. `build_args` maps global ARG names
   used by the image's `FROM` to their values (or `{}` if none were used). If a
   Docker build overrides them with `--build-arg`, pass the same values as the
-  `build_args` argument (**After 0.11.0**), as `--build-arg` does on the
+  `build_args` argument, as `--build-arg` does on the
   command line. A Dockerfile wheelgap can't read is a tool error.
 - `diff_lockfiles`: takes an `old` and a `new` lockfile (plus `python` and
   `targets`) and answers as `wheelgap diff OLD NEW --json` does, with `ok`
@@ -228,8 +228,8 @@ project's release list from PyPI, which is one more request, and is left out
 when there's no gap, when `WHEELGAP_INDEX_URL` points at another index (which
 may hold private names), or when that lookup fails.
 
-**After 0.11.0.** To check what a package installs as well as the package
-itself, as [`--deps`](cli.md#deps) does, pass `dependencies: true`:
+To check what a package installs as well as the package itself, as [`--deps`](cli.md#deps) does, pass
+`dependencies: true`:
 
 > Can I install mcp 2.3.0 on Windows on ARM?
 

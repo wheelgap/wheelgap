@@ -78,6 +78,11 @@
             "description": "Present from 0.10.0 on (older versions don't write it): labels of the checked targets that --advisory or advisory = [...] in [tool.wheelgap] made advisory, empty when there are none. Gaps on these targets are reported in packages and counted in with_gaps and per_target as usual, but don't change the exit code.",
             "items": {"type": "string"}
         },
+        "dropped": {
+            "type": "object",
+            "description": "Present from 0.12.0 on, with --dist when the comparison with the previous release ran: each target label the previous release on PyPI had an installable wheel for that these files have none for, mapped to that release's version. {} when nothing was dropped or there is no previous release; absent without --dist or when the comparison couldn't run.",
+            "additionalProperties": {"type": "string"}
+        },
         "blocking_newer_python": {
             "type": "array",
             "description": "Present only when exactly two Python versions are checked and one is newer (3.14 and 3.15, or 3.14 and 3.15t; not 3.14 and 3.14t), and not written before 0.10.0: the packages that block the move to the newer one, in the order of packages. A package is listed when the newer Python's result is source or missing on a platform where the older one's is wheel, n/a or bundled, not counting the platforms in ignored_targets. It's decided per package name, over every version of it in the inputs. Packages that couldn't be checked (unknown on the newer Python) are left out, so an empty list isn't a pass on its own: summary and the exit code still decide.",
@@ -154,7 +159,7 @@
                 },
                 "issues_url": {
                     "type": ["string", "null"],
-                    "description": "Present with --explain: the package's issue tracker URL from its PyPI metadata (or GitHub /issues fallback), or null if none was found or the package's index isn't known to be PyPI."
+                    "description": "Present from 0.12.0 on (older versions don't write it), with --explain: the package's issue tracker URL from its PyPI metadata (or GitHub /issues fallback), or null if none was found or the package's index isn't known to be PyPI."
                 },
                 "build_requires": {
                     "type": ["array", "null"],

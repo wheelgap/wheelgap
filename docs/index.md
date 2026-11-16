@@ -11,7 +11,7 @@ uvx wheelgap uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
 ```
 
 ```text
-wheelgap 0.11.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.12.0 · uv.lock · 5 packages · Python 3.13
 
 package    version  linux-aarch64  musl-aarch64
 fastlib    2.0.0    ● source       ● source
@@ -46,7 +46,7 @@ Run with --explain to see which wheels were rejected and why.
 
 ## Versions
 
-These pages describe wheelgap on the `main` branch. Anything marked **after 0.11.0** isn't in a release on PyPI yet;
+These pages describe wheelgap on the `main` branch. Anything marked **after 0.12.0** isn't in a release on PyPI yet;
 the [changelog](https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md) lists it under "Unreleased". Check
 `uvx wheelgap@latest --help` for the flags the released version has.
 

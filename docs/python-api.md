@@ -42,7 +42,7 @@ check_package(name, version=None, targets=None, *, files=None, pyodide_locks=(),
 ```
 
 Check one package: the latest release, or `version`. Pass `files` (distribution filenames you already have) to work
-offline, with no index lookup. After 0.11.0, with `deps=True` it returns a list, as `check_packages(deps=True)` does; `files` can't
+offline, with no index lookup. With `deps=True` it returns a list, as `check_packages(deps=True)` does; `files` can't
 be combined with it.
 
 ### `check_packages()`
@@ -54,7 +54,7 @@ check_packages(packages, targets=None, *, workers=16, pyodide_locks=(), deps=Fal
 Check many packages, looking their files up on the index in parallel. Each package is a name (`"numpy"`, the latest
 release) or a `(name, version)` pair.
 
-**After 0.11.0**, `deps=True` also checks everything the packages install, as `--deps` does: resolved for each target from PyPI's
+`deps=True` also checks everything the packages install, as `--deps` does: resolved for each target from PyPI's
 metadata, with markers and extras followed as pip evaluates them there. You get a `Result` for every package in the
 tree, `n/a` on the targets that don't install it, and `via` gives the path to each gap
 (`("mcp", "PyJWT", "cryptography")`). A tree that only a backtracking resolver could settle raises
@@ -137,7 +137,7 @@ why), a result explains the gap the way `--explain` does:
 - `result.via` maps the same targets to the dependency path from a root down to the package, as `--explain`'s `via:`
   line shows it: `("app", "pandas", "numpy")`, or `("(dev group)", "pytest")` when a dependency group pulls it in.
   `check_lockfile()` fills it for `uv.lock`, and for `poetry.lock` files older than lock-version 2.1, and
-  (after 0.11.0) `check_packages()` and `check_package()` fill it with `deps=True`; it's empty for other inputs.
+  `check_packages()` and `check_package()` fill it with `deps=True`; it's empty for other inputs.
 
 `rejected` and `reasons` are worked out when first read; `via` is filled in when the result is made. `to_dict()` leaves
 all three out, and `to_dict(explain=True)` adds `"rejected"` and `"via"` in the same shapes as

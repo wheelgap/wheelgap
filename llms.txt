@@ -1,6 +1,6 @@
 # wheelgap
 
-> wheelgap is a Python command-line tool that reads a lockfile (`uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`, `requirements.txt`) or package names (with `--deps`, everything they install too) and reports, for each package and each target Python and platform (Linux x86_64 and ARM, Alpine/musl, macOS, Windows on ARM, free-threaded 3.14t, Pyodide, iOS, Android), whether pip or uv would install a prebuilt wheel, build from source, or fail. Run the newest release with `uvx wheelgap@latest` (plain `uvx wheelgap` can reuse an older installed or cached version), always pass `-p` and `-t`, and read `--json` and the exit code: `0` no gaps, `1` gaps found (including packages that couldn't be looked up), `2` bad input.
+> wheelgap is a Python command-line tool that reads a lockfile (`uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`, `requirements.txt`) or package names (with `--deps`, everything they install too, as for requirements files and `pyproject.toml`) and reports, for each package and each target Python and platform (Linux x86_64 and ARM, Alpine/musl, macOS, Windows on ARM, free-threaded 3.14t, Pyodide, iOS, Android), whether pip or uv would install a prebuilt wheel, build from source, or fail. Run the newest release with `uvx wheelgap@latest` (plain `uvx wheelgap` can reuse an older installed or cached version), always pass `-p` and `-t`, and read `--json` and the exit code: `0` no gaps, `1` gaps found (including packages that couldn't be looked up), `2` bad input.
 
 The README and docs on `main` can describe changes that aren't on PyPI yet; `CHANGELOG.md` lists them under "Unreleased". Check `uvx wheelgap@latest --help` for the flags the released version has.
 
@@ -17,11 +17,11 @@ The README and docs on `main` can describe changes that aren't on PyPI yet; `CHA
 
 ## Integrations
 
-- [In CI (GitHub Action)](https://github.com/wheelgap/wheelgap#in-ci-github-action): the Action, `--markdown` for job summaries
+- [In CI (GitHub Action)](https://github.com/wheelgap/wheelgap#in-ci-github-action): the Action, `--markdown` for job summaries, and `dist:` to fail a release that drops a platform's wheels
 - [With pre-commit](https://github.com/wheelgap/wheelgap#with-pre-commit): the pre-commit hook
 - [From Python](https://github.com/wheelgap/wheelgap#from-python): `make_targets`, `check_package`, `check_lockfile`
 - [With an AI coding agent](https://github.com/wheelgap/wheelgap#with-an-ai-coding-agent): the `check-wheels` skill for Claude Code, Codex, Cursor and Copilot
-- [MCP server](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md): `uvx --from wheelgap wheelgap-mcp`, a stdio MCP server with read-only `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools; setup for Claude Code, Cursor, VS Code, Codex and Claude Desktop
+- [MCP server](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md): `uvx --from wheelgap wheelgap-mcp`, a stdio MCP server with read-only `check_package` (with `dependencies: true`, everything it installs too), `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools; setup for Claude Code, Cursor, VS Code, Codex and Claude Desktop
 
 ## Optional
 
