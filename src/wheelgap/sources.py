@@ -195,10 +195,10 @@ class Source:
     constraint_specs: dict[str, set[str]] = field(default_factory=dict)
     # Environment marker-bearing constraints apply per target during --deps resolution.
     marker_constraint_specs: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
-    # A requirements file's constraint problems (a marker, a non-index constraint, conflicting pins): the
-    # resolved package gets the error, as the requirement's own row does without --deps.
+    # A requirements file's constraint problems (a non-index constraint, conflicting pins): the resolved package
+    # gets the error, as the requirement's own row does without --deps.
     constraint_errors: dict[str, str] = field(default_factory=dict)
-    # A requirements file's constraints --deps can't apply the way pip does (a marker, a URL, an error): it refuses.
+    # A requirements file's constraints --deps can't apply the way pip does (a URL, an error): it refuses.
     deps_blockers: list[str] = field(default_factory=list)
     # A requirements file's --no-binary/--only-binary policy, applied to the resolved packages too.
     format_control: _FormatControl | None = None
@@ -1451,6 +1451,20 @@ def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
     return True
 
 
+def _exact_pins(entries: list[Package]) -> dict[str, str]:
+    """The constraints' exact versions: 1.9 and 1.9.0 are one version, and reversed() keeps the first spelling."""
+    return {canonicalize_version(e.version): e.version for e in reversed(entries) if e.version}
+
+
+def _constraint_error(entries: list[Package]) -> str | None:
+    """Why these constraints on one package can't be applied as an index version or range, if they can't."""
+    if any(entry.skip for entry in entries):
+        return "constraint isn't an index version or range"
+    if len(_exact_pins(entries)) > 1:
+        return "constraints specify conflicting exact versions"
+    return None
+
+
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
@@ -1476,25 +1490,20 @@ def parse_requirements(path: Path) -> Source:
     for pkg in pkgs:
         if pkg.skip or pkg.version or not (entries := by_name.get(pkg.key)):
             continue
+        # --deps applies a marked constraint per target (resolve_deps), so only the unmarked ones can break it here.
+        if unmarked_error := _constraint_error([entry for entry in entries if not entry.markers]):
+            constraint_errors[pkg.key] = unmarked_error
         if any(entry.markers for entry in entries):
             pkg.error = "constraint has an environment marker; target-dependent constraints aren't supported"
-        elif any(entry.skip for entry in entries):
-            pkg.error = "constraint isn't an index version or range"
-        # 1.9 and 1.9.0 are one version; reversed() keeps the first spelling.
-        elif len(pins := {canonicalize_version(e.version): e.version for e in reversed(entries) if e.version}) > 1:
-            pkg.error = "constraints specify conflicting exact versions"
-        elif pins:
+        elif unmarked_error:
+            pkg.error = unmarked_error
+        elif pins := _exact_pins(entries):
             pkg.version, pkg.spec = next(iter(pins.values())), None
         else:
             spec = SpecifierSet(pkg.spec or "")
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-        if (
-            pkg.error
-            and pkg.error != "constraint has an environment marker; target-dependent constraints aren't supported"
-        ):
-            constraint_errors[pkg.key] = pkg.error
     # A constraint on a package the file doesn't require only ever counts as a transitive dep's specifier,
     # which --deps sees; a constraint the file already called out as broken is left to constraint_errors.
     deps_blockers: list[str] = []

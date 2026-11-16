@@ -31,7 +31,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from . import cache, pypi
-from .check import SDIST_SUFFIXES, marker_holds, rejection
+from .check import SDIST_SUFFIXES, marker_holds, marker_value, rejection
 from .sources import Package, Source, SourceError
 from .targets import Target
 
@@ -393,12 +393,23 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     deps_paths: dict[Target, dict[int, list[str]]] = {}
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] = {}
     for target in targets:
+        # pip evaluates a constraint's marker with `extra` as "" (no extras), so `; extra == "s3"` never applies.
         constraints = {key: set(specs) for key, specs in source.constraint_specs.items()}
+        undecided: dict[str, str] = {}
         for key, entries in source.marker_constraint_specs.items():
             for marker, specifier in entries:
-                if marker_holds(marker, target):
+                holds = marker_value(marker, target, extras=frozenset())
+                if holds:
                     constraints.setdefault(key, set()).add(specifier)
+                elif holds is None:
+                    undecided.setdefault(key, f"{key}{specifier}; {marker}")
         tree = resolver.resolve(roots, target, constraints=constraints)
+        # A constraint on a package the tree doesn't install imposes nothing, whether or not its marker holds.
+        if reached := [text for key, text in undecided.items() if key in tree.paths]:
+            raise DepsError(
+                f"{source.label}: --deps can't tell whether the constraint `{reached[0]}` applies on "
+                f"{target.label(True)}, so check a lockfile instead (pip-compile, or uv pip compile)"
+            )
         reach: dict[int, list[str]] = {}
         direct: dict[int, tuple[str, ...]] = {}
         direct_names = _direct_roots(tree, roots, resolver, target)
