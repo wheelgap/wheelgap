@@ -237,8 +237,10 @@ index, such as an Artifactory or devpi mirror, is an error rather than a run wit
 A pip report is a snapshot of what pip resolved for one environment, **not** a cross-platform lockfile: on another
 platform, machine or Python, pip can install other packages (Windows-only dependencies, say) and leave some of these
 out. So wheelgap refuses a target that differs from the report's `environment` in `sys_platform`,
-`platform_machine`, `python_version` or `implementation_name`, and a report without one. To check several targets,
-make a report on each and check each against its own target. `check_lockfile()` refuses the same way.
+`platform_machine`, `python_version` or `implementation_name`, and a report without one. For `win32`, `linux-i686`
+and `linux-armv7l` it doesn't compare `platform_machine`, since a matching machine can report `AMD64`, `x86_64` or
+`aarch64` there. To check several targets, make a report on each and check each against its own target.
+`check_lockfile()` refuses the same way.
 
 ## Requirements files
 

@@ -2122,7 +2122,13 @@ def check_report_targets(source: Source, targets: Iterable[Target]) -> None:
             "make the report with `pip install --dry-run --report`"
         )
     report = {**env, "python_version": ".".join(env["python_version"].split(".")[:2])}
-    other = [t.label(True) for t in targets if any(report[key] != t.marker_env.get(key) for key in _REPORT_MARKERS)]
+    # A target whose platform_machine wheelgap can't pin down (win32 on 64-bit Windows says AMD64 or ARM64,
+    # linux-i686 in a container says x86_64, linux-armv7l says aarch64 or armv8l) is compared on the other keys.
+    other = [
+        t.label(True)
+        for t in targets
+        if any(report[key] != t.marker_env.get(key) for key in _REPORT_MARKERS if key not in t.unknown_markers)
+    ]
     if other:
         where = ", ".join(f"{key} {env[key]}" for key in _REPORT_MARKERS)
         raise SourceError(

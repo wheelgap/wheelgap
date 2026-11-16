@@ -6,7 +6,7 @@ import pytest
 
 import wheelgap
 from wheelgap.cli import main
-from wheelgap.sources import SourceError, load_inputs
+from wheelgap.sources import SourceError, check_report_targets, load_inputs
 
 LINUX_313 = {
     "implementation_name": "cpython",
@@ -195,6 +195,26 @@ def test_report_on_its_own_target_checks_with_no_note(tmp_path, capsys, fake_pyp
     assert code == 0
     assert [p["name"] for p in json.loads(captured.out)["packages"]] == ["fastlib"]
     assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("platform", "environment"),
+    [
+        ("win32", WIN_313),  # 32-bit Python on 64-bit Windows reports AMD64
+        ("win32", {**WIN_313, "platform_machine": "ARM64"}),
+        ("linux-i686", LINUX_313),  # a 32-bit container on an x86_64 host
+        ("linux-armv7l", {**LINUX_313, "platform_machine": "aarch64"}),
+        ("linux-armv7l", {**LINUX_313, "platform_machine": "armv8l"}),
+    ],
+)
+def test_report_is_not_refused_for_a_machine_wheelgap_cannot_pin_down(tmp_path, platform, environment):
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib")], environment)
+    (source,) = load_inputs([str(path)])
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms=platform))
+    # The other keys still count.
+    with pytest.raises(SourceError, match="check that target only"):
+        check_report_targets(source, wheelgap.make_targets(python="3.14", platforms=platform))
 
 
 def test_api_refuses_a_report_on_another_target(tmp_path, fake_pypi):
