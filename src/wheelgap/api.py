@@ -495,7 +495,7 @@ def _check_lockfile(
                     f"{source.label}: --deps can't follow this the way pip does ({source.deps_blockers[0]}), "
                     "so check a lockfile instead (pip-compile, or uv pip compile)"
                 )
-            resolver = Resolver(read_cache=not online, write_cache=True)
+            resolver = Resolver()  # no on-disk cache from the Python API, as check_packages(deps=True)
             resolve_deps(source, targets, resolver)
     else:
         check_report_targets(source, targets)

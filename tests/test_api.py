@@ -840,3 +840,21 @@ def test_check_lockfile_deps_has_no_lock_to_recheck(tmp_path, monkeypatch):
     wheelgap.check_lockfile(tmp_path / "pyproject.toml", [WIN, LIN], deps=True)
     wheelgap.check_lockfile(tmp_path / "requirements.txt", [WIN, LIN], deps=True)
     assert rechecked == []
+
+
+@pytest.mark.usefixtures("index")
+def test_check_lockfile_deps_uses_no_on_disk_cache(tmp_path, monkeypatch):
+    # The Python API never reads or writes wheelgap's cache (docs/how-it-works.md), deps=True included.
+    import wheelgap.api
+
+    made = []
+    real = wheelgap.api.Resolver
+
+    def spy(*args, **kwargs):
+        made.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(wheelgap.api, "Resolver", spy)
+    (tmp_path / "requirements.txt").write_text("app==1.0\n", encoding="utf-8")
+    wheelgap.check_lockfile(tmp_path / "requirements.txt", [WIN], deps=True)
+    assert made == [{}]

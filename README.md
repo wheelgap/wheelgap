@@ -227,10 +227,6 @@ Sites like [pyreadiness.org](https://pyreadiness.org) and [free-threaded wheels]
 
 wheelgap is growing into **caniuse for Python wheels**: an open map of which packages have wheels for which platforms. The CLI stays focused, and around it come a nightly tracker of the most-used PyPI packages, a community knowledge base of workarounds, and campaigns to help upstream projects ship missing wheels. **[Read the roadmap and join the discussion →](https://github.com/wheelgap/wheelgap/discussions/43)**
 
-Next up for the CLI, each with a first step written up and no PR yet:
-
-- "nearest version with a wheel" hints ([#20](https://github.com/wheelgap/wheelgap/issues/20))
-
 The [roadmap](https://github.com/wheelgap/wheelgap/labels/roadmap) and [help wanted](https://github.com/wheelgap/wheelgap/labels/help%20wanted) labels have more.
 
 ## Contributing
