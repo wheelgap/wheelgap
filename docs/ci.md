@@ -161,6 +161,34 @@ The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile
 `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example
 `args: [--fail-on, missing]`.
 
+## Code scanning {#code-scanning}
+
+`--sarif PATH` (after 0.12.0) writes a [SARIF](output.md#sarif) report that
+[upload-sarif](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github)
+turns into code scanning alerts: listed in the Security tab, and shown on the lockfile line in pull requests that add
+a gap.
+
+```yaml
+jobs:
+  wheelgap:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --sarif wheelgap.sarif
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: wheelgap.sarif
+          category: wheelgap
+```
+
+`if: always()` uploads the report when wheelgap fails the job, which is when it has alerts. Code scanning on a private
+repository needs GitHub Advanced Security (GitHub Code Security).
+
 ## GitLab CI
 
 GitLab shows a JUnit report in the merge request. `--junit PATH` writes one alongside the usual output, with one

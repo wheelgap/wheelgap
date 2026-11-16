@@ -185,6 +185,8 @@ class Source:
     pypi_only: bool = False
     # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
     passed_over: Path | None = None
+    # A pip installation report captures one generating environment, not a cross-platform dependency graph.
+    pip_report_env: dict[str, str] | None = None
     # Requirements for --deps to resolve: package names on the command line, selected pyproject.toml
     # requirements, or a requirements file's requirement lines.
     specs: list[str] = field(default_factory=list)
@@ -2039,6 +2041,123 @@ def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
     return Source(path.name, pkgs + sorted(skipped.values(), key=lambda p: p.key))
 
 
+def parse_pip_report(path: Path) -> Source:
+    """pip install --dry-run --report JSON: pinned installation results, not a cross-platform lockfile."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError as e:  # nested too deeply for the json module
+        raise SourceError(f"{path.name}: invalid pip installation report: nested too deeply") from e
+    except (OSError, ValueError) as e:
+        raise SourceError(f"{path.name}: invalid pip installation report: {e}") from e
+    if not isinstance(data, dict) or "version" not in data or "install" not in data:
+        raise SourceError(
+            f"{path.name}: isn't a pip installation report (no `version` and `install` keys); "
+            "make one with `pip install --dry-run --report report.json`"
+        )
+    if data["version"] != "1":
+        raise SourceError(
+            f"{path.name}: pip installation report version {data['version']!r} isn't supported (only '1')"
+        )
+    if not isinstance(data["install"], list):
+        raise SourceError(f"{path.name}: the pip installation report's `install` isn't a list")
+    environment = data.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in environment.items())
+    ):
+        raise SourceError(f"{path.name}: invalid pip report environment")
+    source = Source(path.name, pip_report_env=environment if environment is not None else {})
+    seen: dict[str, str] = {}
+    public = True
+    mirrors: set[str] = set()  # hosts other than PyPI's that pip downloaded from (not as a direct URL)
+    for number, entry in enumerate(data["install"], 1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("metadata"), dict):
+            raise SourceError(f"{path.name}: install entry {number} has no metadata")
+        metadata = entry["metadata"]
+        name = package_name(path, metadata.get("name"))
+        version = metadata.get("version")
+        if not isinstance(version, str):
+            raise SourceError(f"{path.name}: {name} has no version")
+        try:
+            Version(version)
+        except InvalidVersion as e:
+            raise SourceError(f"{path.name}: {name} has an invalid version {version!r}") from e
+        key = canonicalize_name(name)
+        if key in seen:
+            raise SourceError(f"{path.name}: duplicate install entry for {name}")
+        seen[key] = version
+        info = entry.get("download_info")
+        if info is not None and not isinstance(info, dict):
+            raise SourceError(f"{path.name}: {name} has invalid download_info")
+        info = info or {}
+        url = info.get("url")
+        if url is not None and not isinstance(url, str):
+            raise SourceError(f"{path.name}: {name} has invalid download URL")
+        try:
+            parsed = urlparse(url) if url else None
+            host = parsed.hostname if parsed else None
+        except ValueError as e:
+            raise SourceError(f"{path.name}: {name} has invalid download URL") from e
+        public_file = bool(parsed and parsed.scheme == "https" and host == "files.pythonhosted.org")
+        skip = None
+        if info.get("vcs_info") is not None:
+            skip = "git"
+        elif info.get("dir_info") is not None or (parsed and parsed.scheme == "file"):
+            skip = "path"
+        elif not public_file or entry.get("is_direct"):
+            # An absent URL gives no positive evidence this pin came from PyPI.
+            skip = "url"
+            if host and host != "files.pythonhosted.org" and not entry.get("is_direct"):
+                mirrors.add(host)
+        if not public_file:
+            public = False
+        source.packages.append(Package(name, version, skip=skip, origin=path.name))
+    if mirrors and all(p.skip for p in source.packages):
+        # pip read another index (an Artifactory or devpi mirror, say): checking nothing would look like a pass.
+        raise SourceError(
+            f"{path.name}: nothing to check: pip downloaded these packages from {', '.join(sorted(mirrors))}, "
+            "not PyPI (files.pythonhosted.org), and wheelgap reads only the packages a report got from PyPI"
+        )
+    source.pypi_only = public
+    return source
+
+
+# The markers that decide which packages pip installs on a target; a pip report holds the values it resolved for.
+_REPORT_MARKERS = ("sys_platform", "platform_machine", "python_version", "implementation_name")
+
+
+def check_report_targets(source: Source, targets: Iterable[Target]) -> None:
+    """SourceError unless every target is the environment a pip installation report was resolved for.
+
+    pip resolves a report for the machine it runs on, so on any other target it can install other packages
+    (Windows-only dependencies, say) and leave some of these out: checking one there would give wrong answers.
+    """
+    if source.kind != "pip-report":
+        return
+    env = source.pip_report_env or {}
+    if not all(env.get(key) for key in _REPORT_MARKERS):
+        raise SourceError(
+            f"{source.label}: the pip installation report doesn't say which environment pip resolved it for "
+            f"(its `environment` needs {', '.join(_REPORT_MARKERS)}), so wheelgap can't tell which target it fits; "
+            "make the report with `pip install --dry-run --report`"
+        )
+    report = {**env, "python_version": ".".join(env["python_version"].split(".")[:2])}
+    # A target whose platform_machine wheelgap can't pin down (win32 on 64-bit Windows says AMD64 or ARM64,
+    # linux-i686 in a container says x86_64, linux-armv7l says aarch64 or armv8l) is compared on the other keys.
+    other = [
+        t.label(True)
+        for t in targets
+        if any(report[key] != t.marker_env.get(key) for key in _REPORT_MARKERS if key not in t.unknown_markers)
+    ]
+    if other:
+        where = ", ".join(f"{key} {env[key]}" for key in _REPORT_MARKERS)
+        raise SourceError(
+            f"{source.label}: pip resolved this report for one environment ({where}), and other targets can "
+            f"install other packages, so it can't be checked on {', '.join(other)}: check that target only, "
+            "or make a report on each target"
+        )
+
+
 READERS = {
     "pyproject": parse_pyproject,
     "uv": parse_uv_lock,
@@ -2047,6 +2166,7 @@ READERS = {
     "pdm": parse_pdm_lock,
     "pipfile": parse_pipfile_lock,
     "requirements": parse_requirements,
+    "pip-report": parse_pip_report,
     "pixi": parse_pixi_lock,
 }
 PARSERS = {
@@ -2095,10 +2215,12 @@ def file_kind(path: Path) -> str:
         return "uv"
     if name.endswith((".txt", ".in")):
         return "requirements"
+    if name.endswith(".json"):
+        return "pip-report"
     raise SourceError(
         f"don't know how to read {path} "
         "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, requirements.lock, "
-        "requirements.txt or pyproject.toml)"
+        "requirements.txt, pip report.json or pyproject.toml)"
     )
 
 
@@ -2174,7 +2296,7 @@ def load_inputs(inputs: list[str], environment: str | None = None) -> list[Sourc
                 sources[-1].passed_over = p / "pixi.lock"
         elif p.is_file():
             sources.append(load_file(p, environment))
-        elif "/" in item or item.endswith((".lock", ".txt", ".toml")):
+        elif "/" in item or item.endswith((".lock", ".txt", ".toml", ".json")):
             raise SourceError(f"{item}: no such file")
         else:
             adhoc.packages.append(requirement_to_package(item, "command line"))

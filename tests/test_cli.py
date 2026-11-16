@@ -2224,6 +2224,7 @@ def _assert_matches_output_schema(data):
             "results",
             "rejected",
             "via",
+            "direct",
             "issues_url",
             "build_requires",
             "notes",
@@ -2252,6 +2253,9 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "direct" in pkg:  # gap targets only, each with at least one name
+            assert isinstance(pkg["direct"], dict) and set(pkg["direct"]) <= set(pkg["rejected"])
+            assert all(names and all(isinstance(n, str) for n in names) for names in pkg["direct"].values())
         if "issues_url" in pkg:
             assert pkg["issues_url"] is None or isinstance(pkg["issues_url"], str)
         if "build_requires" in pkg:
@@ -3912,3 +3916,105 @@ def test_explain_issues_url_survives_the_cache_with_two_pythons(capsys, fake_pyp
         code, out, _err = run(capsys, *args)
         assert code == 1
         assert "ask for a wheel: https://github.com/example/gapwithissues/issues" in out
+
+
+def _direct(capsys, *args):
+    code, out, err = run(capsys, *args, "--offline", "--json", "--explain")
+    assert code == 1, err
+    return {p["name"]: p["direct"] for p in json.loads(out)["packages"]}
+
+
+def test_json_explain_direct_names_the_direct_dependency(capsys, tmp_path, fake_pypi):
+    _write_transitive_table_lock(tmp_path)
+    direct = _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert direct["cryptography"] == {"linux-x86_64": ["mcp"]}
+    assert direct["mcp"] == {}  # no gap
+    assert fake_pypi == []
+
+
+def test_json_explain_direct_lists_every_direct_dependency_that_leads_to_it(capsys, tmp_path, fake_pypi):
+    _write_transitive_table_lock(tmp_path, several=True)
+    direct = _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert sorted(direct["cryptography"]["linux-x86_64"]) == ["click", "mcp", "requests"]
+
+
+def test_json_explain_direct_is_per_target_and_gap_targets_only(capsys, tmp_path, fake_pypi):
+    _write_transitive_table_lock(tmp_path, marked=True)
+    direct = _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--no-dev")
+    assert {k: sorted(v) for k, v in direct["cryptography"].items()} == {
+        "linux-x86_64": ["mcp"],
+        "win-amd64": ["mcp", "platformer"],
+    }
+    # A target where the package has a wheel gets no entry, like `via`.
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+            'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n'
+            'wheels = [{ url = "https://files.example/cryptography-50.0.2-cp313-cp313-win_amd64.whl" }]\n',
+        ),
+        encoding="utf-8",
+    )
+    direct = _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--no-dev")
+    assert direct["cryptography"] == {"linux-x86_64": ["mcp"]}
+
+
+def test_json_explain_direct_is_empty_for_a_direct_dependency(capsys, tmp_path, fake_pypi):
+    _write_transitive_table_lock(tmp_path)
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            'dependencies = [{ name = "mcp" }]',
+            'dependencies = [{ name = "mcp" }, { name = "cryptography" }]',
+        ),
+        encoding="utf-8",
+    )
+    assert _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["cryptography"] == {}
+
+
+def test_json_explain_direct_from_poetry_1x(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "mcp"\nversion = "1"\n'
+        'files = [{ file = "mcp-1-py3-none-any.whl" }]\n'
+        '[package.dependencies]\ncryptography = "*"\n\n'
+        '[[package]]\nname = "cryptography"\nversion = "50.0.2"\n'
+        'files = [{ file = "cryptography-50.0.2.tar.gz" }]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    direct = _direct(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert direct["cryptography"] == {"linux-x86_64": ["mcp"]}
+
+
+def test_json_explain_direct_extra_edge_is_only_the_requesters(capsys, tmp_path, fake_pypi):
+    # shared[crypto] pulls cryptography in for mcp only; plain needs shared without the extra.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        '[[package]]\nname = "app"\nversion = "1"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "mcp" }, { name = "plain" }]\n'
+        '[[package]]\nname = "mcp"\nversion = "1"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "shared", extra = ["crypto"] }]\n'
+        'wheels = [{ url = "https://files.example/mcp-1-py3-none-any.whl" }]\n'
+        '[[package]]\nname = "plain"\nversion = "1"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "shared" }]\n'
+        'wheels = [{ url = "https://files.example/plain-1-py3-none-any.whl" }]\n'
+        '[[package]]\nname = "shared"\nversion = "1"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "https://files.example/shared-1-py3-none-any.whl" }]\n'
+        '[package.optional-dependencies]\ncrypto = [{ name = "cryptography" }]\n'
+        '[[package]]\nname = "cryptography"\nversion = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    direct = _direct(capsys, str(tmp_path), "--no-dev", "-p", "3.13", "-t", "linux-x86_64")
+    assert direct["cryptography"] == {"linux-x86_64": ["mcp"]}
+
+
+def test_json_explain_direct_without_a_graph_and_without_explain(capsys, tmp_path, fake_pypi):
+    code, out, _ = run(capsys, "nowheels", "-p", "3.13", "-t", "linux-x86_64", "--json", "--explain")
+    assert code == 1
+    assert json.loads(out)["packages"][0]["direct"] == {}
+    _write_transitive_table_lock(tmp_path)
+    code, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--json")
+    assert code == 1
+    assert all("direct" not in p for p in json.loads(out)["packages"])

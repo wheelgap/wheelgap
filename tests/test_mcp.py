@@ -236,6 +236,48 @@ def test_check_package_explain_caps_rejected_wheels(fake_pypi, monkeypatch):
     assert (data["rejected"], data["rejected_omitted"]) == ({"3.13 linux-x86_64": []}, {})  # an sdist only
 
 
+def test_check_package_explain_includes_issues_url(fake_pypi):
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package", name="gapwithissues", version="1.0", python="3.13", targets=["linux-x86_64"], explain=True
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["issues_url"] == "https://github.com/example/gapwithissues/issues"
+
+    (_, reply_no_explain) = run(
+        init(),
+        call("check_package", name="gapwithissues", version="1.0", python="3.13", targets=["linux-x86_64"]),
+    )
+    data_no_explain = reply_no_explain["result"]["structuredContent"]
+    assert "issues_url" not in data_no_explain
+
+
+def test_check_package_explain_issues_url_null_for_other_index(fake_pypi, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/simple")
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package", name="gapwithissues", version="1.0", python="3.13", targets=["linux-x86_64"], explain=True
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["issues_url"] is None
+
+
+def test_check_package_explain_issues_url_null_with_pip_index_url(fake_pypi, monkeypatch):
+    monkeypatch.setenv("PIP_INDEX_URL", "https://other.example.com/simple")
+    (_, reply) = run(
+        init(),
+        call(
+            "check_package", name="gapwithissues", version="1.0", python="3.13", targets=["linux-x86_64"], explain=True
+        ),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["issues_url"] is None
+
+
 @pytest.mark.usefixtures("index")
 def test_check_package_dependencies_checks_the_tree():
     # As --deps does: app needs lib[crypto], whose crypt has no Windows ARM wheel; winonly is only on Windows.
@@ -258,6 +300,29 @@ def test_check_package_dependencies_checks_the_tree():
             "results": {"3.14 win-arm64": "source", "3.14 linux-x86_64": "wheel"},
             "gaps": ["3.14 win-arm64"],
             "via": {"3.14 win-arm64": ["app", "lib", "crypt"]},
+        }
+    ]
+    (_, reply_explain) = run(
+        init(),
+        call(
+            "check_package",
+            name="app",
+            version="1.0",
+            python="3.14",
+            targets=targets,
+            dependencies=True,
+            explain=True,
+        ),
+    )
+    data_explain = reply_explain["result"]["structuredContent"]
+    assert data_explain["dependency_gaps"] == [
+        {
+            "name": "crypt",
+            "version": "1.0",
+            "results": {"3.14 win-arm64": "source", "3.14 linux-x86_64": "wheel"},
+            "gaps": ["3.14 win-arm64"],
+            "via": {"3.14 win-arm64": ["app", "lib", "crypt"]},
+            "issues_url": None,
         }
     ]
 

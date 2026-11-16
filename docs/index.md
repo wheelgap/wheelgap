@@ -38,7 +38,7 @@ Run with --explain to see which wheels were rejected and why.
 - [Windows on ARM](windows-arm.md): check for missing wheels and understand source-build failures.
 - [Free-threaded Python](free-threading.md): a wheel isn't the whole answer — imports that turn the GIL back on.
 - [Configuration](configuration.md): every `[tool.wheelgap]` key in `pyproject.toml`.
-- [Output](output.md): the text table, `--json`, `--markdown`, `--junit` and exit codes.
+- [Output](output.md): the text table, `--json`, `--markdown`, `--junit`, `--sarif` and exit codes.
 - [CI](ci.md): the GitHub Action, pre-commit and GitLab CI.
 - [Command line](cli.md): every flag.
 - [Python API](python-api.md), [MCP server](mcp.md) and [AI coding agents](agents.md).

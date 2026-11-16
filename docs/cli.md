@@ -356,6 +356,13 @@ a pull request comment. See [Output](output.md#markdown).
 `--junit PATH`: also write a JUnit XML report to `PATH`, alongside the usual output. See
 [Output](output.md#junit-xml).
 
+### `--sarif` {#sarif}
+
+`--sarif PATH` (**after 0.12.0**): also write a
+[SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) report to `PATH`, alongside the usual
+output, for GitHub code scanning. It's written even when the check fails, and an empty `PATH` is an error, as for
+`--junit`. See [Output](output.md#sarif) and [CI](ci.md#code-scanning).
+
 ### `--badge` {#badge}
 
 `--badge PATH`: also write a [shields.io endpoint](https://shields.io/badges/endpoint-badge) file

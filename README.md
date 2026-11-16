@@ -66,6 +66,10 @@ wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 # ...and everything they install too, with the path to each gap
 wheelgap mcp==2.3.0 --deps -t win-arm64 --explain
 
+# On a Linux aarch64 machine: check exactly what pip resolved there, without installing it (after 0.12.0)
+python -m pip install --dry-run --ignore-installed --report report.json -r requirements.txt
+wheelgap report.json -p 3.14 -t linux-aarch64
+
 # Before a release: do the wheels you're about to upload cover every target
 # the last release had one for?
 wheelgap --dist dist -p 3.13 -t win-arm64,linux-aarch64
@@ -135,7 +139,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
 
-The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). `compare-to: base` fails only when a pull request makes the lockfile worse, and `comment: true` posts the result on the pull request ([details and permissions](https://wheelgap.github.io/wheelgap/ci/#compare-to)). For a release workflow, `dist: dist` runs `--dist` on the files about to be uploaded and fails when the release drops a platform's wheels. [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit` and GitLab.
+The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). `compare-to: base` fails only when a pull request makes the lockfile worse, and `comment: true` posts the result on the pull request ([details and permissions](https://wheelgap.github.io/wheelgap/ci/#compare-to)). For a release workflow, `dist: dist` runs `--dist` on the files about to be uploaded and fails when the release drops a platform's wheels. [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit`, `--sarif` and GitLab.
 
 ## With pre-commit
 

@@ -88,6 +88,7 @@ def test_check_package_offline_with_files():
             ]
         },
         "via": {},
+        "issues_url": None,
     }
     json.dumps(result.to_dict(explain=True))  # JSON-friendly
 
@@ -640,3 +641,54 @@ def test_check_packages_deps_raises_the_source_error_the_cli_reports():
 def test_check_packages_deps_refuses_a_url():
     with pytest.raises(ValueError, match="can't check a URL: foo @ https://example.org/foo-1.0.tar.gz"):
         wheelgap.check_packages(["foo @ https://example.org/foo-1.0.tar.gz"], deps=True)
+
+
+def test_result_issues_url():
+    result = wheelgap.Result("x", "1.0", issues_url="https://github.com/example/x/issues")
+    assert result.issues_url == "https://github.com/example/x/issues"
+    assert "issues_url" not in result.to_dict()
+    assert result.to_dict(explain=True)["issues_url"] == "https://github.com/example/x/issues"
+
+    result_none = wheelgap.Result("x", "1.0")
+    assert result_none.issues_url is None
+    assert "issues_url" not in result_none.to_dict()
+    assert result_none.to_dict(explain=True)["issues_url"] is None
+
+
+def test_check_package_issues_url_from_pypi(fake_pypi):
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    result = wheelgap.check_package("gapwithissues", "1.0", targets=targets)
+    assert result.issues_url == "https://github.com/example/gapwithissues/issues"
+    assert "issues_url" not in result.to_dict()
+    assert result.to_dict(explain=True)["issues_url"] == "https://github.com/example/gapwithissues/issues"
+
+
+def test_check_package_issues_url_fallback_homepage(fake_pypi):
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    result = wheelgap.check_package("gapwithhome", "1.0", targets=targets)
+    assert result.issues_url == "https://github.com/example/gapwithhome/issues"
+    assert result.to_dict(explain=True)["issues_url"] == "https://github.com/example/gapwithhome/issues"
+
+
+def test_check_package_issues_url_none_for_other_index(fake_pypi, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/simple")
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    result = wheelgap.check_package("gapwithissues", "1.0", targets=targets)
+    assert result.issues_url is None
+    assert result.to_dict(explain=True)["issues_url"] is None
+
+
+def test_check_package_issues_url_none_with_pip_index_url(fake_pypi, monkeypatch):
+    monkeypatch.setenv("PIP_INDEX_URL", "https://other.example.com/simple")
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    result = wheelgap.check_package("gapwithissues", "1.0", targets=targets)
+    assert result.issues_url is None
+    assert result.to_dict(explain=True)["issues_url"] is None
+
+
+def test_check_lockfile_issues_url(fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_ABI3, encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path, targets)}
+    assert results["abi3lib"].issues_url is None
+    assert results["abi3lib"].to_dict(explain=True)["issues_url"] is None

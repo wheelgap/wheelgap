@@ -989,7 +989,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
             }
         else:
             installed = None
-        # The (via ...) hint, per target, worked out only when a gap needs it: JSON, MCP and gap-free runs never pay.
+        # The (via ...) hint, per target, worked out only when a gap needs it, so gap-free runs never pay. Text and
+        # Markdown tables show it, and `--json --explain` writes it as `direct`.
         hints: dict[Target, dict[int, tuple[str, ...]]] = {}
         for i, pkg in enumerate(source.packages):
             if pkg.skip:

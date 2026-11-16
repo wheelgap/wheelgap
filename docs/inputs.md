@@ -19,6 +19,7 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`Pipfile.lock`](#pipfilelock) | no | no |
 | [`pixi.lock`](#pixilock) | no | no |
 | [requirements files](#requirements-files) | no | with `--deps` |
+| [pip installation report](#pip-installation-report) (after 0.12.0) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | with `--deps` |
 | [package names](#package-names) | no | with `--deps` |
 
@@ -217,6 +218,29 @@ missing from all of them.
 
 `check_lockfile()` takes `environment=` too; the MCP tools and `[tool.wheelgap]` read the `default` environment only.
 Naming an environment for any other lockfile is an error.
+
+## Pip installation report
+
+After 0.12.0, wheelgap reads the report `pip install --dry-run --report` writes: exactly what pip resolved, without
+installing anything. Make the report on the target you want to check, and check that target only:
+
+```bash
+python -m pip install --dry-run --ignore-installed --report report.json -r requirements.txt
+wheelgap report.json -p 3.14 -t linux-aarch64   # on a Linux aarch64 machine with Python 3.14
+```
+
+wheelgap reads `version: "1"` reports and the `metadata.name` / `metadata.version` pins under `install`, and looks
+each one up on the index to check its wheels. VCS checkouts, local paths and direct URLs are skipped, and so are
+packages pip didn't download from PyPI (`files.pythonhosted.org`); a report whose packages all came from another
+index, such as an Artifactory or devpi mirror, is an error rather than a run with nothing checked.
+
+A pip report is a snapshot of what pip resolved for one environment, **not** a cross-platform lockfile: on another
+platform, machine or Python, pip can install other packages (Windows-only dependencies, say) and leave some of these
+out. So wheelgap refuses a target that differs from the report's `environment` in `sys_platform`,
+`platform_machine`, `python_version` or `implementation_name`, and a report without one. For `win32`, `linux-i686`
+and `linux-armv7l` it doesn't compare `platform_machine`, since a matching machine can report `AMD64`, `x86_64` or
+`aarch64` there. To check several targets, make a report on each and check each against its own target.
+`check_lockfile()` refuses the same way.
 
 ## Requirements files
 

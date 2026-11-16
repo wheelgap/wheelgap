@@ -166,15 +166,16 @@ TOOLS: list[dict[str, Any]] = [
             "target's status, the targets with a gap, ok (true only if every target installs without building) and "
             "the libc and macOS versions assumed. With explain: true, also says why: rejected lists, for each "
             f"source or missing target, up to {EXPLAIN_LIMIT} wheels it can't use and the reason for each, closest "
-            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does. With gaps, "
+            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does, and issues_url is "
+            "the package's issue tracker from PyPI metadata (null when absent or not on PyPI). With gaps, "
             "last_with_wheel maps each gap target no newer release has a wheel for to the newest older release that "
             "has one (a version to pin to), as --explain --suggest --json does; it's absent when nothing was looked "
             "up. With dependencies: true, also checks everything the package installs, resolved for each target "
             "from PyPI's metadata as wheelgap --deps does: dependency_gaps lists each other package in the tree with "
-            "a gap, with its results, gaps and via (the path from this package to it on each gap target), "
-            "dependencies_checked counts the other packages checked, and ok is true only if nothing in the tree has "
-            "a gap. A tree that can't be settled without a backtracking resolver is an error, as on the command "
-            "line. " + _STATUS_HELP
+            "a gap, with its results, gaps and via (the path from this package to it on each gap target), plus "
+            "issues_url with explain: true, dependencies_checked counts the other packages checked, and ok is true "
+            "only if nothing in the tree has a gap. A tree that can't be settled without a backtracking resolver is an "
+            "error, as on the command line. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -191,8 +192,9 @@ TOOLS: list[dict[str, Any]] = [
                 "pyodide_lock": _PYODIDE_LOCK_PROP,
                 "explain": {
                     "type": "boolean",
-                    "description": "Also return rejected (and via, always empty for one package): why each source "
-                    "or missing target can't use the published wheels. Default: false.",
+                    "description": "Also return rejected (and via, always empty for one package) and issues_url "
+                    "(the package's issue tracker from PyPI metadata): why each source or missing target can't "
+                    "use the published wheels. Default: false.",
                 },
                 "dependencies": {
                     "type": "boolean",
@@ -501,6 +503,7 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
                 "results": {t.label(True): s.value for t, s in r.statuses.items()},
                 "gaps": [t.label(True) for t in r.gaps],
                 "via": {t.label(True): list(path) for t, path in r.via.items()},
+                **({"issues_url": r.issues_url} if explain else {}),
             }
             for r in tree
             if not r.ok

@@ -19,10 +19,10 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge, origin, pypi
+from . import __version__, cache, condaforge, origin
 from . import notes as tracker
 from . import suggest as release_suggest
-from .api import running_python
+from .api import explain_issues_urls, running_python
 from .badge import write_badge
 from .build import BuildInfo, describe, lookup_all, requires_for, shown
 from .check import (
@@ -54,11 +54,13 @@ from .pyodide import (
     load_pyodide_lock,
 )
 from .pypi import check_index_url, fill_all, keeps_locked_files, previous_release, recheck_lock, split_credentials
+from .sarif import write_sarif
 from .sources import (
     Package,
     Source,
     SourceError,
     UvSelection,
+    check_report_targets,
     load_inputs,
     parse_dist,
     pythons_outside_lock,
@@ -146,7 +148,7 @@ def make_parser() -> argparse.ArgumentParser:
         nargs="*",
         metavar="INPUT",
         help=(
-            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, "
+            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, report.json, "
             "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
@@ -306,6 +308,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--junit",
         metavar="PATH",
         help="also write a JUnit XML report to PATH, alongside the usual output",
+    )
+    p.add_argument(
+        "--sarif",
+        metavar="PATH",
+        help="also write a SARIF 2.1.0 report to PATH for code scanning (github/codeql-action/upload-sarif)",
     )
     p.add_argument(
         "--badge",
@@ -943,6 +950,13 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
+            # The direct dependencies that lead to each gap target, as the table's `(via ...)` names them; only where
+            # the input says (uv.lock, Poetry 1.x, --deps), so `{}` for a direct dependency or an input without a graph.
+            out["direct"] = {
+                t.label(multi_py): list(dict.fromkeys(r.direct_via[t]))
+                for t in gap_targets(r, targets)
+                if r.direct_via.get(t)
+            }
             if issues_urls is not None:
                 out["issues_url"] = issues_urls.get(id(r.package))
             if conda_forge and (h := conda_forge.get(id(r.package))):
@@ -1499,27 +1513,6 @@ def version_suggestions(
     }
 
 
-def explain_issues_urls(
-    rows: list[Row],
-    sources: list[Source],
-    index_url: str | None = None,
-) -> dict[int, str | None]:
-    """Issues tracker URLs for explained packages that pass the PyPI origin rule, by id(package)."""
-    if origin.other_index(index_url) is not None:
-        return {id(r.package): None for r in rows}
-    private = origin.private_names(sources, simple_index=index_url)
-    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
-    out: dict[int, str | None] = {}
-    for r in rows:
-        pkg = r.package
-        src = source_of.get(id(pkg))
-        if src and origin.known_pypi(pkg, src, simple_index=index_url, private=private):
-            out[id(pkg)] = pypi.extract_issues_url(pkg.project_urls, pkg.home_page)
-        else:
-            out[id(pkg)] = None
-    return out
-
-
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
@@ -1763,6 +1756,7 @@ def _main(argv: list[str]) -> int:
                 [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
             )
         for source in sources:
+            check_report_targets(source, targets)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
@@ -2186,6 +2180,13 @@ def _main(argv: list[str]) -> int:
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
             write_junit(args.junit, rows, targets, fail_on, advisory)
+        except OSError as e:
+            print(f"wheelgap: error: {e}", file=sys.stderr)
+            return input_error_json(e) if args.json else 2
+
+    if args.sarif is not None:  # an empty PATH is an error, as for --junit
+        try:
+            write_sarif(args.sarif, rows, targets, sources, fail_on, advisory)
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2

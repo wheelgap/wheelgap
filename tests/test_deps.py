@@ -775,3 +775,22 @@ def test_requirements_deps_marker_constraint_doesnt_hide_conflicting_pins(index,
     (tmp_path / "requirements.txt").write_text("-c constraints.txt\nc\n", encoding="utf-8")
     assert main([str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]) == 2
     assert "c: constraints specify conflicting exact versions" in capsys.readouterr().err
+
+
+def test_deps_json_explain_direct_names_each_direct_requirement(index, capsys):
+    code = main(
+        ["parenta", "parentb", "--deps", "-p", "3.14", "-t", "win-arm64", "--json", "--explain", "--no-suggest"]
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert code == 1
+    crypt = next(p for p in output["packages"] if p["name"] == "crypt")
+    assert sorted(crypt["direct"]["win-arm64"]) == ["parenta", "parentb"]
+    assert len(crypt["via"]["win-arm64"]) > 1  # `via` still gives one full path
+
+
+def test_deps_json_explain_direct_extra_only_names_the_requester(index, capsys):
+    code = main(["app", "plain", "--deps", "-p", "3.14", "-t", "win-arm64", "--json", "--explain", "--no-suggest"])
+    output = json.loads(capsys.readouterr().out)
+    assert code == 1
+    crypt = next(p for p in output["packages"] if p["name"] == "crypt")
+    assert crypt["direct"] == {"win-arm64": ["app"]}
