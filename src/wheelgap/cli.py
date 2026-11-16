@@ -1653,12 +1653,16 @@ def _main(argv: list[str]) -> int:
             return 0
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
-        quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # quiet = true is a project default, so --from-log (which explains each package) on the command line wins over
+        # it, as --no-quiet does; --quiet on the command line still applies.
+        quiet = args.quiet if args.quiet is not None else config.get("quiet", False) and args.from_log is None
         # offline = true is a project default, so --online on the command line wins over it.
         offline = args.offline or (config.get("offline", False) and not args.online)
         offline_how = "--offline" if args.offline else "offline = true in [tool.wheelgap]"
         # Quiet only changes the text output, so it can't clash with --explain when printing JSON or Markdown.
         if quiet and args.explain and not (args.json or args.markdown):
+            if args.from_log is not None:
+                parser.error("--from-log explains each package, so it can't be used with --quiet")
             parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
         docker_musl = False
         if args.dockerfile:
@@ -1750,16 +1754,9 @@ def _main(argv: list[str]) -> int:
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         if args.from_log is not None:
-            failures = failed_builds(read_log(args.from_log))
-            listed = ", ".join(f"{name} {version}" if version else name for name, version in failures)
+            failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
+            listed = ", ".join(f"{name} {version}" for name, version in failures)
             print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
-            for name, version in failures:
-                if version is None:
-                    print(
-                        f"wheelgap: note: the install log doesn't say which version of {name} failed; checking its "
-                        "newest release",
-                        file=sys.stderr,
-                    )
             sources = [log_source(failures)]
         else:
             sources = (

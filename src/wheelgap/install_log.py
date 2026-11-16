@@ -37,17 +37,29 @@ _NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 _COLLECT = re.compile(rf" {{0,2}}Collecting ({_NAME})(?:\[[^\]]*\])?(.*)$")
 _PIN = re.compile(r"\s*===?\s*([^\s,;*]+)(?:\s|$)")
 _FILE = re.compile(r" {0,4}(?:Downloading|Using cached) (\S+)")
+# pip's resolver, when it tries more than one release of a package (backtracking).
+_BACKTRACK = re.compile(rf"INFO: pip is (?:still )?looking at multiple versions of ({_NAME})(?:\[[^\]]*\])? ")
+# pip's `Looking in indexes: https://pypi.org/simple, https://private.example/simple`, when it's given an index.
+_INDEXES = re.compile(r"\s*Looking in indexes: (.+)$")
+_PYPI_SIMPLE = "https://pypi.org/simple"
+_USERINFO = re.compile(r"//[^/@]*@")  # pip hides the password, but not always the user name
 # pip, for each package it builds: `Building wheel for X (pyproject.toml) ... error`, then
 # `ERROR: Failed building wheel for X` if it fails.
 _BUILDING = re.compile(rf"(?:Building wheel for|Failed building wheel for) ({_NAME})(?:\s|$)")
-# pip's summary, at column 0: `Failed to build X Y`, and pip 24.1+'s `ERROR: Failed to build installable wheels for
-# some pyproject.toml based projects (X, Y)`.
+# pip's summary, at column 0: `Failed to build X Y`; pip 24.1 to 25.1's `ERROR: Failed to build installable wheels for
+# some pyproject.toml based projects (X, Y)` (`ERROR: ERROR: ...` in pip 24.1 to 24.3); and pip 25.2 and later's
+# `× Failed to build installable wheels for some pyproject.toml based projects` with the names on the next line,
+# `╰─> X, Y` (without the `×` and `╰─>` when the console can't print them).
 _PIP_INSTALLABLE = re.compile(
-    r"(?:ERROR: )?Failed to build installable wheels for some pyproject\.toml based projects \(([^()]*)\)\s*$"
+    r"(?:ERROR: ){0,2}Failed to build installable wheels for some pyproject\.toml based projects \(([^()]*)\)\s*$"
 )
+_PIP_DIAGNOSTIC = re.compile(r"(×\s+)?Failed to build installable wheels for some pyproject\.toml based projects\s*$")
+_PIP_DIAGNOSTIC_NAMES = re.compile(r"╰─>\s*(.*)$")
 _PIP_SUMMARY = re.compile(r"(?:ERROR: )?Failed to build ([^`'\"]+)$")
-# uv: `× Failed to build `x==1.0``, `× Failed to download and build `x==1.0``, older uv's `Failed to build: `x==1.0``.
-_UV = re.compile(r"Failed to (?:download and )?build:? `([^`]*)`")
+# uv: `× Failed to build `x==1.0``, `× Failed to download and build `x==1.0``, older uv's `error: Failed to download
+# and build: `x==1.0`` and `Caused by: Failed to build: `x==1.0``; only after the prefixes uv starts these lines with,
+# never in a build's output.
+_UV = re.compile(r"\s*(?:×|├─▶|╰─▶|error:|Caused by:)\s*Failed to (?:download and )?build:? `([^`]*)`")
 _UV_NAME_VERSION = re.compile(rf"({_NAME})(?:==(\S+))?")
 
 _UNCLEAR = "unclear"  # the log collects the package again without a version after naming one
@@ -89,27 +101,24 @@ def _decode(f: BinaryIO) -> str:
     return bytes(buf).decode(encoding, "replace").removeprefix("\ufeff")
 
 
-def failed_builds(text: str) -> list[tuple[str, str | None]]:
+def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]:
     """The (name, version) of each package the log says failed to build, in the order the log names them. The version
-    is the one uv names, else the one on the nearest `Collecting`, `Downloading` or `Using cached` line before the
-    failure, else None."""
-    versions: dict[str, str] = {}  # canonical name -> the latest version the log names, _UNCLEAR or _DIRECT
+    is the one uv names, else the one the `Collecting`, `Downloading` and `Using cached` lines since the package's last
+    `Collecting` line name. A failure whose version the log doesn't make clear is an error, and so is a pip log that
+    used another index than PyPI, unless `other_index` (wheelgap itself checks another index, as with --index-url)."""
+    # canonical name -> the versions named since its last `Collecting` line (Version -> as written), or _UNCLEAR or
+    # _DIRECT
+    versions: dict[str, dict[Version, str] | str] = {}
+    # The first package pip's resolver tried more than one release of. Backtracking on one package changes the
+    # versions its dependencies are collected at, and pip doesn't log a candidate again when it goes back to it.
+    backtracked: str | None = None
     built: set[str] = set()  # names pip printed `Building wheel for` or `Failed building wheel for` for
-    failures: dict[str, tuple[str, str | None]] = {}
+    failures: dict[str, tuple[str, str]] = {}
 
     def failed(name: str, version: str | None) -> None:
         key = canonicalize_name(name)
         if version is None:
-            version = versions.get(key)
-            if version == _UNCLEAR:
-                raise SourceError(
-                    f"--from-log: the log collects {name} again without a version after naming one, so which "
-                    f"version failed isn't clear; refusing to guess (check {name}==VERSION instead)"
-                )
-        if version == _DIRECT:
-            raise SourceError(
-                f"--from-log: the log installs {name} from a URL or a path, not from an index, so it can't be checked"
-            )
+            version = pip_version(name, key)
         if key in failures and failures[key][1] != version:
             raise SourceError(
                 f"--from-log: the log says {name} failed to build at more than one version; refusing to guess"
@@ -121,6 +130,45 @@ def failed_builds(text: str) -> list[tuple[str, str | None]]:
                 "like a broken build environment rather than missing wheels"
             )
 
+    def pip_version(name: str, key: str) -> str:
+        # pip doesn't say which version failed, so it must be the one version the log names for it.
+        seen = versions.get(key)
+        if seen == _UNCLEAR:
+            raise SourceError(
+                f"--from-log: the log collects {name} again without a version after naming one, so which "
+                f"version failed isn't clear; refusing to guess (check {name}==VERSION directly)"
+            )
+        if seen == _DIRECT:
+            raise SourceError(
+                f"--from-log: the log installs {name} from a URL or a path, not from an index, so it can't be checked"
+            )
+        if not isinstance(seen, dict) or not seen:
+            # A local project (`pip install .` logs `Processing`, never `Collecting`), `pip install -q`, or a log
+            # whose start was cut off. PyPI's newest release of that name may be another project altogether.
+            raise SourceError(
+                f"--from-log: the log doesn't say which version of {name} failed to build (pip logs `Processing` "
+                "for a local project, and `pip install -q` hides `Collecting`); refusing to guess "
+                f"(check {name}==VERSION directly)"
+            )
+        if len(seen) > 1:
+            raise SourceError(
+                f"--from-log: pip tried more than one version of {name}, so which version failed isn't clear; "
+                f"refusing to guess (check {name}==VERSION directly)"
+            )
+        if backtracked is not None:
+            raise SourceError(
+                f"--from-log: pip backtracked (it looked at multiple versions of {backtracked}), so which version of "
+                f"{name} failed isn't clear; refusing to guess (check {name}==VERSION directly)"
+            )
+        return next(iter(seen.values()))
+
+    def named(key: str, version: str) -> None:
+        seen = versions.setdefault(key, {})
+        if seen == _UNCLEAR:
+            versions[key] = seen = {}
+        if isinstance(seen, dict):  # a URL or a path stays one, whatever file it downloads
+            seen.setdefault(Version(version), version)
+
     def pip_summary(names: list[str]) -> None:
         # Only names pip printed `Building wheel for` for: a build's own output at column 0 (`Failed to build the
         # extension`) isn't pip's summary. A line that names any of them must name only them.
@@ -131,22 +179,48 @@ def failed_builds(text: str) -> list[tuple[str, str | None]]:
         for n in names:
             failed(n, None)
 
+    # After pip 25.2's `Failed to build installable wheels ...`: whether it had the `×`, so the names follow `╰─>`.
+    diagnostic: bool | None = None
     for line in _ANSI.sub("", text).splitlines():
         if m := _TIMESTAMP.match(line):
             line = line[m.end() :]
+        if diagnostic is not None:
+            if not line.strip():
+                continue
+            if diagnostic:  # this line must be `╰─> NAMES`
+                if not (m := _PIP_DIAGNOSTIC_NAMES.match(line)):
+                    raise SourceError(
+                        "--from-log: can't read pip's list of packages that failed to build; refusing to guess"
+                    )
+                line = m.group(1)
+            pip_summary([n.strip() for n in line.split(",")])  # else it's skipped if it names no built package
+            diagnostic = None
+            continue
+        if m := _INDEXES.match(line):
+            others = [url for url in map(str.strip, m.group(1).split(",")) if url.rstrip("/") != _PYPI_SIMPLE]
+            if others and not other_index:
+                others = [_USERINFO.sub("//", url) for url in others]
+                raise SourceError(
+                    f"--from-log: the log used another index than PyPI ({', '.join(others)}), so its packages may "
+                    "not be PyPI's; pass that index with --index-url to check it"
+                )
         if m := _COLLECT.match(line):
             key, rest = canonicalize_name(m.group(1)), m.group(2)
             if (pin := _PIN.match(rest)) and _is_version(pin.group(1)):
-                versions[key] = pin.group(1)
+                versions[key] = {Version(pin.group(1)): pin.group(1)}
             elif rest.lstrip().startswith("@"):
                 versions[key] = _DIRECT
             elif key in versions:
                 versions[key] = _UNCLEAR
+            else:
+                versions[key] = {}
         elif (m := _FILE.match(line)) and (found := _file_version(m.group(1))):
-            versions[canonicalize_name(found[0])] = found[1]
+            named(canonicalize_name(found[0]), found[1])
+        if backtracked is None and (m := _BACKTRACK.match(line)):
+            backtracked = m.group(1)
         if m := _BUILDING.search(line):
             built.add(canonicalize_name(m.group(1)))
-        if m := _UV.search(line):
+        if m := _UV.match(line):
             uv = _UV_NAME_VERSION.fullmatch(m.group(1))
             if uv is None or not _NAME_RE.fullmatch(uv.group(1)) or not _is_version(uv.group(2)):
                 raise SourceError(
@@ -156,8 +230,12 @@ def failed_builds(text: str) -> list[tuple[str, str | None]]:
             failed(uv.group(1), uv.group(2))
         elif m := _PIP_INSTALLABLE.match(line):
             pip_summary([n.strip() for n in m.group(1).split(",")])
+        elif m := _PIP_DIAGNOSTIC.match(line):
+            diagnostic = m.group(1) is not None
         elif m := _PIP_SUMMARY.match(line):
             pip_summary(m.group(1).split())
+    if diagnostic:
+        raise SourceError("--from-log: can't read pip's list of packages that failed to build; refusing to guess")
 
     if not failures:
         raise SourceError(
@@ -168,8 +246,9 @@ def failed_builds(text: str) -> list[tuple[str, str | None]]:
 
 
 def _file_version(location: str) -> tuple[str, str] | None:
-    """The (name, version) of the file a `Downloading` or `Using cached` line names; None if it's not a distribution."""
-    filename = location.split("#", 1)[0].split("?", 1)[0].rsplit("/", 1)[-1]
+    """The (name, version) of the file a `Downloading` or `Using cached` line names (or of the distribution whose
+    `.metadata` file it is); None if it's not a distribution."""
+    filename = location.split("#", 1)[0].split("?", 1)[0].rsplit("/", 1)[-1].removesuffix(".metadata")
     try:
         if filename.endswith(".whl"):
             name, version, _, _ = parse_wheel_filename(filename)
@@ -192,9 +271,9 @@ def _is_version(version: str | None) -> bool:
     return True
 
 
-def log_source(failures: list[tuple[str, str | None]]) -> Source:
+def log_source(failures: list[tuple[str, str]]) -> Source:
     """The packages to check, as PyPI names: built from the log's names and versions, never read as paths."""
     source = Source("install log", pypi_only=True)
     for name, version in failures:
-        source.packages.append(requirement_to_package(f"{name}=={version}" if version else name, "install log"))
+        source.packages.append(requirement_to_package(f"{name}=={version}", "install log"))
     return source

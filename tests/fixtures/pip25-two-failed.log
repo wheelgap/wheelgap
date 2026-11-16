@@ -1,0 +1,28 @@
+Collecting fastlib (from -r requirements.txt (line 1))
+  Downloading fastlib-2.0.0.tar.gz (30 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+Collecting laggard==1.0 (from -r requirements.txt (line 2))
+  Using cached laggard-1.0.tar.gz (12 kB)
+Building wheels for collected packages: fastlib, laggard
+  Building wheel for fastlib (pyproject.toml): started
+  Building wheel for fastlib (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × Building wheel for fastlib (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [2 lines of output]
+      running bdist_wheel
+      error: can't find Rust compiler
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for fastlib
+  Building wheel for laggard (pyproject.toml): started
+  Building wheel for laggard (pyproject.toml): finished with status 'error'
+  ERROR: Failed building wheel for laggard
+Failed to build fastlib laggard
+error: failed-wheel-build-for-install
+
+× Failed to build installable wheels for some pyproject.toml based projects
+╰─> fastlib, laggard

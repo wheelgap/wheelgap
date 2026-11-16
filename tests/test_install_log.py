@@ -31,18 +31,40 @@ def log(name: str) -> str:
         ("uv-old.log", [("nowheels", "0.9")]),
         # Copied from GitHub Actions: timestamps, and an earlier run that pinned forked==0.9.
         ("gha-pip-mixed.log", [("forked", "1.0")]),
-        # The log's start was cut off: no version to be found.
-        ("pip-no-version.log", [("nowheels", None)]),
+        # pip 25.2 and later: `× Failed to build installable wheels ...` with the names on the `╰─>` line.
+        ("pip25-two-failed.log", [("fastlib", "2.0.0"), ("laggard", "1.0")]),
     ],
 )
 def test_failed_builds(name, expected):
     assert failed_builds(log(name)) == expected
 
 
-def test_pip_24_summary_alone():
-    text = log("pip24-two-failed.log").replace("\nFailed to build fastlib laggard\n", "\n")
-    assert "Failed to build fastlib" not in text
+@pytest.mark.parametrize(
+    "summary",
+    [
+        # pip 24.1 to 25.1
+        "ERROR: Failed to build installable wheels for some pyproject.toml based projects (fastlib, laggard)\n",
+        # pip 24.1 to 24.3 print ERROR: twice
+        "ERROR: ERROR: Failed to build installable wheels for some pyproject.toml based projects (fastlib, laggard)\n",
+        # pip 25.2 and later
+        "error: failed-wheel-build-for-install\n\n× Failed to build installable wheels for some pyproject.toml based "
+        "projects\n╰─> fastlib, laggard\n",
+        # pip 25.2 and later on a console that can't print `×` and `╰─>`
+        "error: failed-wheel-build-for-install\n\nFailed to build installable wheels for some pyproject.toml based "
+        "projects\n\nfastlib, laggard\n",
+    ],
+)
+def test_pip_installable_summary_alone(summary):
+    text = log("pip24-two-failed.log")
+    text = text[: text.index("Failed to build fastlib laggard\n")] + summary
     assert failed_builds(text) == [("fastlib", "2.0.0"), ("laggard", "1.0")]
+
+
+def test_pip_25_names_line_that_cant_be_read_is_refused():
+    text = log("pip25-two-failed.log").replace("╰─> fastlib, laggard", "note: something else")
+    text = text.replace("Failed to build fastlib laggard\n", "")
+    with pytest.raises(SourceError, match="can't read pip's list"):
+        failed_builds(text)
 
 
 def test_column_0_text_that_names_no_built_package_is_not_pip_summary():
@@ -58,11 +80,89 @@ def test_column_0_text_that_names_no_built_package_is_not_pip_summary():
         ("pip-two-versions.log", "forked failed to build at more than one version"),
         ("pip-git-url.log", "installs nowheels from a URL or a path"),
         ("uv-local-project.log", "not as NAME==VERSION"),
+        # The log's start was cut off: no version to be found.
+        ("pip-no-version.log", r"doesn't say which version of nowheels failed to build .*check nowheels==VERSION"),
     ],
 )
 def test_refuses_rather_than_guesses(name, fragment):
     with pytest.raises(SourceError, match=fragment):
         failed_builds(log(name))
+
+
+BUILD_FAILED = """\
+Building wheels for collected packages: nowheels
+  Building wheel for nowheels (pyproject.toml) ... error
+  ERROR: Failed building wheel for nowheels
+Failed to build nowheels
+"""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # `pip install .` logs `Processing`, never `Collecting`: PyPI's nowheels may be another project.
+        "Processing /home/me/nowheels\n  Installing build dependencies ... done\n" + BUILD_FAILED,
+        # `pip install -q` hides `Collecting`, `Building wheel for` and `Failed to build`.
+        "  ERROR: Failed building wheel for nowheels\nERROR: Failed to build installable wheels for some "
+        "pyproject.toml based projects (nowheels)\n",
+    ],
+)
+def test_no_version_is_refused(text):
+    with pytest.raises(SourceError, match="doesn't say which version of nowheels failed to build"):
+        failed_builds(text)
+
+
+@pytest.mark.parametrize(
+    "downloads",
+    [
+        "  Downloading nowheels-1.1.tar.gz (5 kB)\n  Downloading nowheels-1.0.tar.gz (5 kB)\n",
+        # pip fetches a wheel's metadata alone while it resolves
+        "  Downloading nowheels-1.1-py3-none-any.whl.metadata (2 kB)\n  Downloading nowheels-1.0.tar.gz (5 kB)\n",
+    ],
+)
+def test_more_than_one_version_since_collecting_is_refused(downloads):
+    with pytest.raises(SourceError, match="pip tried more than one version of nowheels"):
+        failed_builds("Collecting nowheels\n" + downloads + BUILD_FAILED)
+
+
+def test_the_same_version_twice_is_one_version():
+    text = "Collecting nowheels==1.0\n  Downloading nowheels-1.0.0.tar.gz (5 kB)\n" + BUILD_FAILED
+    assert failed_builds(text) == [("nowheels", "1.0")]
+
+
+@pytest.mark.parametrize("backtracked", ["nowheels", "other[extra]"])
+def test_backtracking_is_refused(backtracked):
+    # Backtracking on any package changes the versions its dependencies are collected at.
+    text = (
+        "Collecting nowheels==1.0\n  Downloading nowheels-1.0.tar.gz (5 kB)\n"
+        f"INFO: pip is looking at multiple versions of {backtracked} to determine which version is compatible with "
+        "other requirements. This could take a while.\n" + BUILD_FAILED
+    )
+    with pytest.raises(SourceError, match="pip backtracked"):
+        failed_builds(text)
+
+
+def test_a_download_doesnt_turn_a_url_into_an_index_version():
+    text = "Collecting nowheels @ https://example.com/nowheels-1.0.tar.gz\n  Downloading nowheels-1.0.tar.gz\n"
+    with pytest.raises(SourceError, match="installs nowheels from a URL or a path"):
+        failed_builds(text + BUILD_FAILED)
+
+
+INDEXES = "Looking in indexes: https://pypi.org/simple, https://__token__:****@private.example/simple\n"
+
+
+def test_another_index_is_refused():
+    assert failed_builds("Looking in indexes: https://pypi.org/simple/\n" + log("pip23-laggard.log"))
+    with pytest.raises(SourceError, match=r"another index than PyPI \(https://private\.example/simple\)") as e:
+        failed_builds(INDEXES + log("pip23-laggard.log"))
+    assert "token" not in str(e.value)
+    assert failed_builds(INDEXES + log("pip23-laggard.log"), other_index=True) == [("laggard", "1.0")]
+
+
+def test_uv_lines_count_only_after_uvs_prefixes():
+    # A build's own output that happens to read like uv's error isn't uv's.
+    text = log("uv-old.log") + "--- stdout:\nnote: Failed to build `nowheels==0.8`, retrying\n"
+    assert failed_builds(text) == [("nowheels", "0.9")]
 
 
 def test_a_summary_that_names_a_package_pip_never_built_is_refused():
@@ -73,7 +173,9 @@ def test_a_summary_that_names_a_package_pip_never_built_is_refused():
 
 def summary_of(count: int) -> str:
     names = [f"pkg{i}" for i in range(count)]
-    built = "".join(f"  Building wheel for {name} (pyproject.toml) ... error\n" for name in names)
+    built = "".join(
+        f"Collecting {name}==1.0\n  Building wheel for {name} (pyproject.toml) ... error\n" for name in names
+    )
     return f"{built}Failed to build {' '.join(names)}\n"
 
 
@@ -168,15 +270,43 @@ def test_a_failed_package_with_a_wheel_for_the_target_gets_a_note(capsys, fake_p
 
 
 def test_a_package_named_like_a_folder_is_still_a_pypi_name(capsys, fake_pypi, tmp_path, monkeypatch):
-    (tmp_path / "nowheels").mkdir()
-    (tmp_path / "nowheels" / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "laggard").mkdir()
+    (tmp_path / "laggard" / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    code, out, err = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--json"))
+    code, out, _ = run(capsys, *from_log("pip23-laggard.log", "-t", "win-amd64", "--json"))
     assert code == 1
     (pkg,) = json.loads(out)["packages"]
-    assert (pkg["name"], pkg["version"], pkg["results"]) == ("nowheels", "0.9", {"win-amd64": "source"})
-    assert set(fake_pypi) == {"https://pypi.org/pypi/nowheels/json"}  # never the folder's purewheel
-    assert "the install log doesn't say which version of nowheels failed; checking its newest release\n" in err
+    assert (pkg["name"], pkg["version"], pkg["results"]) == ("laggard", "1.0", {"win-amd64": "source"})
+    assert not [url for url in fake_pypi if "purewheel" in url]  # never the folder's purewheel
+
+
+def test_quiet_in_pyproject_doesnt_stop_it(capsys, fake_pypi, tmp_path, monkeypatch):
+    # quiet = true is a project default; --from-log on the command line wins, as --no-quiet does.
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    code, out, err = run(capsys, *from_log("pip23-laggard.log", "-t", "win-amd64"))
+    assert code == 1
+    assert "laggard" in out and "the install log says these failed to build: laggard 1.0\n" in err
+
+
+def test_quiet_on_the_command_line_is_an_error(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(from_log("pip23-laggard.log", "-t", "win-amd64", "--quiet"))
+    assert e.value.code == 2
+    assert "--from-log explains each package, so it can't be used with --quiet\n" in capsys.readouterr().err
+
+
+def test_a_log_from_another_index_is_checked_only_with_another_index(capsys, fake_pypi, tmp_path, monkeypatch):
+    path = tmp_path / "install.log"
+    path.write_text(INDEXES + log("pip23-laggard.log"), encoding="utf-8")
+    code, out, err = run(capsys, "--from-log", str(path), "-p", "3.13", "-t", "win-amd64", "--no-cache")
+    assert (code, out) == (2, "")
+    assert "the log used another index than PyPI" in err
+    assert fake_pypi == []
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    code, _, err = run(capsys, "--from-log", str(path), "-p", "3.13", "-t", "win-amd64", "--no-cache", "--json")
+    assert code == 1 and "the log used another index" not in err
+    assert fake_pypi and all(url.startswith("https://mirror.example.com/pypi/") for url in fake_pypi)
 
 
 @pytest.mark.parametrize("given", [[], ["-p", "3.13"], ["-t", "win-amd64"]])
@@ -211,6 +341,7 @@ def test_flags_it_cant_be_combined_with(capsys, extra, flag):
     [
         ("pip-unclear-version.log", "collects forked again without a version"),
         ("pip-succeeded.log", "found no package that failed to build"),
+        ("pip-no-version.log", "doesn't say which version of nowheels failed to build"),  # never asks PyPI for it
     ],
 )
 def test_an_unreadable_log_is_an_input_error(capsys, fake_pypi, name, fragment):

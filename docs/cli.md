@@ -251,19 +251,25 @@ wheelgap --from-log install.log -p 3.13 -t win-arm64
 pip install -r requirements.txt 2>&1 | wheelgap --from-log - -p 3.13 -t win-arm64
 ```
 
-It reads pip's summary at the end (`Failed to build NAME`, and pip 24.1 and later's `Failed to build installable wheels
-for some pyproject.toml based projects (NAME)`), counting only names pip also printed `Building wheel for NAME` for, and
-uv's ``Failed to build `NAME==VERSION` ``. pip leaves the version out, so it comes from the nearest
-`Collecting NAME==VERSION`, `Downloading` or `Using cached` line before the failure; when the log has none, the newest
-release is checked, with a note. It's an error rather than a guess when a failure line can't be read, when the log
-collects the package again without a version after naming one, when the package came from a URL or a path, or when
-more than 50 packages failed. Colour codes and GitHub Actions timestamps are skipped, a UTF-16 log (PowerShell's `>`)
-is read too, and of a longer log only the last 8 MiB is read.
+It reads pip's summary at the end (`Failed to build NAME`; pip 24.1 to 25.1's `Failed to build installable wheels for
+some pyproject.toml based projects (NAME)`; and pip 25.2 and later's `× Failed to build installable wheels for some
+pyproject.toml based projects` with the names on the `╰─> NAME` line after it), counting only names pip also printed
+`Building wheel for NAME` for, and uv's ``Failed to build `NAME==VERSION` `` on uv's own error lines (after `×`, `├─▶`,
+`╰─▶`, `error:` or `Caused by:`). pip leaves the version out, so it comes from the `Collecting NAME==VERSION`,
+`Downloading` and `Using cached` lines since the package's last `Collecting` line. It's an error rather than a guess
+when the log doesn't name a version (`pip install .` logs `Processing` instead, and `pip install -q` hides
+`Collecting`: check `NAME==VERSION` directly then), when it names more than one or pip backtracked (`INFO: pip is
+looking at multiple versions of ...`), when it collects the package again without a version after naming one, when the
+package came from a URL or a path, when pip's `Looking in indexes:` names another index than https://pypi.org/simple
+and wheelgap isn't given one too (`--index-url`, `index-url` in `[tool.wheelgap]`, or `WHEELGAP_INDEX_URL`), when a
+failure line can't be read, or when more than 50 packages failed. Colour codes and GitHub Actions timestamps are
+skipped, a UTF-16 log (PowerShell's `>`) is read too, and of a longer log only the last 8 MiB is read.
 
 A note lists the packages the log says failed, and another says when one has a wheel for a checked target after all:
 then the log likely comes from another platform or Python than `-p` and `-t`. `--no-suggest` turns `--suggest` off.
-It takes no other inputs, and can't be combined with `--dist`, `--deps`, `--environment`, `--suggest-targets`,
-`--list-targets` or `--clear-cache`.
+`quiet = true` in `[tool.wheelgap]` doesn't apply to it, as `--no-quiet` overrides it; `--quiet` is an error, as with
+`--explain`, unless the output is `--json` or `--markdown`. It takes no other inputs, and can't be combined with
+`--dist`, `--deps`, `--environment`, `--suggest-targets`, `--list-targets` or `--clear-cache`.
 
 ### `--conda-forge` {#conda-forge}
 
