@@ -13,7 +13,7 @@ Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ign
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
-`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.12.0**
+`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.13.0**
 aren't in a release yet.
 
 ## Targets
@@ -241,7 +241,7 @@ A wheel that would fit but whose release was yanked is named with the reason `ya
 
 ### `--from-log` {#from-log}
 
-**After 0.12.0.** `--from-log FILE` reads the log of a failed `pip install` or uv install (`-` reads stdin), finds the
+`--from-log FILE` reads the log of a failed `pip install` or uv install (`-` reads stdin), finds the
 packages that failed to build, and checks each one as `--explain --suggest` does: why no wheel fits, and the release
 that has one. The log doesn't say where the install ran, so pass `-p` and `-t` for that machine (or `--dockerfile` for
 a docker build); without them it's an error.
@@ -358,7 +358,7 @@ a pull request comment. See [Output](output.md#markdown).
 
 ### `--sarif` {#sarif}
 
-`--sarif PATH` (**after 0.12.0**): also write a
+`--sarif PATH`: also write a
 [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) report to `PATH`, alongside the usual
 output, for GitHub code scanning. It's written even when the check fails, and an empty `PATH` is an error, as for
 `--junit`. See [Output](output.md#sarif) and [CI](ci.md#code-scanning).
@@ -378,7 +378,7 @@ so CI can publish it; an empty `PATH` is an error, as for `--junit`. See [Recipe
 Also mark each package with a gap on its own line of the lockfile in GitHub Actions, as an
 annotation. The GitHub Action passes it; see [CI](ci.md#annotations).
 
-With `--deps` on a requirements file (after 0.12.0), a direct requirement's
+With `--deps` on a requirements file, a direct requirement's
 gap is on its own line, as without `--deps`. A transitive gap goes on the line
 of the requirement that pulls it in when exactly one does on every target where
 it has a gap, and its message says `(via …)`. When more than one does, or a

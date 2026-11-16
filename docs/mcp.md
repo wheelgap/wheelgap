@@ -2,7 +2,7 @@
 
 `wheelgap-mcp` is wheelgap's [MCP](https://modelcontextprotocol.io/) server. It
 runs over stdio and gives an agent six read-only tools: `check_package`,
-`check_lockfile`, `check_dockerfile`, `check_dist` (after 0.12.0), `diff_lockfiles` and `list_targets`. Every
+`check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles` and `list_targets`. Every
 client below starts it with the same command:
 
 ```bash
@@ -30,7 +30,7 @@ All six are read-only. They look packages up on PyPI, or on the index in
   settings included: the packages with gaps, the ones it skipped (git, path and
   private-index packages, which aren't checked) and any notes. It also returns
   `blocking_newer_python` when two Pythons, one newer, are checked. With
-  `dependencies: true` (after 0.12.0), requirements files and `pyproject.toml`
+  `dependencies: true`, requirements files and `pyproject.toml`
   are resolved as `--deps` would, including transitive gaps, each with `via`
   (the path to it on each gap target) and `direct` (the direct dependencies
   behind it). It's refused where `--deps` is: lockfiles, offline, and another
@@ -44,7 +44,7 @@ All six are read-only. They look packages up on PyPI, or on the index in
   Docker build overrides them with `--build-arg`, pass the same values as the
   `build_args` argument, as `--build-arg` does on the
   command line. A Dockerfile wheelgap can't read is a tool error.
-- `check_dist` (after 0.12.0): the files a release is about to upload — the
+- `check_dist`: the files a release is about to upload — the
   `dist/` folder `uv build` or `python -m build` leaves — as
   `wheelgap --dist DIR --json` reports them: per target, whether a wheel
   installs or only the sdist is there to build from, and `dropped` naming each target the previous
@@ -64,7 +64,7 @@ All six are read-only. They look packages up on PyPI, or on the index in
   whether the upgrade lost a wheel.
 - `list_targets`: the platform names the other tools accept.
 
-For example (after 0.12.0), to check everything `requirements.txt` installs, call
+For example, to check everything `requirements.txt` installs, call
 `check_lockfile` with `{"path": "requirements.txt", "python": "3.13",
 "targets": ["win-arm64"], "dependencies": true}`. The `dependencies` argument
 is a boolean, defaults to `false`, and follows the command line's `--deps`
@@ -128,7 +128,7 @@ for `check_dist` the nearest folder above the dist folder with a
 | `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
 | `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` (when a pyodide target is checked) | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
 | `offline` | boolean | `[tool.wheelgap] offline`, else `false` | Use only the files recorded in the lockfile; never contact the index. `true` turns it on; `offline = true` in the project can't be turned off from here. |
-| `dependencies` | boolean | `false` | (after 0.12.0) Resolve transitive dependencies of requirements files and `pyproject.toml` with `--deps`; each gap gets `via` and `direct`. Refused for lockfiles, offline and another index. |
+| `dependencies` | boolean | `false` | Resolve transitive dependencies of requirements files and `pyproject.toml` with `--deps`; each gap gets `via` and `direct`. Refused for lockfiles, offline and another index. |
 
 #### `check_dockerfile`
 
@@ -325,8 +325,8 @@ newest before the one checked), such as `{"3.13 win-arm64": "46.0.3"}`, so it
 can answer "pin cryptography to 46.0.3 or earlier". It reads the
 project's release list from PyPI, which is one more request, and is left out
 when there's no gap, when `WHEELGAP_INDEX_URL` points at another index (which
-may hold private names), or when that lookup fails. (`suggest` is there after
-0.12.0; before it, only `last_with_wheel` is.)
+may hold private names), or when that lookup fails. (`suggest` is new in
+0.13.0; 0.12.0 gives only `last_with_wheel`.)
 
 To check what a package installs as well as the package itself, as [`--deps`](cli.md#deps) does, pass
 `dependencies: true`:
@@ -337,7 +337,7 @@ The tree is resolved for each target from PyPI's metadata, and the result adds
 `dependencies_checked` (how many other packages were checked) and
 `dependency_gaps`: each package in the tree with a gap, with its `results`,
 `gaps` and `via`, the path to it on each gap target, such as
-`{"3.13 win-arm64": ["mcp", "PyJWT", "cryptography"]}`, and (after 0.12.0) its
+`{"3.13 win-arm64": ["mcp", "PyJWT", "cryptography"]}`, and its
 own `suggest` and `last_with_wheel`, looked up for the whole tree together.
 Those aren't checked against what the rest of the tree requires, so a parent
 may pin the dependency elsewhere: `via` shows who pulls it in. With several

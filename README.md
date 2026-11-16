@@ -51,7 +51,7 @@ wheelgap -p 3.14t -t all
 # Several Pythons at once, Linux on both architectures
 wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
-# Diagnose failed pip or uv wheel builds (after 0.12.0)
+# Diagnose failed pip or uv wheel builds
 wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
 
 # Resolve a version range separately for each Python
@@ -66,7 +66,7 @@ wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 # ...and everything they install too, with the path to each gap
 wheelgap mcp==2.3.0 --deps -t win-arm64 --explain
 
-# On a Linux aarch64 machine: check exactly what pip resolved there, without installing it (after 0.12.0)
+# On a Linux aarch64 machine: check exactly what pip resolved there, without installing it
 python -m pip install --dry-run --ignore-installed --report report.json -r requirements.txt
 wheelgap report.json -p 3.14 -t linux-aarch64
 
@@ -134,7 +134,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.12.0
+- uses: wheelgap/wheelgap@v0.13.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -146,7 +146,7 @@ The job fails when a dependency would build from source on a target you ship, fo
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.12.0
+    rev: v0.13.0
     hooks:
       - id: wheelgap
 ```

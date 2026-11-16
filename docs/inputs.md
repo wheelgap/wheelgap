@@ -19,7 +19,7 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`Pipfile.lock`](#pipfilelock) | no | no |
 | [`pixi.lock`](#pixilock) | no | no |
 | [requirements files](#requirements-files) | no | with `--deps` |
-| [pip installation report](#pip-installation-report) (after 0.12.0) | no | no |
+| [pip installation report](#pip-installation-report) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | with `--deps` |
 | [package names](#package-names) | no | with `--deps` |
 
@@ -221,7 +221,7 @@ Naming an environment for any other lockfile is an error.
 
 ## Pip installation report
 
-After 0.12.0, wheelgap reads the report `pip install --dry-run --report` writes: exactly what pip resolved, without
+wheelgap reads the report `pip install --dry-run --report` writes: exactly what pip resolved, without
 installing anything. Make the report on the target you want to check, and check that target only:
 
 ```bash
@@ -273,7 +273,7 @@ root, and the whole tree it installs is checked per target. Constraint files and
 apply to the resolved packages too. A fully pinned file that already lists what it installs (`pip-compile` output
 with `--hash` lines or `# via` comments) needs no resolving: wheelgap says so and checks it as written.
 
-With `--deps` (after 0.12.0), a constraint with an environment marker applies only on the targets where its marker
+With `--deps`, a constraint with an environment marker applies only on the targets where its marker
 holds, as pip evaluates it: `urllib3<2; python_version < "3.12"` constrains Python 3.11 but not Python 3.14, and
 `extra == "…"` never holds on a constraint. A constraint on a package the tree doesn't install imposes nothing. When a
 target can't decide a marker on an installed package (`platform_release`, `platform_version`, or `platform_machine`

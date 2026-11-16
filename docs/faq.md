@@ -72,5 +72,5 @@ gap.
 
 ## Which version of the docs is this?
 
-These pages follow the `main` branch. Anything marked **after 0.12.0** isn't released yet; the
+These pages follow the `main` branch. Anything marked **after 0.13.0** isn't released yet; the
 [changelog](https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md) lists it under "Unreleased".

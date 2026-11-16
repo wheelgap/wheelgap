@@ -86,7 +86,7 @@ Check every package a lockfile (or a project directory) installs on at least one
 target's Python may be missing wheels for it, so its PyPI packages are also looked up on the index (keeping the
 lock's files if a lookup fails).
 
-- `deps=True` (after 0.12.0) resolves the dependency tree for requirements files and `pyproject.toml` inputs from
+- `deps=True` resolves the dependency tree for requirements files and `pyproject.toml` inputs from
   PyPI metadata for each target, as `--deps` does on the command line. Each package in the tree gets its own
   `Result`, and on its gap targets `via` gives the path from your input and `direct` the direct dependencies behind
   it. A `pyproject.toml` (or a project directory with only one) is accepted and read from `[project] dependencies`
@@ -130,7 +130,7 @@ Each check returns a `Result` (a list of them for `check_packages()`, `check_loc
 | `ok` | `True` if no target has a gap |
 | `gaps` | the targets with a gap (`source`, `missing` or `unknown`) |
 | `bundled_versions`, `bundled_version`, `bundled_version_differs` | with `pyodide_locks`: see [Pyodide](#pyodide) |
-| `issues_url` | (after 0.12.0) the package's issue tracker URL from PyPI metadata, or `None` when absent or not on PyPI |
+| `issues_url` | the package's issue tracker URL from PyPI metadata, or `None` when absent or not on PyPI |
 | `to_dict()` | the package in the shape of a `--json` package entry, keyed by each target's full label (`"3.13 musl-aarch64"`, with the Python even when only one is checked) |
 
 ### Explaining a gap
@@ -156,12 +156,12 @@ why), a result explains the gap the way `--explain` does:
   line shows it: `("app", "pandas", "numpy")`, or `("(dev group)", "pytest")` when a dependency group pulls it in.
   `check_lockfile()` fills it for `uv.lock`, for `poetry.lock` files older than lock-version 2.1, and with
   `deps=True`, and `check_packages()` and `check_package()` fill it with `deps=True`; it's empty for other inputs.
-- `result.direct` (after 0.12.0) maps the same targets to the direct dependencies that lead to the package, as the
+- `result.direct` maps the same targets to the direct dependencies that lead to the package, as the
   table's `(via ...)` names them: `result.direct[target]` is a tuple such as `("mcp", "httpx")`, and
   `to_dict(explain=True)` gives `{"3.13 win-arm64": ["mcp", "httpx"]}`. It's empty for a direct dependency and for
   an input with no dependency graph: `check_lockfile()` fills it for `uv.lock`, for `poetry.lock` files older than
   lock-version 2.1, and with `deps=True`, and `check_packages()` and `check_package()` fill it with `deps=True`.
-- `result.issues_url` (after 0.12.0) is the package's issue tracker link from PyPI metadata, or `None` when absent, for
+- `result.issues_url` is the package's issue tracker link from PyPI metadata, or `None` when absent, for
   private packages, or when pointing at another index.
 
 `rejected` and `reasons` are worked out when first read; `via`, `direct` and `issues_url` are filled in when the result

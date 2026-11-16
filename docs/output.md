@@ -23,7 +23,7 @@ Add `set -o pipefail` when you pipe the output, so input errors still fail.
 ## Text
 
 ```text
-wheelgap 0.12.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.13.0 · uv.lock · 5 packages · Python 3.13
 
 package    version  linux-aarch64  musl-aarch64
 fastlib    2.0.0    ● source       ● source
@@ -328,7 +328,7 @@ gaps = [p["name"] for p in data["packages"] if p["results"].get(key) in ("source
 
 With `--json --explain`, each package gets `rejected` (`{"file", "reason"}` objects) and `via` (the dependency path),
 both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph. It also
-gets `issues_url`: the package's issue tracker URL from its PyPI metadata, or `null`, and (**after 0.12.0**) `direct`:
+gets `issues_url`: the package's issue tracker URL from its PyPI metadata, or `null`, and `direct`:
 for each gap target, the direct dependencies that lead to the package, as the table's `cryptography (via mcp)` names
 them (`{"win-arm64": ["mcp", "httpx"]}`). `direct` has entries only for uv.lock, Poetry 1.x and `--deps` inputs. It
 leaves out a target where the package is itself a direct dependency, and may leave one out when the lockfile doesn't
@@ -358,7 +358,7 @@ wheels go in a collapsed section.
 ```markdown
 ### wheelgap: 3 of 5 packages have gaps
 
-wheelgap 0.12.0 · `uv.lock` · 5 packages · Python 3.13
+wheelgap 0.13.0 · `uv.lock` · 5 packages · Python 3.13
 
 | package | version | linux-aarch64 | musl-aarch64 |
 | --- | --- | --- | --- |
@@ -406,7 +406,7 @@ report, alongside whatever output mode you use. It has one testsuite per target 
 ```
 
 - A cell that fails the run is a failure: `missing`, `unknown`, and `source` unless `--fail-on missing`.
-- (**after 0.12.0**) A transitive gap's failure or advisory-skip message names the direct dependency that pulls it
+- A transitive gap's failure or advisory-skip message names the direct dependency that pulls it
   in on that target, as the tables do: `source (via mcp)`, or `source (via mcp +2)`, and the element's text lists
   them all. Only inputs with a dependency graph (uv.lock, Poetry 1.x, `--deps`) have one. Testcase names don't
   change, so dashboard history is kept.
@@ -419,7 +419,7 @@ report, alongside whatever output mode you use. It has one testsuite per target 
 
 ## SARIF {#sarif}
 
-`--sarif PATH` (**after 0.12.0**) also writes a
+`--sarif PATH` also writes a
 [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) file for GitHub code scanning (or
 another SARIF viewer), alongside whatever output mode you use. It has two rules, `wheelgap/source` and
 `wheelgap/missing`, and one result per package and target with that status:

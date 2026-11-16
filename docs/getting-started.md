@@ -23,7 +23,7 @@ finds. You can also pass a file,
 a directory, or package names. [Inputs](inputs.md) has the details.
 
 `uvx wheelgap` can reuse an older copy that uv installed or cached. Run `uvx wheelgap@latest` for the newest release,
-or pin one (`uvx wheelgap@0.12.0`) when the result must not change between runs.
+or pin one (`uvx wheelgap@0.13.0`) when the result must not change between runs.
 
 ## Pick your Python and platforms
 
