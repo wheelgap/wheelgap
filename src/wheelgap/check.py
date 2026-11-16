@@ -539,6 +539,41 @@ def poetry_extras_decide(marker: str, extras: PoetryExtras) -> tuple[bool | None
         return None, False
 
 
+def marker_value(
+    marker: str | None,
+    target: Target,
+    *,
+    extras: frozenset[str] | None = None,
+    groups: frozenset[str] | None = None,
+) -> bool | None:
+    """Whether `marker` holds on `target`, or None when the target can't decide it: a marker that doesn't parse, or one
+    that depends on something unknown there (platform_release, platform_version, an `extra` when `extras` is None,
+    platform_machine on a target whose machine name isn't fixed)."""
+    if not marker:
+        return True
+    m = _parsed_marker(marker)
+    if m is None:
+        return None
+    try:
+        if extras is None and groups is None:
+            return _evaluate3(m._markers, target)
+        # uv's synthetic conflict marker names aren't public extra names. Preserve their
+        # existing unknown/conservative treatment rather than hiding a potentially needed wheel.
+        synthetic = bool(re.search(r"(?:extra|group)-\d+-", marker))
+        contexts = extras | {""} if extras is not None and not synthetic else {None}
+        results: set[bool | None] = set()
+        for extra in contexts:
+            environment: dict = {}
+            if extra is not None:
+                environment.update(extra=extra, extras=extras)
+            if groups is not None:
+                environment["dependency_groups"] = groups
+            results.add(_evaluate3(m._markers, target, environment))
+        return True if True in results else None if None in results else False
+    except Exception:  # packaging changed its internals: unknown
+        return None
+
+
 def marker_holds(
     marker: str | None,
     target: Target,
@@ -546,29 +581,9 @@ def marker_holds(
     extras: frozenset[str] | None = None,
     groups: frozenset[str] | None = None,
 ) -> bool:
-    if not marker:
-        return True
-    m = _parsed_marker(marker)
-    if m is None:
-        return True  # can't parse it: assume the package is needed rather than hide a gap
-    try:
-        if extras is None and groups is None:
-            return _evaluate3(m._markers, target) is not False
-        # uv's synthetic conflict marker names aren't public extra names. Preserve their
-        # existing unknown/conservative treatment rather than hiding a potentially needed wheel.
-        synthetic = bool(re.search(r"(?:extra|group)-\d+-", marker))
-        contexts = extras | {""} if extras is not None and not synthetic else {None}
-        for extra in contexts:
-            environment: dict = {}
-            if extra is not None:
-                environment.update(extra=extra, extras=extras)
-            if groups is not None:
-                environment["dependency_groups"] = groups
-            if _evaluate3(m._markers, target, environment) is not False:
-                return True
-        return False
-    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
-        return True
+    """Whether `marker` can hold on `target`: unknown counts as holding, to assume a package is needed rather than
+    hide a gap."""
+    return marker_value(marker, target, extras=extras, groups=groups) is not False
 
 
 # How a package was reached: the index of the package that depends on it, the name of the
