@@ -1,0 +1,8 @@
+Collecting forked==0.9
+  Using cached forked-0.9.tar.gz (5 kB)
+Successfully installed forked-0.9
+Collecting forked
+Building wheels for collected packages: forked
+  Building wheel for forked (pyproject.toml) ... error
+  ERROR: Failed building wheel for forked
+Failed to build forked

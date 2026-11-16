@@ -1,0 +1,9 @@
+Resolved 2 packages in 150ms
+error: Failed to download and build: `nowheels==0.9`
+  Caused by: Failed to build: `nowheels==0.9`
+  Caused by: Build backend failed to build wheel through `build_wheel()` (exit status: 1)
+--- stdout:
+running bdist_wheel
+--- stderr:
+Failed to build the extension
+---

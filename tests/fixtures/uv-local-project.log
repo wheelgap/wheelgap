@@ -1,0 +1,4 @@
+Resolved 4 packages in 90ms
+  × Failed to build `myproj @ file:///home/me/myproj`
+  ├─▶ The build backend returned an error
+  ╰─▶ Call to `setuptools.build_meta.build_editable` failed (exit status: 1)

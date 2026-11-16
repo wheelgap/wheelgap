@@ -1,0 +1,6 @@
+Collecting nowheels@ git+https://github.com/example/nowheels
+  Cloning https://github.com/example/nowheels to /tmp/pip-install-1x2y/nowheels
+Building wheels for collected packages: nowheels
+  Building wheel for nowheels (pyproject.toml) ... error
+  ERROR: Failed building wheel for nowheels
+Failed to build nowheels

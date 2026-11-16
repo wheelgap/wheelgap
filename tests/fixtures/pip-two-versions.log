@@ -1,0 +1,10 @@
+Collecting forked==0.9
+  Using cached forked-0.9.tar.gz (5 kB)
+  Building wheel for forked (pyproject.toml) ... error
+  ERROR: Failed building wheel for forked
+Failed to build forked
+Collecting forked==1.0
+  Downloading forked-1.0.tar.gz (5 kB)
+  Building wheel for forked (pyproject.toml) ... error
+  ERROR: Failed building wheel for forked
+Failed to build forked

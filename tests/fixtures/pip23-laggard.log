@@ -1,0 +1,22 @@
+Collecting laggard==1.0 (from -r requirements.txt (line 1))
+  Downloading laggard-1.0.tar.gz (12 kB)
+  Installing build dependencies ... done
+  Getting requirements to build wheel ... done
+  Preparing metadata (pyproject.toml) ... done
+Building wheels for collected packages: laggard
+  Building wheel for laggard (pyproject.toml) ... error
+  error: subprocess-exited-with-error
+  
+  × Building wheel for laggard (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [5 lines of output]
+      running bdist_wheel
+      building 'laggard._speedups' extension
+      error: Microsoft Visual C++ 14.0 or greater is required.
+      Failed to build the extension
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for laggard
+Failed to build laggard
+ERROR: Could not build wheels for laggard, which is required to install pyproject.toml-based projects

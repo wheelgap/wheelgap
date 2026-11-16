@@ -1,0 +1,10 @@
+Resolved 3 packages in 210ms
+  [31m×[0m Failed to download and build `[36m[1mnowheels==0.9[0m`
+  [31m├─▶[0m Failed to build `[36m[1mnowheels==0.9[0m`
+  [31m├─▶[0m The build backend returned an error
+  [31m╰─▶[0m Call to `setuptools.build_meta.build_wheel` failed (exit status: 1)
+
+      [31m[stderr][39m
+      error: Microsoft Visual C++ 14.0 or greater is required.
+
+      [36m[1mhint[0m[1m:[0m This usually indicates a problem with the package or the build environment.

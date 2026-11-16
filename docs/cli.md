@@ -16,17 +16,6 @@ can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separat
 `wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.12.0**
 aren't in a release yet.
 
-### `--from-log` {#from-log}
-
-Diagnose a failed pip or uv wheel build from a bounded installation log, or use `-` for stdin:
-
-```bash
-wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
-pip install -r requirements.txt 2>&1 | wheelgap --from-log - -t win-arm64
-```
-
-This recognises pip's `Failed building wheel for NAME` / `Failed to build NAME` messages and uv's `Failed to build \`NAME==VERSION\`` error. It recovers versions from preceding `Collecting NAME==VERSION` lines where possible, then runs `--explain --suggest` to show rejected wheels and alternatives. If a version is absent, it checks the newest available release and notes the limitation on stderr. Unreadable or ambiguous failures are input errors, not guesses. This is a diagnosis of named failures, not a replay of the install or a complete dependency resolution.
-
 ## Targets
 
 ### `-p`, `--python` {#python}
@@ -249,6 +238,32 @@ the package where the input has one. With `--json`, adds `rejected` and `via` to
 combine it with quiet mode. See [Output](output.md#explain).
 
 A wheel that would fit but whose release was yanked is named with the reason `yanked`.
+
+### `--from-log` {#from-log}
+
+**After 0.12.0.** `--from-log FILE` reads the log of a failed `pip install` or uv install (`-` reads stdin), finds the
+packages that failed to build, and checks each one as `--explain --suggest` does: why no wheel fits, and the release
+that has one. The log doesn't say where the install ran, so pass `-p` and `-t` for that machine (or `--dockerfile` for
+a docker build); without them it's an error.
+
+```bash
+wheelgap --from-log install.log -p 3.13 -t win-arm64
+pip install -r requirements.txt 2>&1 | wheelgap --from-log - -p 3.13 -t win-arm64
+```
+
+It reads pip's summary at the end (`Failed to build NAME`, and pip 24.1 and later's `Failed to build installable wheels
+for some pyproject.toml based projects (NAME)`), counting only names pip also printed `Building wheel for NAME` for, and
+uv's ``Failed to build `NAME==VERSION` ``. pip leaves the version out, so it comes from the nearest
+`Collecting NAME==VERSION`, `Downloading` or `Using cached` line before the failure; when the log has none, the newest
+release is checked, with a note. It's an error rather than a guess when a failure line can't be read, when the log
+collects the package again without a version after naming one, when the package came from a URL or a path, or when
+more than 50 packages failed. Colour codes and GitHub Actions timestamps are skipped, a UTF-16 log (PowerShell's `>`)
+is read too, and of a longer log only the last 8 MiB is read.
+
+A note lists the packages the log says failed, and another says when one has a wheel for a checked target after all:
+then the log likely comes from another platform or Python than `-p` and `-t`. `--no-suggest` turns `--suggest` off.
+It takes no other inputs, and can't be combined with `--dist`, `--deps`, `--environment`, `--suggest-targets`,
+`--list-targets` or `--clear-cache`.
 
 ### `--conda-forge` {#conda-forge}
 

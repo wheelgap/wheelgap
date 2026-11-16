@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `--from-log FILE` (or `-` for stdin) reads failed pip and uv wheel-build logs and checks the affected packages with explanations and version suggestions; unrecognised or ambiguous failures are refused rather than guessed. (#424, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
+- `--from-log FILE` (or `-` for stdin) turns a failed `pip install` or uv install log into the answer: it finds the packages that failed to build and checks each with `--explain --suggest` for the Python and platform you name with `-p` and `-t` (both required, as the log doesn't say where it ran), so you see why no wheel fits and the release that has one. The version comes from the log; a failure it can't read, or a version the log leaves unclear, is an error rather than a guess. Logs copied from GitHub Actions (timestamps, colour) and saved by PowerShell (UTF-16) work too. (#424, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 
 ## 0.12.0 (2026-11-16)
 
