@@ -771,6 +771,18 @@ def test_pin_requires_python_reason_only_for_wheels_the_target_fits():
     assert reasons[other] != "requires Python >=3.10"
 
 
+@pytest.mark.parametrize("bad", ["https://[github.com/org/repo/issues", "https://[foo]/"])
+def test_extract_issues_url_skips_a_url_urlsplit_refuses(bad):
+    # A typo in a package's own metadata must not crash --explain: that URL is skipped, the next one is used.
+    assert pypi.extract_issues_url({"Issues": bad, "Bug Tracker": "https://bugs.example.com/p"}) == (
+        "https://bugs.example.com/p"
+    )
+    assert (
+        pypi.extract_issues_url({"Source": bad}, "https://github.com/org/repo") == "https://github.com/org/repo/issues"
+    )
+    assert pypi.extract_issues_url({"Issues": bad}) is None
+
+
 def test_extract_issues_url_issue_tracker_keys():
     assert (
         pypi.extract_issues_url({"Issues": "https://github.com/org/repo/issues"})

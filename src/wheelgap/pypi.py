@@ -329,7 +329,10 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
                 candidate = url.strip()
                 if not candidate:
                     continue
-                parsed = urlsplit(candidate)
+                try:
+                    parsed = urlsplit(candidate)
+                except ValueError:  # "https://[github.com/x": urlsplit refuses a bracketed host; try the next URL
+                    continue
                 # No userinfo: https://github.com@evil.example/ reads as GitHub but opens evil.example.
                 if parsed.scheme == "https" and parsed.netloc and "@" not in parsed.netloc and _plain(candidate):
                     return candidate
@@ -344,7 +347,10 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
         if not cand:
             continue
         candidate = cand.strip()
-        parsed = urlsplit(candidate)
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
         if parsed.scheme == "https" and parsed.netloc.lower() in ("github.com", "www.github.com") and _plain(candidate):
             segments = [s for s in parsed.path.strip("/").split("/") if s]
             if len(segments) >= 2:
