@@ -16,6 +16,17 @@ can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separat
 `wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.12.0**
 aren't in a release yet.
 
+### `--from-log` {#from-log}
+
+Diagnose a failed pip or uv wheel build from a bounded installation log, or use `-` for stdin:
+
+```bash
+wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
+pip install -r requirements.txt 2>&1 | wheelgap --from-log - -t win-arm64
+```
+
+This recognises pip's `Failed building wheel for NAME` / `Failed to build NAME` messages and uv's `Failed to build \`NAME==VERSION\`` error. It recovers versions from preceding `Collecting NAME==VERSION` lines where possible, then runs `--explain --suggest` to show rejected wheels and alternatives. If a version is absent, it checks the newest available release and notes the limitation on stderr. Unreadable or ambiguous failures are input errors, not guesses. This is a diagnosis of named failures, not a replay of the install or a complete dependency resolution.
+
 ## Targets
 
 ### `-p`, `--python` {#python}

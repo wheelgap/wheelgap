@@ -51,6 +51,9 @@ wheelgap -p 3.14t -t all
 # Several Pythons at once, Linux on both architectures
 wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
+# Diagnose failed pip or uv wheel builds (after 0.12.0)
+wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
+
 # Resolve a version range separately for each Python
 wheelgap "numpy>=1.26,<3" -p 3.9,3.13 -t linux
 

@@ -41,6 +41,7 @@ from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
+from .install_log import failed_builds, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -240,6 +241,12 @@ def make_parser() -> argparse.ArgumentParser:
         "--clear-cache",
         action="store_true",
         help="delete the cache of pinned package lookups first; with no INPUT, do only that",
+    )
+    p.add_argument(
+        "--from-log",
+        metavar="FILE",
+        help="read pip/uv failed wheel builds from FILE (or - for stdin), then check their wheels with --explain "
+        "and --suggest",
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
@@ -1559,6 +1566,11 @@ def _main(argv: list[str]) -> int:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
+    if args.from_log is not None:
+        if args.inputs or args.dist or args.deps:
+            parser.error("--from-log takes a pip/uv log instead of package inputs, --dist or --deps")
+        args.explain = True
+        args.suggest = True
     if args.suggest_targets is not None:
         if args.markdown:
             parser.error("--suggest-targets has no Markdown form (use --json)")
@@ -1717,7 +1729,21 @@ def _main(argv: list[str]) -> int:
                 )
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
-        sources = [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+        if args.from_log is not None:
+            specs, unpinned = failed_builds(read_log(args.from_log))
+            sources = load_inputs(specs, args.environment)
+            sources[0].label = f"install log: {args.from_log}"
+            if not quiet:
+                for name in unpinned:
+                    print(
+                        f"wheelgap: note: no version found for {name} in the install log; checking the newest "
+                        "available release instead",
+                        file=sys.stderr,
+                    )
+        else:
+            sources = (
+                [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+            )
         for source in sources:
             if source.passed_over is not None and not quiet:
                 print(
