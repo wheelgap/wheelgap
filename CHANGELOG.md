@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--deps` now evaluates environment markers on requirements-file constraints separately for each target, so marked constraints apply only where their conditions hold without blocking other targets. (#425, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 - `--explain`'s issue tracker link now also finds labels spelled `Issue-Tracker`, `Bug-Tracker`, `bugtracker`, `issue_tracker` or `GitHub: issues`: `project_urls` labels are normalised as PyPI normalises its well-known labels (PEP 753) before matching. A label that only contains "issues", such as `Known issues`, still doesn't count. (#417, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `--deps` now caches each wheel's metadata file (its `Requires-Dist`) on disk for 24 hours, like pinned lookups, so a repeat run asks PyPI only for the release lists. `--no-cache` skips it, `--online` asks again, failed reads aren't cached, and the Python API doesn't use it. (#408, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `--explain` now links each gap to the package's issue tracker from PyPI metadata (`ask for a wheel: <url>`), only for packages whose index is known to be PyPI. `--json --explain` includes an additive `issues_url` per package. (#407, thanks [@dianatofficial](https://github.com/dianatofficial))

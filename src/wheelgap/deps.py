@@ -393,7 +393,12 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     deps_paths: dict[Target, dict[int, list[str]]] = {}
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] = {}
     for target in targets:
-        tree = resolver.resolve(roots, target, constraints=source.constraint_specs)
+        constraints = {key: set(specs) for key, specs in source.constraint_specs.items()}
+        for key, entries in source.marker_constraint_specs.items():
+            for marker, specifier in entries:
+                if marker_holds(marker, target):
+                    constraints.setdefault(key, set()).add(specifier)
+        tree = resolver.resolve(roots, target, constraints=constraints)
         reach: dict[int, list[str]] = {}
         direct: dict[int, tuple[str, ...]] = {}
         direct_names = _direct_roots(tree, roots, resolver, target)

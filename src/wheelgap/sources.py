@@ -193,6 +193,8 @@ class Source:
     compiled: bool = False
     # A requirements file's -c constraints as clean index specifiers (key -> specifiers), for --deps to seed.
     constraint_specs: dict[str, set[str]] = field(default_factory=dict)
+    # Environment marker-bearing constraints apply per target during --deps resolution.
+    marker_constraint_specs: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     # A requirements file's constraint problems (a marker, a non-index constraint, conflicting pins): the
     # resolved package gets the error, as the requirement's own row does without --deps.
     constraint_errors: dict[str, str] = field(default_factory=dict)
@@ -1469,6 +1471,7 @@ def parse_requirements(path: Path) -> Source:
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
     constraint_specs: dict[str, set[str]] = {}
+    marker_constraint_specs: dict[str, list[tuple[str, str]]] = {}
     constraint_errors: dict[str, str] = {}
     for pkg in pkgs:
         if pkg.skip or pkg.version or not (entries := by_name.get(pkg.key)):
@@ -1487,22 +1490,29 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-        if pkg.error:
+        if (
+            pkg.error
+            and pkg.error != "constraint has an environment marker; target-dependent constraints aren't supported"
+        ):
             constraint_errors[pkg.key] = pkg.error
     # A constraint on a package the file doesn't require only ever counts as a transitive dep's specifier,
     # which --deps sees; a constraint the file already called out as broken is left to constraint_errors.
     deps_blockers: list[str] = []
     for entry in constraints:
-        # pip applies these only on some targets, or installs from elsewhere; --deps can't follow that yet.
-        if entry.markers:
-            deps_blockers.append(f"the constraint on {entry.name} has a marker")
-        elif entry.skip:
+        # URL/path constraints remain unfollowable; marker constraints apply per target in deps.py.
+        if entry.skip:
             deps_blockers.append(f"the constraint on {entry.name} isn't an index release ({entry.skip})")
-        if entry.markers or entry.skip or entry.key in constraint_errors:
+            continue
+        if entry.key in constraint_errors:
             continue
         # A bare name constrains nothing; a version or range does.
         if specifier := f"=={entry.version}" if entry.version else entry.spec:
-            constraint_specs.setdefault(entry.key, set()).add(specifier)
+            if entry.markers:
+                marker_constraint_specs.setdefault(entry.key, []).extend(
+                    (marker, specifier) for marker in entry.markers
+                )
+            else:
+                constraint_specs.setdefault(entry.key, set()).add(specifier)
     for pkg in pkgs:
         if not pkg.skip:
             pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
@@ -1514,6 +1524,7 @@ def parse_requirements(path: Path) -> Source:
         specs=req_lines,
         compiled="hash" in compiler_signs,  # hash mode makes pip refuse anything unpinned: the file is complete
         constraint_specs=constraint_specs,
+        marker_constraint_specs=marker_constraint_specs,
         constraint_errors=constraint_errors,
         format_control=format_control,
         deps_blockers=deps_blockers + [f"{key}: {error}" for key, error in constraint_errors.items()],

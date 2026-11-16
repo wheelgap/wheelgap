@@ -469,7 +469,6 @@ def test_requirements_with_via_comments_but_no_hashes_are_still_resolved(index, 
 @pytest.mark.parametrize(
     ("constraint", "message"),
     [
-        ('crypt<2; python_version < "3.15"', "the constraint on crypt has a marker"),
         ("crypt @ https://example.invalid/crypt-1.0.tar.gz", "the constraint on crypt isn't an index release"),
     ],
 )
@@ -666,3 +665,41 @@ def test_deps_json_explain_has_issues_url_for_a_transitive_gap(crypt_issues, cap
     assert rows["crypt"]["via"] == {"win-arm64": ["app", "lib", "crypt"]}
     assert rows["crypt"]["issues_url"] == "https://github.com/example/crypt/issues"
     assert rows["lib"]["issues_url"] is None  # publishes no tracker and isn't on GitHub
+
+
+def test_requirements_deps_applies_marker_constraints_per_target(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text(
+        'c<2; sys_platform == "win32"\nunused<2; sys_platform == "win32"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\na\n", encoding="utf-8")
+    code = main(
+        [
+            str(tmp_path / "requirements.txt"),
+            "--deps",
+            "-p",
+            "3.14",
+            "-t",
+            "win-arm64",
+            "-t",
+            "linux-x86_64",
+            "--json",
+            "--no-cache",
+        ]
+    )
+    data = json.loads(capsys.readouterr().out)
+    by_version = {p["version"]: p["results"] for p in data["packages"] if p["name"] == "c"}
+    assert set(by_version) == {"1.5", "2.0"}
+    assert by_version["1.5"]["win-arm64"] != "n/a"
+    assert by_version["1.5"]["linux-x86_64"] == "n/a"
+    assert by_version["2.0"]["linux-x86_64"] != "n/a"
+    assert by_version["2.0"]["win-arm64"] == "n/a"
+    assert "unused" not in {p["name"] for p in data["packages"]}
+    assert code == 0
+
+
+def test_requirements_deps_marker_constraint_without_installed_package_is_harmless(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text('unused==999; sys_platform == "win32"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\na\n", encoding="utf-8")
+    assert main([str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]) == 0
+    assert "can't follow" not in capsys.readouterr().err

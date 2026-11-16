@@ -249,6 +249,8 @@ root, and the whole tree it installs is checked per target. Constraint files and
 apply to the resolved packages too. A fully pinned file that already lists what it installs (`pip-compile` output
 with `--hash` lines or `# via` comments) needs no resolving: wheelgap says so and checks it as written.
 
+With `--deps`, a constraint with an environment marker applies only to matching targets. For example, `urllib3<2; python_version < "3.12"` constrains Python 3.11 but not Python 3.14. Constraints for packages not in the installed tree impose nothing. Direct URL constraints remain unsupported.
+
 ## pyproject.toml
 
 Libraries usually don't commit a lockfile. Pass the library's `pyproject.toml` to check the dependencies it declares
