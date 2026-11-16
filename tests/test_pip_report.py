@@ -120,7 +120,8 @@ def test_report_rejects_malformed_and_ambiguous_data(tmp_path, payload, part):
 def test_report_too_deeply_nested_is_an_input_error(tmp_path):
     path = tmp_path / "report.json"
     path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
-    with pytest.raises(SourceError, match="invalid pip installation report"):
+    # Some Pythons' json raises RecursionError here and some parse it; either way it's an input error, not a crash.
+    with pytest.raises(SourceError, match="invalid pip installation report|isn't a pip installation report"):
         load_inputs([str(path)])
 
 
