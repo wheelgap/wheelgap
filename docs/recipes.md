@@ -409,7 +409,7 @@ gaps: fastlib, nativeext, puresdist
 
 ## Installing from the gap wheel index
 
-The [gap wheel index](https://wheelgap.github.io/tracker/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. Its current coverage is Windows on ARM with CPython 3.14 and free-threaded 3.14t; Linux wheels are not published yet. Check the index page for the latest coverage.
+The [gap wheel index](https://wheelgap.github.io/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. Its current coverage is Windows on ARM with CPython 3.14 and free-threaded 3.14t; Linux wheels are not published yet. Check the index page for the latest coverage.
 
 Use pip for this partial index. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) limits a package to candidates from the first index that contains it, which can hide PyPI versions when an extra index only contains selected wheels.
 
@@ -422,7 +422,7 @@ jobs:
   install:
     runs-on: windows-11-arm
     env:
-      PIP_EXTRA_INDEX_URL: https://wheelgap.github.io/tracker/wheels/simple/
+      PIP_EXTRA_INDEX_URL: https://wheelgap.github.io/wheels/simple/
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -442,5 +442,5 @@ Docker images are Linux, and the index has no Linux wheels yet, so it doesn't he
 Put the setting in the project's `requirements.txt`, so it applies to that project only:
 
 ```text
---extra-index-url https://wheelgap.github.io/tracker/wheels/simple/
+--extra-index-url https://wheelgap.github.io/wheels/simple/
 ```
