@@ -4,6 +4,7 @@ metadata. A fake JSON API serves each project page and each release page with it
 import json
 import re
 import urllib.error
+from collections import Counter
 
 import pytest
 from packaging.requirements import Requirement
@@ -469,8 +470,10 @@ def test_requirements_with_via_comments_but_no_hashes_are_still_resolved(index, 
 @pytest.mark.parametrize(
     ("constraint", "message"),
     [
-        ('crypt<2; python_version < "3.15"', "the constraint on crypt has a marker"),
         ("crypt @ https://example.invalid/crypt-1.0.tar.gz", "the constraint on crypt isn't an index release"),
+        # No target fixes these, so whether pip applies the constraint is unknown: refuse rather than apply it.
+        ('crypt<2; platform_release >= "5"', 'can\'t tell whether the constraint `crypt<2; platform_release >= "5"`'),
+        ('crypt<2; platform_version == "x"', "applies on 3.14 win-arm64"),
     ],
 )
 def test_requirements_deps_refuses_constraints_it_cant_follow(index, capsys, tmp_path, constraint, message):
@@ -546,6 +549,31 @@ def test_deps_direct_origins_preserve_roots_across_multiple_targets(index, capsy
     assert code == 1
     assert "crypt (via parenta +1)" in out
     assert index
+
+
+@pytest.mark.parametrize("target", [WIN, LIN])
+def test_direct_roots_reads_shared_requirements_once_per_target(index, monkeypatch, target):
+    monkeypatch.setitem(INDEX, "third", {"1.0": release(["lib[crypto]>=1"])})
+    roots = [Requirement(name) for name in ("app", "plain", "third")]
+    resolver = Resolver()
+    tree = resolver.resolve(roots, target)
+    calls = Counter()
+    original = resolver.requires
+
+    def requires(key, version, requested_target):
+        calls[key, version, requested_target] += 1
+        return original(key, version, requested_target)
+
+    monkeypatch.setattr(resolver, "requires", requires)
+    owners = deps._direct_roots(tree, roots, resolver, target)
+
+    assert owners["lib"] == ("app", "plain", "third")
+    assert owners["crypt"] == ("app", "third")  # plain does not request lib's crypto extra
+    if target == WIN:
+        assert owners["winonly"] == ("app", "plain", "third")
+    else:
+        assert "winonly" not in owners
+    assert calls == Counter({(key, version, target): 1 for key, version in tree.chosen.items()})
 
 
 def test_wheel_metadata_is_cached_on_disk_between_runs(index):
@@ -666,3 +694,84 @@ def test_deps_json_explain_has_issues_url_for_a_transitive_gap(crypt_issues, cap
     assert rows["crypt"]["via"] == {"win-arm64": ["app", "lib", "crypt"]}
     assert rows["crypt"]["issues_url"] == "https://github.com/example/crypt/issues"
     assert rows["lib"]["issues_url"] is None  # publishes no tracker and isn't on GitHub
+
+
+def test_requirements_deps_applies_marker_constraints_per_target(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text(
+        'c<2; sys_platform == "win32"\nunused<2; sys_platform == "win32"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\na\n", encoding="utf-8")
+    code = main(
+        [
+            str(tmp_path / "requirements.txt"),
+            "--deps",
+            "-p",
+            "3.14",
+            "-t",
+            "win-arm64",
+            "-t",
+            "linux-x86_64",
+            "--json",
+            "--no-cache",
+        ]
+    )
+    data = json.loads(capsys.readouterr().out)
+    by_version = {p["version"]: p["results"] for p in data["packages"] if p["name"] == "c"}
+    assert set(by_version) == {"1.5", "2.0"}
+    assert by_version["1.5"]["win-arm64"] != "n/a"
+    assert by_version["1.5"]["linux-x86_64"] == "n/a"
+    assert by_version["2.0"]["linux-x86_64"] != "n/a"
+    assert by_version["2.0"]["win-arm64"] == "n/a"
+    assert "unused" not in {p["name"] for p in data["packages"]}
+    assert code == 0
+
+
+def test_requirements_deps_marker_constraint_without_installed_package_is_harmless(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text('unused==999; sys_platform == "win32"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\na\n", encoding="utf-8")
+    assert main([str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]) == 0
+    assert "can't follow" not in capsys.readouterr().err
+
+
+def _c_versions(capsys, tmp_path, constraints, requirements="a", targets=("win-arm64", "linux-x86_64")):
+    (tmp_path / "constraints.txt").write_text(constraints, encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text(f"-c constraints.txt\n{requirements}\n", encoding="utf-8")
+    args = [str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "--json", "--no-cache", "--all"]
+    assert main([*args, *(a for t in targets for a in ("-t", t))]) == 0
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    return {t: next(p["version"] for p in rows if p["name"] == "c" and p["results"][t] != "n/a") for t in targets}
+
+
+def test_requirements_deps_marker_constraint_on_an_extra_never_applies(index, capsys, tmp_path):
+    # pip evaluates a constraint's marker with extra == "", so this constraint never holds.
+    assert _c_versions(capsys, tmp_path, 'c<2; extra == "s3"\n') == {"win-arm64": "2.0", "linux-x86_64": "2.0"}
+
+
+def test_requirements_deps_undecidable_marker_on_a_package_not_installed_is_harmless(index, capsys, tmp_path):
+    assert _c_versions(capsys, tmp_path, 'unused<2; platform_release >= "5"\n') == {
+        "win-arm64": "2.0",
+        "linux-x86_64": "2.0",
+    }
+
+
+def test_requirements_deps_refuses_platform_machine_where_the_target_doesnt_fix_it(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text('c<2; platform_machine == "armv7l"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\na\n", encoding="utf-8")
+    args = [str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "--no-cache"]
+    assert main([*args, "-t", "linux-aarch64"]) == 0  # aarch64 decides it: the constraint doesn't apply
+    capsys.readouterr()
+    assert main([*args, "-t", "linux-armv7l"]) == 2
+    assert 'can\'t tell whether the constraint `c<2; platform_machine == "armv7l"`' in capsys.readouterr().err
+
+
+def test_requirements_deps_applies_a_marker_constraint_to_a_direct_requirement(index, capsys, tmp_path):
+    versions = _c_versions(capsys, tmp_path, 'c<2; sys_platform == "win32"\n', requirements="c")
+    assert versions == {"win-arm64": "1.5", "linux-x86_64": "2.0"}
+
+
+def test_requirements_deps_marker_constraint_doesnt_hide_conflicting_pins(index, capsys, tmp_path):
+    (tmp_path / "constraints.txt").write_text('c==1.0\nc==1.5\nc<2; sys_platform == "win32"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-c constraints.txt\nc\n", encoding="utf-8")
+    assert main([str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]) == 2
+    assert "c: constraints specify conflicting exact versions" in capsys.readouterr().err

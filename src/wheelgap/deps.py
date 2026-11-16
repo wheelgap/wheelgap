@@ -31,7 +31,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from . import cache, pypi
-from .check import SDIST_SUFFIXES, marker_holds, rejection
+from .check import SDIST_SUFFIXES, marker_holds, marker_value, rejection
 from .sources import Package, Source, SourceError
 from .targets import Target
 
@@ -344,11 +344,14 @@ def _direct_roots(
 
     Traverse each root's active extras independently. A shared package requested with an
     extra by one root must not make its optional dependencies look like the other root's.
-    Metadata is cached by Resolver.requires from the resolution pass.
+    Cache the raw requirements here too: Resolver.requires caches metadata, but still
+    filters a release's wheels on every call. The target and chosen versions are fixed
+    for this walk; extras and markers are evaluated independently for each owner below.
     """
     owners: dict[str, dict[str, str]] = {}
     direct: set[str] = set()
     seen: dict[tuple[str, str], frozenset[str]] = {}
+    requirements: dict[str, list[Requirement]] = {}
     queue: deque[tuple[Requirement, frozenset[str], str, str]] = deque()
     for root in roots:
         if root.marker is not None and not marker_holds(str(root.marker), target):
@@ -374,10 +377,11 @@ def _direct_roots(
         if key in tree.errors:
             continue
         try:
-            requirements = resolver.requires(key, tree.chosen[key], target)
+            if key not in requirements:
+                requirements[key] = resolver.requires(key, tree.chosen[key], target)
         except Exception:
             continue  # Resolver already recorded the metadata error; hints must not change results
-        queue.extend((child, seen[state], owner, label) for child in requirements)
+        queue.extend((child, seen[state], owner, label) for child in requirements[key])
     return {key: tuple(labels.values()) for key, labels in owners.items() if key not in direct}
 
 
@@ -393,7 +397,23 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     deps_paths: dict[Target, dict[int, list[str]]] = {}
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] = {}
     for target in targets:
-        tree = resolver.resolve(roots, target, constraints=source.constraint_specs)
+        # pip evaluates a constraint's marker with `extra` as "" (no extras), so `; extra == "s3"` never applies.
+        constraints = {key: set(specs) for key, specs in source.constraint_specs.items()}
+        undecided: dict[str, str] = {}
+        for key, entries in source.marker_constraint_specs.items():
+            for marker, specifier in entries:
+                holds = marker_value(marker, target, extras=frozenset())
+                if holds:
+                    constraints.setdefault(key, set()).add(specifier)
+                elif holds is None:
+                    undecided.setdefault(key, f"{key}{specifier}; {marker}")
+        tree = resolver.resolve(roots, target, constraints=constraints)
+        # A constraint on a package the tree doesn't install imposes nothing, whether or not its marker holds.
+        if reached := [text for key, text in undecided.items() if key in tree.paths]:
+            raise DepsError(
+                f"{source.label}: --deps can't tell whether the constraint `{reached[0]}` applies on "
+                f"{target.label(True)}, so check a lockfile instead (pip-compile, or uv pip compile)"
+            )
         reach: dict[int, list[str]] = {}
         direct: dict[int, tuple[str, ...]] = {}
         direct_names = _direct_roots(tree, roots, resolver, target)

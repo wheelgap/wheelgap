@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--deps` on a requirements file no longer refuses a constraint file with environment markers (`urllib3<2; python_version < "3.10"`), such as OpenStack's upper-constraints: each marked constraint applies on the targets where pip would apply it, and `extra == "..."` never holds on a constraint, as in pip. A marker a target can't decide (`platform_release`, `platform_version`, or `platform_machine` on a target like `linux-armv7l`) on a package the tree installs still stops the run with an error, as a URL constraint does. (#425, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 - wheelgap now reads a pip installation report (`pip install --dry-run --report report.json`) and checks exactly the packages pip resolved, without installing them. A report holds what pip resolved for the machine it ran on, so wheelgap checks it only on that target (same platform, machine, Python and implementation) and refuses any other, since another target can install other packages. Packages pip didn't get from PyPI (VCS checkouts, local paths, direct URLs, another index) are skipped, and a report whose packages all came from a mirror such as Artifactory or devpi is an error, not an empty pass. (#423, thanks [@AdityaSreevatsaK](https://github.com/AdityaSreevatsaK))
 
 ## 0.12.0 (2026-11-16)

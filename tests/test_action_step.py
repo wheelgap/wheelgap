@@ -512,6 +512,82 @@ def build_dist(work, *names):
         (work / "dist" / name).write_bytes(b"")
 
 
+@pytest.fixture
+def record_step(run_step):
+    """Record exact argv and control both exit codes, without running wheelgap."""
+    pipx = run_step.work.parent / "stubs" / "pipx"
+    pipx.write_text(
+        f"""#!/bin/bash
+env | grep -q {TOKEN} && echo pipx >> "$LEAK_FILE"
+exec "$PYTHON_REAL" -c '
+import json
+import os
+import sys
+with open(os.environ["PIPX_LOG"], "a", encoding="utf-8") as log:
+    print(json.dumps(sys.argv[1:]), file=log)
+if "--markdown" in sys.argv[5:]:
+    print(os.environ.get("STEP_REPORT", "### wheelgap\\n\\nA report."))
+    sys.exit(int(os.environ.get("STEP_SUMMARY_CODE", "0")))
+sys.exit(int(os.environ.get("STEP_CHECK_CODE", "0")))
+' "$@"
+""",
+        encoding="utf-8",
+    )
+    return run_step
+
+
+@pytest.mark.parametrize("code", [0, 1, 2])
+def test_lockfile_step_preserves_arguments_and_check_exit_code(record_step, code):
+    r = record_step(WHEELGAP_ARGS="uv.lock -p 3.13 -t linux-aarch64", STEP_CHECK_CODE=str(code))
+    prefix = ["run", "--spec", str(ROOT), "wheelgap"]
+    args = ["uv.lock", "-p", "3.13", "-t", "linux-aarch64"]
+    calls = [json.loads(line) for line in r["pipx"]]
+    assert calls[0] == prefix + ["--github-annotations"] + args
+    assert r["code"] == code
+    if code <= 1:
+        assert calls[1:] == [prefix + ["--markdown", "--no-quiet", "--exit-zero"] + args]
+        assert r["summary"] == "### wheelgap\n\nA report.\n"
+    else:
+        assert len(calls) == 1 and r["summary"] == ""
+
+
+def test_diff_step_keeps_the_subcommand_first_without_annotations(record_step):
+    r = record_step(WHEELGAP_ARGS="diff base.lock head.lock", STEP_CHECK_CODE="1")
+    prefix = ["run", "--spec", str(ROOT), "wheelgap"]
+    args = ["diff", "base.lock", "head.lock"]
+    assert [json.loads(line) for line in r["pipx"]] == [
+        prefix + args,
+        prefix + ["--markdown", "--no-quiet", "--exit-zero"] + args,
+    ]
+    assert r["code"] == 1 and r["summary"].startswith("### wheelgap\n")
+
+
+def test_lockfile_step_splits_and_expands_globs_before_both_runs(record_step):
+    for name in ["b.lock", "a.lock", "my lock.lock", "unrelated.txt"]:
+        (record_step.work / name).write_bytes(b"")
+    r = record_step(WHEELGAP_ARGS="*.lock\t-p  3.13\n-t linux-aarch64")
+    args = ["a.lock", "b.lock", "my lock.lock", "-p", "3.13", "-t", "linux-aarch64"]
+    prefix = ["run", "--spec", str(ROOT), "wheelgap"]
+    assert [json.loads(line) for line in r["pipx"]] == [
+        prefix + ["--github-annotations"] + args,
+        prefix + ["--markdown", "--no-quiet", "--exit-zero"] + args,
+    ]
+    assert r["code"] == 0
+
+
+@pytest.mark.parametrize("report", ["", "usage: wheelgap ...", "0.11.0", "linux-aarch64", "not a report\n### wheelgap"])
+def test_lockfile_step_does_not_append_non_report_output(record_step, report):
+    r = record_step(WHEELGAP_ARGS="uv.lock", STEP_REPORT=report)
+    assert len(r["pipx"]) == 2
+    assert r["code"] == 0 and r["summary"] == ""
+
+
+def test_lockfile_step_ignores_a_failed_summary_run(record_step):
+    r = record_step(WHEELGAP_ARGS="uv.lock", STEP_CHECK_CODE="1", STEP_SUMMARY_CODE="2")
+    assert len(r["pipx"]) == 2
+    assert r["code"] == 1 and r["summary"] == ""
+
+
 def test_dist_fails_the_job_on_a_dropped_platform(run_step):
     build_dist(
         run_step.work,
