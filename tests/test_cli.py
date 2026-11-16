@@ -3896,3 +3896,19 @@ def test_poetry_extra_edge_credits_nobody(capsys, tmp_path, fake_pypi):
     )
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
     assert "via plain" not in out
+
+
+def test_explain_issues_url_once_per_release(capsys, fake_pypi):
+    args = ("gapwithissues==1.0", "-p", "3.12,3.13", "-t", "linux-x86_64,linux-aarch64", "--explain")
+    code, out, _ = run(capsys, *args)
+    assert code == 1
+    assert out.count("ask for a wheel: https://github.com/example/gapwithissues/issues") == 1
+
+
+def test_explain_issues_url_survives_the_cache_with_two_pythons(capsys, fake_pypi):
+    # With several Pythons the metadata lands on per-Python copies; the cached rerun must still show the link.
+    args = ("gapwithissues==1.0", "-p", "3.12,3.13", "-t", "linux-x86_64", "--explain")
+    for _ in range(2):  # the second run reads the pinned release from the lookup cache
+        code, out, _err = run(capsys, *args)
+        assert code == 1
+        assert "ask for a wheel: https://github.com/example/gapwithissues/issues" in out

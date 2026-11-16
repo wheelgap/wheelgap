@@ -277,6 +277,11 @@ def fetch_releases(key: str, timeout: float = 10.0, deadline: float | None = Non
     return releases
 
 
+def _plain(url: str) -> bool:
+    """Printable ASCII with no spaces: nothing a terminal would act on, nothing that splits the line."""
+    return url.isascii() and url.isprintable() and " " not in url
+
+
 _ISSUE_KEYS = ("issues", "issue tracker", "bug tracker", "tracker", "bugs", "bug reports", "issue reports")
 _REPO_KEYS = ("source", "source code", "code", "repository", "homepage", "home")
 
@@ -286,7 +291,8 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
 
     Reads `project_urls` case-insensitively, preferring issue tracker keys (Issues, Bug Tracker, Tracker).
     Falls back to a GitHub Source/Homepage URL with `/issues` added.
-    Refuses any URL that is not an https:// URL.
+    Refuses any URL that is not an https:// URL, and any with a character that isn't printable ASCII: the URL comes
+    from the package's own metadata and is printed to a terminal, where an escape sequence could rewrite the output.
     """
     lower_urls: dict[str, str] = {}
     if project_urls and isinstance(project_urls, dict):
@@ -299,7 +305,8 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
                 if not candidate:
                     continue
                 parsed = urlsplit(candidate)
-                if parsed.scheme == "https" and parsed.netloc and not any(c.isspace() for c in candidate):
+                # No userinfo: https://github.com@evil.example/ reads as GitHub but opens evil.example.
+                if parsed.scheme == "https" and parsed.netloc and "@" not in parsed.netloc and _plain(candidate):
                     return candidate
 
     repo_candidates: list[str] = []
@@ -314,11 +321,7 @@ def extract_issues_url(project_urls: dict[str, str] | None, homepage: str | None
             continue
         candidate = cand.strip()
         parsed = urlsplit(candidate)
-        if (
-            parsed.scheme == "https"
-            and parsed.netloc.lower() in ("github.com", "www.github.com")
-            and not any(c.isspace() for c in candidate)
-        ):
+        if parsed.scheme == "https" and parsed.netloc.lower() in ("github.com", "www.github.com") and _plain(candidate):
             segments = [s for s in parsed.path.strip("/").split("/") if s]
             if len(segments) >= 2:
                 owner, repo = segments[0], segments[1].removesuffix(".git")
@@ -854,7 +857,9 @@ def fill(
     valid = not any(p.error for p in pkg.variants) and isinstance(data, dict) and isinstance(data.get("urls"), list)
     if key and write_cache and cached is None and valid:
         cache.save_files(*key, _files(data["urls"]))
-        cache.save_project_urls(*key, pkg.project_urls, pkg.home_page)
+        # With several Pythons the metadata lands on the per-Python copies, not on pkg itself.
+        has = next((p for p in (pkg, *pkg.variants) if p.project_urls or p.home_page), pkg)
+        cache.save_project_urls(*key, has.project_urls, has.home_page)
     return pkg
 
 

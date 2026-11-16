@@ -329,7 +329,9 @@ def fake_pypi(monkeypatch, tracker):
 def _simple_files(name):
     """Every file of every version in one flat list, like a PEP 691 project page."""
     files = []
-    for fs in FAKE_INDEX[name].values():
+    for version, fs in FAKE_INDEX[name].items():
+        if version.startswith("_"):  # _project_urls, _home_page: metadata, not a release
+            continue
         for f in fs:
             entry = f if isinstance(f, dict) else {"filename": f}
             item = {

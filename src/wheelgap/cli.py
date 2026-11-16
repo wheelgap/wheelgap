@@ -751,7 +751,6 @@ def render_explain(
     suggestions: Suggestions | None = None,
     builds: RowBuilds | None = None,
     issues_urls: dict[int, str | None] | None = None,
-    markdown: bool = False,
 ) -> list[str]:
     """`conda_forge`: --conda-forge hints, `build_info`: --build-info answers and `suggestions`: --suggest's, by id()
     of the row's package. `notes` and `builds` (the tracker's build lab results): --notes, by id() of the row."""
@@ -762,6 +761,7 @@ def render_explain(
         info = (build_info or {}).get(id(r.package))
         sources = source_targets(r, targets)
         needs = describe(info, sources) if info and sources else None
+        ask = (issues_urls or {}).get(id(r.package))  # once per release, under its first gap
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -786,9 +786,9 @@ def render_explain(
                 only_binary=r.package.only_binary,
             )
             out += [f"  {line}" for line in lines]
-            if issues_urls and (url := issues_urls.get(id(r.package))):
-                rendered_url = _md(url) if markdown else url
-                out.append(f"  ask for a wheel: {rendered_url}")
+            if ask:
+                out.append(f"  ask for a wheel: {ask}")
+                ask = None
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
             out += [condaforge.hint_text(r.package, h, multi_py), ""]
@@ -1256,8 +1256,7 @@ def render_markdown(
             notes,
             build_info,
             builds=builds,
-            issues_urls=issues_urls,
-            markdown=True,
+            issues_urls=issues_urls,  # inside the fence below, so shown exactly, with no escaping
         )
         fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
         out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]

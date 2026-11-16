@@ -798,6 +798,23 @@ def test_extract_issues_url_github_fallback():
     assert pypi.extract_issues_url(None, homepage="https://github.com/org/repo") == "https://github.com/org/repo/issues"
 
 
+def test_extract_issues_url_refuses_control_characters():
+    # The URL comes from the package's metadata and is printed to a terminal: no escape sequences, no line breaks.
+    for bad in (
+        "https://github.com/org/repo/issues\x1b[2J",
+        "https://bugs.example.com/\x07",
+        "https://ex.com/a\nb",
+        "https://ex.com/\u202eevil",
+    ):
+        assert pypi.extract_issues_url({"Issues": bad}) is None, bad
+    assert pypi.extract_issues_url({"Source": "https://github.com/org/repo\x1b]8;;"}) is None
+
+
+def test_extract_issues_url_refuses_userinfo():
+    assert pypi.extract_issues_url({"Issues": "https://github.com@evil.example/x"}) is None
+    assert pypi.extract_issues_url({"Issues": "https://user:pass@bugs.example.com/"}) is None
+
+
 def test_extract_issues_url_rejects_insecure_and_invalid():
     assert pypi.extract_issues_url({"Issues": "http://insecure.example.com/issues"}) is None
     assert pypi.extract_issues_url({"Source": "http://github.com/org/repo"}) is None
