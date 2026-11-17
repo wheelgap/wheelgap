@@ -796,9 +796,10 @@ def test_deps_json_explain_direct_extra_only_names_the_requester(index, capsys):
     assert crypt["direct"] == {"win-arm64": ["app"]}
 
 
-def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(index, monkeypatch, capsys):
-    # #453: "flaky" can't be looked up, so it's unknown, but the table still names what pulls it in.
+def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(index, monkeypatch, capsys, tmp_path):
+    # #453: "flaky" can't be looked up, so it's unknown, but the table and --junit still name what pulls it in.
     monkeypatch.setitem(INDEX, "usesflaky", {"1.0": release(["flaky"])})
+    monkeypatch.setitem(INDEX, "alsoflaky", {"1.0": release(["flaky"])})
     fetch_json = pypi.fetch_json
 
     def failing(url, *args, **kwargs):
@@ -816,6 +817,13 @@ def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(inde
         args = ["usesflaky", "c", "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache", "--color", "never"]
         assert main([*args, *display]) == 1
         assert "flaky (via usesflaky)" in capsys.readouterr().out
+    report = tmp_path / "report.xml"
+    assert main([*args, "--junit", str(report)]) == 1
+    capsys.readouterr()
+    assert "(via usesflaky)" in report.read_text(encoding="utf-8")
+    both = [Requirement("usesflaky"), Requirement("alsoflaky")]
+    tree = resolver.resolve(both, WIN)
+    assert sorted(deps._direct_roots(tree, both, resolver, WIN)["flaky"]) == ["alsoflaky", "usesflaky"]
 
 
 def test_diff_deps_detects_a_new_transitive_gap_on_upgrade(index, monkeypatch, capsys):
