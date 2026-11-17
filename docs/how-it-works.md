@@ -138,6 +138,11 @@ Each flag then adds its own limits:
   `offline = true`).
 - **`--notes`** takes the recorded-index route only from `uv.lock` and `pylock.toml`, and is off with `--offline`
   (or `offline = true`).
+- **`--fix`** follows the rule as it is, with a note naming the packages it didn't check, and is refused with
+  `--offline` (or `offline = true`). It sends no names at all, but it suggests installing from another index, so the
+  rule decides which packages it may suggest that for. The settings it can't read matter more here: pip treats every
+  index alike, so with a private index in `pip.conf` a private package with the same name and version as one on the
+  gap wheel index could install the gap wheel. Don't follow its pip advice in that setup.
 - **`--build-info`** is off for the whole run when an environment variable above is set, as well as with
   `--offline`. When the lock records an sdist URL (`uv.lock`, `pylock.toml`), it downloads from that URL only if it's
   on `files.pythonhosted.org` and names that release's sdist, checked against the lock's sha256; otherwise there's no

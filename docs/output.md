@@ -328,13 +328,18 @@ explicit = true
 [tool.uv.sources]
 tokenizers = { index = "wheelgap" }
 
-tokenizers comes in through transformers; uv only applies [tool.uv.sources] to direct dependencies, so also add "tokenizers" to [project] dependencies.
+tokenizers comes in through transformers; uv only applies [tool.uv.sources] to direct dependencies, so also list "tokenizers" where transformers is (the same dependencies, dependency group or extra).
+If pyproject.toml already has a [tool.uv.sources] table, add these lines to it instead of a second one.
 
 How these wheels are built and checked: https://wheelgap.github.io/wheels/
 ```
 
-Other inputs get the `--extra-index-url https://wheelgap.github.io/wheels/simple/` line for a requirements file or
-`pip install`. `--markdown` renders the same section with fenced code blocks, and `-q` keeps it. With nothing to fill, a
+A requirements file, a `pyproject.toml`, a pip report or package names get the
+`--extra-index-url https://wheelgap.github.io/wheels/simple/` line for a requirements file or `pip install`, each wheel's
+`--hash` for requirements that pin hashes, and a reminder that pip treats every index alike. Other lockfiles
+(`pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`) pin each file, so they get a line saying to add
+the index where the lockfile is made and lock again. Packages wheelgap can't place on PyPI aren't checked, and a note
+on stderr names them. `--markdown` renders the same section with fenced code blocks, and `-q` keeps it. With nothing to fill, a
 note on stderr says so instead (not with `-q`).
 
 With `--json --fix`, the top-level `gap_wheels` list has one object per filled cell: `name`, `version`, `target` (the

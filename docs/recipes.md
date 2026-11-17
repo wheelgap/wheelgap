@@ -424,11 +424,14 @@ wheelgap uv.lock -p 3.14t -t win-arm64 --fix
 
 A gap counts only when it's `source` or `missing`, the package is [positively PyPI's](how-it-works.md#pypi-origin), and
 the index has a wheel of exactly that version that the target accepts. The exit code doesn't change: wheelgap still
-reports what PyPI has. For a requirements file or package names it prints the `--extra-index-url` line; for a uv.lock
-it prints a `pyproject.toml` snippet that adds the index with `explicit = true` and points each package at it in
-`[tool.uv.sources]`. uv applies `[tool.uv.sources]` only to direct dependencies: for a package that comes in through
-another one, `--fix` also says to add it to `[project] dependencies`, and when the lock can't show whether a package is
-direct, it says to add it to be safe. uv's `exclude-newer` won't see these packages' files on this index: its pages
+reports what PyPI has. For a requirements file or package names it prints the `--extra-index-url` line (with each
+wheel's `--hash`, for requirements that pin hashes); for a uv.lock it prints a `pyproject.toml` snippet that adds the
+index with `explicit = true` and points each package at it in `[tool.uv.sources]`. uv applies `[tool.uv.sources]` only
+to direct dependencies: for a package that comes in through another one, `--fix` also says to list it where that one is
+(the same dependencies, dependency group or extra), and when the lock can't show whether a package is direct, it says
+to list it to be safe. Other lockfiles get a line saying to add the index where the lockfile is made. Only follow the
+pip advice if the packages come from PyPI: pip treats every index alike, and wheelgap can't see a private index set in
+`pip.conf`. uv's `exclude-newer` won't see these packages' files on this index: its pages
 are HTML, which carries no upload times. `--fix` is refused with `--offline`, and reads nothing with `--index-url` or
 a `WHEELGAP_INDEX_URL` mirror. With `--json`, the [`gap_wheels`](output.md#fix) key lists each wheel with its URL and
 SHA-256.

@@ -1547,11 +1547,17 @@ def gap_wheel_fills(
         return []
     private = origin.private_names(sources, simple_index=index_url)
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
-    wanted = [
-        r
-        for r in gaps
-        if gapwheels.candidates(r, targets) and gapwheels.eligible(r, source_of[id(r.package)], index_url, private)
-    ]
+    candidates = [r for r in gaps if gapwheels.candidates(r, targets)]
+    wanted = [r for r in candidates if gapwheels.eligible(r, source_of[id(r.package)], index_url, private)]
+    unchecked = [r.package.name for r in candidates if r not in wanted]
+    if unchecked and not quiet:
+        # Without it, a run that couldn't check these would read as "no gap wheel fits them".
+        names = ", ".join(dict.fromkeys(unchecked))
+        print(
+            f"wheelgap: note: --fix didn't check {names}: wheelgap can't tell they come from PyPI "
+            "(see how-it-works.md#pypi-origin), so the gap wheel index isn't suggested for them",
+            file=sys.stderr,
+        )
     fills: list[gapwheels.Fill] = []
     if wanted:
         wheels = gapwheels.look_up()
@@ -1560,8 +1566,8 @@ def gap_wheel_fills(
             print("wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions", file=sys.stderr)
             return []
         fills = gapwheels.fillable(wanted, targets, source_of, wheels, private, index_url)
-    if not fills and not quiet and any(gapwheels.candidates(r, targets) for r in gaps):
-        print("wheelgap: note: --fix: no wheel on the gap wheel index fills these gaps", file=sys.stderr)
+        if not fills and not quiet:
+            print("wheelgap: note: --fix: no wheel on the gap wheel index fills these gaps", file=sys.stderr)
     return fills
 
 

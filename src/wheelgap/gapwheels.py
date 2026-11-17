@@ -29,6 +29,9 @@ from .sources import Source
 from .targets import Target
 
 SCHEMA = 1
+# Inputs pip installs from as they are: a requirements file, a pyproject.toml, a pip report or package names. Lockfiles
+# pin each file's URL, so adding an index to pip changes nothing for them; they get the lockfile advice (_lock_kinds).
+PIP_KINDS = frozenset({"requirements", "pyproject", "pip-report", None})
 INDEX = "https://wheelgap.github.io/wheels/simple/"
 DOWNLOAD = "https://github.com/wheelgap/wheels/releases/download/gap-wheels"
 ABOUT = "https://wheelgap.github.io/wheels/"
@@ -201,13 +204,20 @@ def _uv_direct_note(name: str, fills: list[Fill], code: Callable[[str], str] = _
     if any(p is not None and len(p) == 2 for p in paths):
         return None
     add = (
-        f"uv only applies {code('[tool.uv.sources]')} to direct dependencies, so "
-        f"{{}}also add {code(json.dumps(name))} to {code('[project]')} dependencies"
+        f"uv only applies {code('[tool.uv.sources]')} to direct dependencies, so {{}}also list {code(json.dumps(name))}"
     )
     if paths and all(p is not None and len(p) > 2 for p in paths):
-        through = ", ".join(map(code, dict.fromkeys(p[1] for p in paths if p is not None)))
-        return f"{code(name)} comes in through {through}; " + add.format("")
-    return f"wheelgap can't tell whether {code(name)} is a direct dependency; " + add.format("to be safe ")
+        firsts = list(dict.fromkeys(p[1] for p in paths if p is not None))
+        through = ", ".join(map(code, firsts))
+        # Next to the package that brings it in: the same dependencies, dependency group or extra, so a dev-only
+        # package doesn't become a runtime dependency.
+        return (
+            f"{code(name)} comes in through {through}; "
+            + add.format("")
+            + f" where {through} {'is' if len(firsts) == 1 else 'are'}"
+            + " (the same dependencies, dependency group or extra)"
+        )
+    return f"wheelgap can't tell whether {code(name)} is a direct dependency; " + add.format("to be safe ") + " as one"
 
 
 def _parts(
@@ -215,7 +225,7 @@ def _parts(
 ) -> tuple[list[str], list[str], list[str], bool]:
     """(one line per package, the uv config lines, the uv notes, whether the pip way applies)."""
     listed = [
-        f"{name} {version}: {', '.join(f.target.label(multi_py) for f in fs)}"
+        f"{name} {version}: {', '.join(dict.fromkeys(f.target.label(multi_py) for f in fs))}"
         for (name, version), fs in _by_package(fills).items()
     ]
     uv_names: dict[str, list[Fill]] = {}  # by canonical name: one sources line per package
@@ -223,7 +233,7 @@ def _parts(
     for f in fills:
         if f.source.kind == "uv":
             uv_names.setdefault(f.row.package.key, []).append(f)
-        else:
+        elif f.source.kind in PIP_KINDS:
             pip = True
     config: list[str] = []
     notes: list[str] = []
@@ -238,6 +248,31 @@ def _parts(
     return listed, config, notes, pip
 
 
+def _lock_kinds(fills: list[Fill]) -> list[str]:
+    """The input kinds (other than uv.lock and pip's) of the fills, as their file labels, in order."""
+    return list(
+        dict.fromkeys(f.source.label for f in fills if f.source.kind != "uv" and f.source.kind not in PIP_KINDS)
+    )
+
+
+def _hashes(fills: list[Fill]) -> list[tuple[str, str]]:
+    """(name==version, sha256) per pip-way wheel, for requirements files that pin hashes."""
+    return list(
+        dict.fromkeys(
+            (f"{f.row.package.name}=={f.row.package.version}", f.wheel.sha256)
+            for f in fills
+            if f.source.kind in PIP_KINDS
+        )
+    )
+
+
+PIP_CAVEAT = (
+    "pip treats every index alike, so do this only if these packages come from PyPI: not if a private index "
+    "(set in pip.conf, say) has packages of the same names."
+)
+UV_MERGE = "If pyproject.toml already has a [tool.uv.sources] table, add these lines to it instead of a second one."
+
+
 def text_lines(fills: list[Fill], multi_py: bool) -> list[str]:
     """--fix's section of the text output (empty when nothing is fillable)."""
     if not fills:
@@ -248,6 +283,7 @@ def text_lines(fills: list[Fill], multi_py: bool) -> list[str]:
     if config:
         out += ["", "To install them with uv, add this to pyproject.toml, then run uv lock:", "", *config, ""]
         out += [f"{note}." for note in notes]
+        out.append(UV_MERGE)
     if pip:
         out += [
             "",
@@ -255,6 +291,15 @@ def text_lines(fills: list[Fill], multi_py: bool) -> list[str]:
             f"  --extra-index-url {INDEX}",
             "or pass it to pip install:",
             f"  pip install --extra-index-url {INDEX} ...",
+            "If the requirements pin hashes, also add each wheel's hash to its line:",
+            *(f"  {req} --hash=sha256:{sha}" for req, sha in _hashes(fills)),
+            PIP_CAVEAT,
+        ]
+    if locks := _lock_kinds(fills):
+        out += [
+            "",
+            f"{', '.join(locks)} pins each file, so add {INDEX} as an index (for these packages only, if the tool "
+            "allows it) where that lockfile is made, then lock again.",
         ]
     out += ["", f"How these wheels are built and checked: {ABOUT}"]
     return out
@@ -274,6 +319,10 @@ def markdown_lines(fills: list[Fill], multi_py: bool) -> list[str]:
         out += [f"- {note}." for note in notes]
         if notes:
             out.append("")
+        out += [
+            UV_MERGE.replace("pyproject.toml", "`pyproject.toml`").replace("[tool.uv.sources]", "`[tool.uv.sources]`"),
+            "",
+        ]
     if pip:
         out += [
             "To install them with pip, add this line to your requirements file, or pass it to `pip install`:",
@@ -281,6 +330,20 @@ def markdown_lines(fills: list[Fill], multi_py: bool) -> list[str]:
             "```",
             f"--extra-index-url {INDEX}",
             "```",
+            "",
+            "If the requirements pin hashes, also add each wheel's hash to its line:",
+            "",
+            "```",
+            *(f"{req} --hash=sha256:{sha}" for req, sha in _hashes(fills)),
+            "```",
+            "",
+            PIP_CAVEAT,
+            "",
+        ]
+    if locks := _lock_kinds(fills):
+        out += [
+            f"{', '.join(f'`{k}`' for k in locks)} pins each file, so add `{INDEX}` as an index (for these packages "
+            "only, if the tool allows it) where that lockfile is made, then lock again.",
             "",
         ]
     out += [f"How these wheels are built and checked: {ABOUT}", ""]

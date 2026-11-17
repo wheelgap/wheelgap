@@ -53,6 +53,9 @@ def test_pip_way_for_package_names_and_the_same_exit_code(capsys, fake_pypi, gap
         f"  --extra-index-url {INDEX}\n"
         "or pass it to pip install:\n"
         f"  pip install --extra-index-url {INDEX} ...\n"
+        "If the requirements pin hashes, also add each wheel's hash to its line:\n"
+        f"  nowheels==0.9 --hash=sha256:{'ab' * 32}\n"
+        f"{gapwheels.PIP_CAVEAT}\n"
         "\n"
         "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
     )
@@ -92,8 +95,9 @@ def test_uv_way_for_a_uv_lock_with_direct_and_transitive_packages(capsys, fixtur
         'nativeext = { index = "wheelgap" }\n'
         'puresdist = { index = "wheelgap" }\n'
         "\n"
-        "nativeext comes in through fastlib; uv only applies [tool.uv.sources] to direct dependencies, so also add "
-        '"nativeext" to [project] dependencies.\n'
+        "nativeext comes in through fastlib; uv only applies [tool.uv.sources] to direct dependencies, so also list "
+        '"nativeext" where fastlib is (the same dependencies, dependency group or extra).\n'
+        f"{gapwheels.UV_MERGE}\n"
         "\n"
         "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
     )
@@ -109,7 +113,7 @@ def test_uv_note_when_the_lock_cant_tell_whether_a_package_is_direct():
     fill = gapwheels.Fill(row, target, wheel, Source("uv.lock", kind="uv"))
     assert (
         "wheelgap can't tell whether x is a direct dependency; uv only applies [tool.uv.sources] to direct "
-        'dependencies, so to be safe also add "x" to [project] dependencies.'
+        'dependencies, so to be safe also list "x" as one.'
     ) in gapwheels.text_lines([fill], False)
     assert "- wheelgap can't tell whether `x` is a direct dependency; uv only applies `[tool.uv.sources]`" in "\n".join(
         gapwheels.markdown_lines([fill], False)
@@ -319,3 +323,44 @@ def test_fetch_reads_the_whole_list_once_with_a_cap(gap_wheels, monkeypatch):
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     assert gap_wheels.real() == {"schema": 1, "wheels": []}
     assert seen == [("https://wheelgap.github.io/wheels/data/gap-wheels.json", 2, pypi.GAP_WHEELS_MAX_BYTES)]
+
+
+def _fill(kind, label="input", via=None):
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    wheel = gapwheels.parse(
+        {"schema": 1, "wheels": [{"name": "x", "version": "1", "wheel": "x-1-py3-none-any.whl", "sha256": "0" * 64}]}
+    )[0]  # type: ignore[index]
+    row = Row(Package("x", "1"), {target: Status.SOURCE})
+    if via is not None:
+        row.via[target] = via
+    return gapwheels.Fill(row, target, wheel, Source(label, kind=kind))
+
+
+def test_packages_it_couldnt_place_on_pypi_get_a_note_not_nothing_fits(capsys, fake_pypi, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    req = tmp_path / "requirements.txt"
+    req.write_text("--extra-index-url https://pkgs.example.com/simple\nnowheels==0.9\n", encoding="utf-8")
+    code, data, err = gap_wheels_json(capsys, str(req), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert data["gap_wheels"] == [] and gap_wheels.calls == 0
+    assert "--fix didn't check nowheels: wheelgap can't tell they come from PyPI" in err
+    assert NOTHING_FITS not in err
+
+
+def test_lockfiles_get_lock_advice_not_requirements_advice():
+    text = "\n".join(gapwheels.text_lines([_fill("pylock", "pylock.toml")], False))
+    assert "--extra-index-url" not in text and "[tool.uv" not in text
+    assert f"pylock.toml pins each file, so add {INDEX} as an index" in text
+    md = "\n".join(gapwheels.markdown_lines([_fill("pdm", "pdm.lock")], False))
+    assert f"`pdm.lock` pins each file, so add `{INDEX}` as an index" in md and "--extra-index-url" not in md
+
+
+def test_dev_group_package_is_listed_where_its_parent_is_not_in_project_dependencies():
+    text = "\n".join(gapwheels.text_lines([_fill("uv", "uv.lock", ["(dev group)", "pytest-thing", "x"])], False))
+    assert 'also list "x" where pytest-thing is (the same dependencies, dependency group or extra)' in text
+    assert "[project] dependencies" not in text
+
+
+def test_the_same_target_from_two_inputs_is_listed_once():
+    lines = gapwheels.text_lines([_fill("requirements", "a.txt"), _fill("requirements", "b.txt")], False)
+    assert "  x 1: win-arm64" in lines
+    assert sum(line.startswith("  x==1 --hash=") for line in lines) == 1
