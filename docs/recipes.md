@@ -411,7 +411,7 @@ gaps: fastlib, nativeext, puresdist
 
 The [gap wheel index](https://wheelgap.github.io/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. Its current coverage is Windows on ARM with CPython 3.14 and free-threaded 3.14t; Linux wheels are not published yet. Check the index page for the latest coverage.
 
-Use pip for this partial index. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) limits a package to candidates from the first index that contains it, which can hide PyPI versions when an extra index only contains selected wheels. With uv, pin only the packages that need it to the index as an explicit index, as `--fix` prints below.
+It works with pip and uv. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) takes all of a package's files from the first index that has it, so each package's page on this index also lists every file PyPI has for it (refreshed hourly), plus the gap wheel. With uv, pin only the packages that need it to the index as an explicit index, as `--fix` prints below.
 
 ### Which gaps it fills: `--fix`
 
