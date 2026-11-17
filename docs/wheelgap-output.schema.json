@@ -171,12 +171,12 @@
                 },
                 "via": {
                     "type": "object",
-                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
+                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected and (after 0.13.0) targets where the package couldn't be looked up (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
                 "direct": {
                     "type": "object",
-                    "description": "Present from 0.13.0 on (older versions don't write it), with --explain: the direct dependencies that lead to the package, keyed by target label, for gap targets only, as the text table's `(via ...)` names them (uv.lock, Poetry before lock-version 2.1, and --deps). A target is left out when the package is itself a direct dependency or the input has no graph, and may be left out when the lockfile doesn't record which direct dependency asked for an extra that leads to the package (Poetry before lock-version 2.1); empty object when no target has one.",
+                    "description": "Present from 0.13.0 on (older versions don't write it), with --explain: the direct dependencies that lead to the package, keyed by target label, for gap targets and (after 0.13.0) targets where the package couldn't be looked up, as the text table's `(via ...)` names them (uv.lock, Poetry before lock-version 2.1, and --deps). A target is left out when the package is itself a direct dependency or the input has no graph, and may be left out when the lockfile doesn't record which direct dependency asked for an extra that leads to the package (Poetry before lock-version 2.1); empty object when no target has one.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}
                 },
                 "issues_url": {

@@ -52,6 +52,9 @@ from .targets import (
 
 _OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
 _EXPLAINED = (Status.SOURCE, Status.MISSING)  # the statuses --explain explains
+# The statuses --explain traces to the user's own requirements (via, direct): the gaps, and a package that couldn't be
+# looked up, which is the row a user most needs to trace (#453).
+_TRACED = (*_EXPLAINED, Status.UNKNOWN)
 
 
 def running_python() -> str:
@@ -245,7 +248,7 @@ def _result(
         # Preserve the legacy scalar only when all applied locks agree.
         shared_version,
         any(bundled_version_differs(pkg, lock) for lock in applied),
-        {t: tuple(via[t]) for t, s in statuses.items() if s in _EXPLAINED and t in via},
+        {t: tuple(via[t]) for t, s in statuses.items() if s in _TRACED and t in via},
         # A file's yanked flag and its Requires-Python reason are the same for every Python, so these are the union.
         frozenset(f for variant in pkg.variants for f in variant.yanked),
         {f: why for variant in pkg.variants for f, why in variant.requires_python_rejected.items()},
@@ -253,7 +256,7 @@ def _result(
         pkg.only_binary,
         bundled_versions=bundled_versions,
         direct={
-            t: tuple(dict.fromkeys(direct_via[t])) for t, s in statuses.items() if s in _EXPLAINED and direct_via.get(t)
+            t: tuple(dict.fromkeys(direct_via[t])) for t, s in statuses.items() if s in _TRACED and direct_via.get(t)
         },
         issues_url=issues_url,
     )

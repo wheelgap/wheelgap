@@ -389,9 +389,11 @@ gaps = [p["name"] for p in data["packages"] if p["results"].get(key) in ("source
 ```
 
 With `--json --explain`, each package gets `rejected` (`{"file", "reason"}` objects) and `via` (the dependency path),
-both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph. It also
+both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph, and (after 0.13.0) also
+covers targets where the package couldn't be looked up. It also
 gets `issues_url`: the package's issue tracker URL from its PyPI metadata, or `null`, and `direct`:
-for each gap target, the direct dependencies that lead to the package, as the table's `cryptography (via mcp)` names
+for each gap target, and (after 0.13.0) each target where the package couldn't be looked up (`unknown`), the direct
+dependencies that lead to the package, as the table's `cryptography (via mcp)` names
 them (`{"win-arm64": ["mcp", "httpx"]}`). `direct` has entries only for uv.lock, Poetry 1.x and `--deps` inputs. It
 leaves out a target where the package is itself a direct dependency, and may leave one out when the lockfile doesn't
 record which direct dependency asked for an extra that leads to the package (Poetry 1.x).

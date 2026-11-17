@@ -821,6 +821,12 @@ def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(inde
     assert main([*args, "--junit", str(report)]) == 1
     capsys.readouterr()
     assert "(via usesflaky)" in report.read_text(encoding="utf-8")
+    # --json --explain names it too: `direct`, and `via` where the tree has a path (#453).
+    assert main([*args, "--json", "--explain"]) == 1
+    flaky = next(p for p in json.loads(capsys.readouterr().out)["packages"] if p["name"] == "flaky")
+    assert flaky["results"] == {"win-arm64": "unknown"}
+    assert flaky["direct"] == {"win-arm64": ["usesflaky"]}
+    assert flaky["rejected"] == {}  # nothing to explain: no files were read
     both = [Requirement("usesflaky"), Requirement("alsoflaky")]
     tree = resolver.resolve(both, WIN)
     assert sorted(deps._direct_roots(tree, both, resolver, WIN)["flaky"]) == ["alsoflaky", "usesflaky"]
