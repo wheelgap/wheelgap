@@ -270,6 +270,10 @@ PIP_CAVEAT = (
     "pip treats every index alike, so do this only if these packages come from PyPI: not if a private index "
     "(set in pip.conf, say) has packages of the same names."
 )
+LOCK_CAVEAT = (
+    "An index that isn't limited to these packages has the same risk as with pip: don't add it if a private index "
+    "has packages of the same names."
+)
 UV_MERGE = "If pyproject.toml already has a [tool.uv.sources] table, add these lines to it instead of a second one."
 
 
@@ -300,6 +304,7 @@ def text_lines(fills: list[Fill], multi_py: bool) -> list[str]:
             "",
             f"{', '.join(locks)} pins each file, so add {INDEX} as an index (for these packages only, if the tool "
             "allows it) where that lockfile is made, then lock again.",
+            LOCK_CAVEAT,
         ]
     out += ["", f"How these wheels are built and checked: {ABOUT}"]
     return out
@@ -344,6 +349,8 @@ def markdown_lines(fills: list[Fill], multi_py: bool) -> list[str]:
         out += [
             f"{', '.join(f'`{k}`' for k in locks)} pins each file, so add `{INDEX}` as an index (for these packages "
             "only, if the tool allows it) where that lockfile is made, then lock again.",
+            "",
+            LOCK_CAVEAT,
             "",
         ]
     out += [f"How these wheels are built and checked: {ABOUT}", ""]

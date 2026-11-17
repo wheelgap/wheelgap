@@ -1549,7 +1549,12 @@ def gap_wheel_fills(
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     candidates = [r for r in gaps if gapwheels.candidates(r, targets)]
     wanted = [r for r in candidates if gapwheels.eligible(r, source_of[id(r.package)], index_url, private)]
-    unchecked = [r.package.name for r in candidates if r not in wanted]
+    # Only those the origin rule turned away: a --no-binary package wouldn't use a wheel anyway.
+    unchecked = [
+        r.package.name
+        for r in candidates
+        if r not in wanted and r.package.version is not None and not r.package.no_binary
+    ]
     if unchecked and not quiet:
         # Without it, a run that couldn't check these would read as "no gap wheel fits them".
         names = ", ".join(dict.fromkeys(unchecked))

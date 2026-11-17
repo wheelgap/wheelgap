@@ -364,3 +364,15 @@ def test_the_same_target_from_two_inputs_is_listed_once():
     lines = gapwheels.text_lines([_fill("requirements", "a.txt"), _fill("requirements", "b.txt")], False)
     assert "  x 1: win-arm64" in lines
     assert sum(line.startswith("  x==1 --hash=") for line in lines) == 1
+
+
+def test_no_binary_package_isnt_blamed_on_its_origin(capsys, fake_pypi, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    req = tmp_path / "requirements.txt"
+    req.write_text("--no-binary nowheels\nnowheels==0.9\n", encoding="utf-8")
+    _, data, err = gap_wheels_json(capsys, str(req), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert data["gap_wheels"] == [] and "can't tell they come from PyPI" not in err
+
+
+def test_lock_advice_carries_the_private_index_caveat():
+    assert gapwheels.LOCK_CAVEAT in gapwheels.text_lines([_fill("poetry", "poetry.lock")], False)
