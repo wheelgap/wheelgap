@@ -41,6 +41,7 @@ uv run --group dev pytest
 | `condaforge.py` | `--conda-forge`: under `--explain`, whether conda-forge has a build of the same package and version that fits a gap's target (anaconda.org, through `pypi.fetch_json`) |
 | `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`, `--notes`); never for private-index names |
 | `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names `origin.known_pypi` accepts (from `uv.lock` and `pylock.toml` for a registry), never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror |
+| `gapwheels.py` | `--fix`: which gaps a wheel on wheelgap's gap wheel index fills (the list from `pypi.fetch_gap_wheels`, each entry checked and dropped whole if malformed), and how to install from the index; only for names `origin.known_pypi` accepts, never with `--offline`, `--index-url` or a mirror |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `logsafe.py` | Keeps input text from running as a GitHub Actions workflow command: the CLI's and `diff`'s stdout and stderr go through `CommandGuard` |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
@@ -52,6 +53,7 @@ uv run --group dev pytest
 - **No network, ever.** Use the `fake_pypi` fixture in `tests/conftest.py`. To add a package, add it to `FAKE_INDEX`. The fixture returns the list of URLs fetched, so tests can assert what was (or wasn't) looked up. Lockfile fixtures live in `tests/fixtures/`; small one-off lockfiles go in `tmp_path`.
 - `--explain --notes` asks the coverage tracker for notes; the autouse `tracker` fixture answers instead (a 404 for every name, unless a test adds a file with `tracker.add(name, note)`), and `tracker.calls` lists what was asked.
 - `fake_pypi` patches `wheelgap.pypi.fetch_json`. New code that fetches should call `pypi.fetch_json` at call time (as `pyodide.py` does), not import the name, so the fixture catches it.
+- `--fix` reads the gap wheel list through `pypi.fetch_gap_wheels`; the autouse `gap_wheels` fixture answers instead (an empty list unless a test calls `gap_wheels.add(...)` or sets `gap_wheels.doc`), and `gap_wheels.calls` counts the fetches.
 - `fake_files` serves sdists (for `--build-info`) at `https://files.example/<filename>`, the URL `fake_pypi` gives every file. Any other real request fails at once (the autouse `no_network` fixture), except to a test's own localhost server.
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.

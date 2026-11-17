@@ -337,6 +337,19 @@ different Pythons. The file isn't checked against the rest of the dependency tre
 too, so a pin can move a package for a target that wouldn't fail the run. It's written even when the check fails; an
 empty `FILE` is an error, as for `--junit`.
 
+### `--fix` {#fix}
+
+After the usual output, say which gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/)
+fills, and how to install from it: a `[tool.uv.index]` and `[tool.uv.sources]` snippet for `pyproject.toml` with a
+uv.lock input, and an `--extra-index-url` line for pip otherwise. A cell counts only when it's `source` or `missing`
+(and not `--ignore`d), the package passes [the PyPI-origin rule](how-it-works.md#pypi-origin), and the index has a
+wheel of exactly that version whose tags the target accepts. It reads the index's list from wheelgap.github.io in one
+request that names no package, and only when a gap could use it. It never changes a status, the summary or the exit
+code: wheelgap still reports what PyPI has. `--offline` refuses the flag; with `--index-url`, `index-url` in
+`[tool.wheelgap]` or a `WHEELGAP_INDEX_URL` mirror it's off and reads nothing. If the list can't be read, a note on
+stderr says so. With `--json` it adds [`gap_wheels`](output.md#fix). There's no config key for it.
+See [Installing from the gap wheel index](recipes.md#installing-from-the-gap-wheel-index).
+
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
 Print only the gap summary and the affected package names. Clean runs without ignored packages are silent, and JSON

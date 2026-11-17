@@ -122,6 +122,8 @@ resolutions appear in separate rows, including in JSON, with `n/a` for targets u
 
 `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)). `--suggest` is on by default when `--deps` resolved every input, since it already looked the whole tree up on PyPI; `--no-suggest` turns it off.
 
+`--fix` lists the gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/) fills (today Windows on ARM for CPython 3.14 and 3.14t), with the `pyproject.toml` snippet for uv or the `--extra-index-url` line for pip. It reads the index's list in one request that names no package, and never changes the exit code ([how](https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index)).
+
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 
 ## Targets

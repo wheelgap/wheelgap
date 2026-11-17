@@ -273,6 +273,35 @@ def tracker(monkeypatch) -> FakeTracker:
     return fake
 
 
+class FakeGapWheels:
+    """The gap wheel list --fix reads (pypi.fetch_gap_wheels), served in place of wheelgap.github.io."""
+
+    def __init__(self):
+        self.doc: object = {"schema": 1, "wheels": []}  # what the fetch returns, or an exception it raises
+        self.calls = 0
+
+    def add(self, name: str, version: str, wheel: str, **fields) -> None:
+        entry = {"name": name, "version": version, "wheel": wheel, "sha256": "ab" * 32, **fields}
+        self.doc["wheels"].append(entry)  # type: ignore[index]
+
+    def fetch(self, timeout=10.0):
+        self.calls += 1
+        if isinstance(self.doc, BaseException):
+            raise self.doc
+        return self.doc
+
+
+@pytest.fixture(autouse=True)
+def gap_wheels(monkeypatch) -> FakeGapWheels:
+    """Every test gets an empty gap wheel list, so --fix never reaches the network; .calls counts the fetches."""
+    from wheelgap import pypi
+
+    fake = FakeGapWheels()
+    fake.real = pypi.fetch_gap_wheels  # type: ignore[attr-defined]  # for a test of the fetch itself
+    monkeypatch.setattr(pypi, "fetch_gap_wheels", fake.fetch)
+    return fake
+
+
 @pytest.fixture
 def fake_pypi(monkeypatch, tracker):
     import urllib.error

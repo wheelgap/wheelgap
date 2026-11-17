@@ -278,6 +278,17 @@ def fetch_releases(key: str, timeout: float = 10.0, deadline: float | None = Non
     return releases
 
 
+# --fix: the list of wheels wheelgap publishes for releases PyPI has no wheel for (see gapwheels.py).
+GAP_WHEELS_URL = "https://wheelgap.github.io/wheels/data/gap-wheels.json"
+GAP_WHEELS_MAX_BYTES = 4 * 1024 * 1024
+
+
+def fetch_gap_wheels(timeout: float = 10.0) -> dict:
+    """--fix: the whole gap wheel list, in one request that names no package. Tried twice, and capped at
+    GAP_WHEELS_MAX_BYTES; the caller checks every entry (gapwheels.parse)."""
+    return fetch_json(GAP_WHEELS_URL, timeout=timeout, attempts=2, max_bytes=GAP_WHEELS_MAX_BYTES)
+
+
 def _plain(url: str) -> bool:
     """Printable ASCII with no spaces: nothing a terminal would act on, nothing that splits the line."""
     return url.isascii() and url.isprintable() and " " not in url

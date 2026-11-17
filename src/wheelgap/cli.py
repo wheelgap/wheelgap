@@ -19,7 +19,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge, origin
+from . import __version__, cache, condaforge, gapwheels, origin
 from . import notes as tracker
 from . import suggest as release_suggest
 from .api import explain_issues_urls, running_python
@@ -291,6 +291,13 @@ def make_parser() -> argparse.ArgumentParser:
         help="with --explain, also show the coverage tracker's notes for packages with gaps, which sends the names of "
         "those from PyPI to wheelgap.github.io (never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror; "
         "--no-notes overrides notes = true)",
+    )
+    p.add_argument(
+        "--fix",
+        action="store_true",
+        help="also say which gaps a wheel on wheelgap's gap wheel index fills, and how to install from it (reads "
+        "the index's list from wheelgap.github.io, which sends no package names; not with --offline, and off with "
+        "--index-url or a WHEELGAP_INDEX_URL mirror)",
     )
     p.add_argument(
         "-q",
@@ -919,6 +926,7 @@ def report_json(
     builds: RowBuilds | None = None,
     dropped: dict[str, str] | None = None,
     issues_urls: dict[int, str | None] | None = None,
+    gap_wheels: list[gapwheels.Fill] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -1011,6 +1019,8 @@ def report_json(
     }
     if blocking is not None:
         report["blocking_newer_python"] = blocking.names
+    if gap_wheels is not None:  # --fix: one entry per gap cell a wheel on the gap wheel index fills
+        report["gap_wheels"] = gapwheels.to_json(gap_wheels, multi_py)
     return json.dumps(report, indent=2)
 
 
@@ -1514,6 +1524,47 @@ def version_suggestions(
     }
 
 
+def gap_wheel_fills(
+    gaps: list[Row],
+    targets: list[Target],
+    sources: list[Source],
+    index_url: str | None,
+    index_how: str,
+    quiet: bool,
+) -> list[gapwheels.Fill]:
+    """--fix: the gap cells a wheel on wheelgap's gap wheel index fills. The list is read in one request that names no
+    package, only when a gap of a package that is positively PyPI's could use it (gapwheels.eligible), and never when
+    packages come from another index. Notes on stderr say when it wasn't read, couldn't be, or nothing fits."""
+    other = origin.other_index(index_url)
+    if other is not None:
+        if not quiet:
+            how = index_how if other == "--index-url" else other
+            print(
+                f"wheelgap: note: --fix is off with {how}: packages may come from another index, "
+                "so the gap wheel list wasn't read",
+                file=sys.stderr,
+            )
+        return []
+    private = origin.private_names(sources, simple_index=index_url)
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    wanted = [
+        r
+        for r in gaps
+        if gapwheels.candidates(r, targets) and gapwheels.eligible(r, source_of[id(r.package)], index_url, private)
+    ]
+    fills: list[gapwheels.Fill] = []
+    if wanted:
+        wheels = gapwheels.look_up()
+        if wheels is None:
+            # Even with -q: without it, a run that couldn't look would read as "no gap wheel fits".
+            print("wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions", file=sys.stderr)
+            return []
+        fills = gapwheels.fillable(wanted, targets, source_of, wheels, private, index_url)
+    if not fills and not quiet and any(gapwheels.candidates(r, targets) for r in gaps):
+        print("wheelgap: note: --fix: no wheel on the gap wheel index fills these gaps", file=sys.stderr)
+    return fills
+
+
 def main(argv: list[str] | None = None, *, project: Path | None = None) -> int:
     """The command line. `project`: the folder whose pyproject.toml and .python-version apply when no input names one
     (the MCP server's check_dist passes the dist folder's project, not the server's working directory)."""
@@ -1892,6 +1943,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     f"{offline_how}: --suggest would look packages up on PyPI; "
                     f"drop --suggest, or {undo_offline(offline_how)}"
                 )
+            if args.fix:
+                raise SourceError(
+                    f"{offline_how}: --fix would read the gap wheel list from wheelgap.github.io; "
+                    f"drop --fix, or {undo_offline(offline_how)}"
+                )
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
@@ -2181,6 +2237,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if stopped is not None and not quiet:
             print(Style(use_color(args.color)).dim(f"wheelgap: note: {stopped}"), file=sys.stderr)
 
+    # None: not asked for. Like --suggest, it never changes a status or the exit code.
+    fills = gap_wheel_fills(gaps, targets, sources, index_url, index_how, quiet) if args.fix else None
+
     issues_urls = explain_issues_urls(rows, sources, index_url) if args.explain else None
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
@@ -2242,36 +2301,42 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 row_builds,
                 dropped,
                 issues_urls=issues_urls,
+                gap_wheels=fills,
             )
         )
         return code
 
+    multi_py = len({t.python for t in targets}) > 1
     if args.markdown:
         print(
             "\n".join(
-                render_markdown(
-                    rows,
-                    targets,
-                    source_labels,
-                    skipped,
-                    ignored,
-                    args,
-                    pyodide_lock,
-                    source_allowed,
-                    advisory,
-                    conda_forge,
-                    row_notes,
-                    build_info,
-                    row_builds,
-                    suggestions=suggestions,
-                    dropped=dropped,
-                    issues_urls=issues_urls,
-                )
+                [
+                    *render_markdown(
+                        rows,
+                        targets,
+                        source_labels,
+                        skipped,
+                        ignored,
+                        args,
+                        pyodide_lock,
+                        source_allowed,
+                        advisory,
+                        conda_forge,
+                        row_notes,
+                        build_info,
+                        row_builds,
+                        suggestions=suggestions,
+                        dropped=dropped,
+                        issues_urls=issues_urls,
+                    ),
+                    *gapwheels.markdown_lines(fills or [], multi_py),
+                ]
             )
         )
         return code
 
     style = Style(use_color(args.color))
+    fix_lines = gapwheels.text_lines(fills or [], multi_py)  # nothing unless a gap wheel fills a gap
     total_pkgs = len(_group_rows(rows))
     if quiet:
         if gaps:
@@ -2297,6 +2362,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         for r in rows:
             if r.package.error:  # say why a package is "unknown", even in quiet mode
                 print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
+        for ln in fix_lines:  # asked for with --fix, so -q keeps it
+            print(ln)
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
@@ -2367,6 +2434,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
     if source_allowed and not args.exit_zero:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
+    for ln in fix_lines:  # a gap wheel fills only a gap, so the runs that return early above have none
+        print(ln)
     return code
 
 
