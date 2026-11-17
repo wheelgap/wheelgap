@@ -28,6 +28,7 @@ from .build import BuildInfo, describe, lookup_all, requires_for, shown
 from .check import (
     CELL,
     EXPLAIN_LIMIT,
+    HINTED,
     Row,
     Status,
     check,
@@ -706,9 +707,7 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
 def traced_targets(row: Row, targets: list[Target]) -> list[Target]:
     """The gap targets plus those where the package couldn't be looked up (unknown): what --json --explain's `via`
     and `direct` trace to the user's own requirements (#453)."""
-    return [
-        t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING, Status.UNKNOWN) and t not in row.ignored
-    ]
+    return [t for t in targets if row.results[t] in HINTED and t not in row.ignored]
 
 
 RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]

@@ -826,6 +826,7 @@ def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(inde
     flaky = next(p for p in json.loads(capsys.readouterr().out)["packages"] if p["name"] == "flaky")
     assert flaky["results"] == {"win-arm64": "unknown"}
     assert flaky["direct"] == {"win-arm64": ["usesflaky"]}
+    assert flaky["via"] == {"win-arm64": ["usesflaky", "flaky"]}
     assert flaky["rejected"] == {}  # nothing to explain: no files were read
     both = [Requirement("usesflaky"), Requirement("alsoflaky")]
     tree = resolver.resolve(both, WIN)

@@ -97,7 +97,8 @@ class Result:
     # version is outside the requested pin or range (the package still counts as ok).
     bundled_version: str | None = None
     bundled_version_differs: bool = False
-    # Per SOURCE or MISSING target, the dependency path from a root down to this package, as --explain shows it:
+    # Per SOURCE, MISSING or UNKNOWN target, the dependency path from a root down to this package, as --explain
+    # shows it:
     # ("app", "pandas", "numpy"), or ("(dev group)", "pytest") for a dependency group. Filled for inputs with a
     # dependency graph: uv.lock and poetry.lock before lock-version 2.1, and anything checked with deps=True.
     via: dict[Target, tuple[str, ...]] = field(default_factory=dict)
@@ -111,7 +112,7 @@ class Result:
     _resolutions: ClassVar[Mapping[str, Package]] = MappingProxyType({})
     # Each applicable Pyodide lock may ship a different version for its Python.
     bundled_versions: dict[str, str] = field(default_factory=dict)
-    # The direct dependencies that lead to each gap target, as the table's (via ...) names them.
+    # The direct dependencies that lead to each gap target (or unknown one), as the table's (via ...) names them.
     # Only check_lockfile() and check_packages(deps=True) fill it, and only for inputs with a dependency graph.
     direct: dict[Target, tuple[str, ...]] = field(default_factory=dict)
     issues_url: str | None = None
@@ -174,8 +175,8 @@ class Result:
     def to_dict(self, explain: bool = False) -> dict[str, object]:
         """JSON-friendly, keyed by target label. explain=True adds "rejected", "via", "direct" and "issues_url" as
         `wheelgap --json --explain` does: each SOURCE or MISSING target's rejected wheels as {"file", "reason"}
-        objects, its dependency path where there is one, the direct dependencies that lead to each gap, and the
-        package's issue tracker URL."""
+        objects, its dependency path where there is one and the direct dependencies that lead to it (for UNKNOWN
+        targets too), and the package's issue tracker URL."""
         out: dict[str, object] = {
             "name": self.name,
             "version": self.version,

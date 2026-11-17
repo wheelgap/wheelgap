@@ -156,7 +156,7 @@ why), a result explains the gap the way `--explain` does:
   number of wheels (the command line shows 8), or `no wheels published for this version`, plus a line such as
   `there is an sdist, but pyodide can't build packages from source` on the targets that can't build sdists (Pyodide,
   iOS and Android).
-- `result.via` maps the same targets to the dependency path from a root down to the package, as `--explain`'s `via:`
+- `result.via` maps the same targets, and (after 0.13.0) any `unknown` target, to the dependency path from a root down to the package, as `--explain`'s `via:`
   line shows it: `("app", "pandas", "numpy")`, or `("(dev group)", "pytest")` when a dependency group pulls it in.
   `check_lockfile()` fills it for `uv.lock`, for `poetry.lock` files older than lock-version 2.1, and with
   `deps=True`, and `check_packages()` and `check_package()` fill it with `deps=True`; it's empty for other inputs.
