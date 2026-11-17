@@ -366,6 +366,8 @@ def _direct_roots(
             continue
         key = canonicalize_name(req.name)
         if key not in tree.chosen:
+            if key in tree.paths:  # its lookup failed (#453): still credit the owner, but it has nothing to walk
+                owners.setdefault(key, {})[owner] = label
             continue
         owners.setdefault(key, {})[owner] = label
         wanted = frozenset(canonicalize_name(extra) for extra in req.extras)
