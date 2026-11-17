@@ -824,6 +824,24 @@ def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(inde
     both = [Requirement("usesflaky"), Requirement("alsoflaky")]
     tree = resolver.resolve(both, WIN)
     assert sorted(deps._direct_roots(tree, both, resolver, WIN)["flaky"]) == ["alsoflaky", "usesflaky"]
+    # The GitHub annotation names the owner and sits on its line, as a transitive gap's does.
+    (tmp_path / "requirements.txt").write_text("c\nusesflaky\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    files = [str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]
+    assert main([*files, "--github-annotations"]) == 1
+    (line,) = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::") and "title=flaky" in ln]
+    assert line.startswith("::error file=requirements.txt,line=2,") and "(via usesflaky)" in line
+
+
+def test_deps_names_the_direct_requirement_of_a_package_with_no_release_for_the_python(index, monkeypatch):
+    # #453: "toonew" has no release for 3.14, so it's never chosen, but it still gets its owner.
+    monkeypatch.setitem(INDEX, "toonew", {"1.0": release(requires_python=">=3.15")})
+    monkeypatch.setitem(INDEX, "usestoonew", {"1.0": release(["toonew"])})
+    roots = [Requirement("usestoonew")]
+    resolver = Resolver()
+    tree = resolver.resolve(roots, WIN)
+    assert "toonew" in tree.errors and "toonew" not in tree.chosen
+    assert deps._direct_roots(tree, roots, resolver, WIN) == {"toonew": ("usestoonew",)}
 
 
 def test_diff_deps_detects_a_new_transitive_gap_on_upgrade(index, monkeypatch, capsys):
