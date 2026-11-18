@@ -575,6 +575,9 @@ def select_uv_dependencies(
             continue
         if source.uv_packages is None:
             continue
+        if source.uv_script is not None and not strict:
+            # A script's lock has no extras or groups; [tool.wheelgap]'s belong to the project beside it.
+            continue
         pyproject = source.uv_pyproject
         if pyproject is not None and pyproject.is_file():
             uv = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("uv", {})

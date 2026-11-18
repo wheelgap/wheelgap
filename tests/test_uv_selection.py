@@ -1909,6 +1909,17 @@ def test_script_lock_named_requirements_is_not_a_requirements_file(tmp_path):
     assert [(p.name, p.version) for p in src.packages] == [("purewheel", "3.1")]
 
 
+@pytest.mark.parametrize(("args", "code"), [([], 1), (["--group", "docs"], 2)])
+def test_script_lock_ignores_configured_groups(tmp_path, capsys, fake_pypi, args, code):
+    # [tool.wheelgap] groups belong to the project beside the script; only command-line selectors are refused.
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\ngroups = ["docs"]\n', encoding="utf-8")
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel", "puresdist"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64", *args]) == code
+    if code == 2:
+        assert "unknown groups: docs" in capsys.readouterr().err
+
+
 def test_script_lock_diff(tmp_path, capsys, fake_pypi):
     from wheelgap.diff import main as diff_main
 
