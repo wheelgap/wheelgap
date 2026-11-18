@@ -146,6 +146,9 @@ class Source:
     uv_packages: list[dict] | None = None
     uv_manifest: dict = field(default_factory=dict)
     uv_pyproject: Path | None = None
+    # A script's lock (example.py.lock, from uv lock --script): the script's file name. uv takes no dependency
+    # groups for it from a pyproject.toml beside it, so uv_pyproject is None; --fix's config goes in the script's block.
+    uv_script: str | None = None
     uv_default_groups: list[str] = field(default_factory=lambda: ["dev"])
     uv_selection: UvSelection | None = None
     # A requirements file (requirements.txt, .in, requirements.lock): unpinned lines get the newest release.
@@ -460,7 +463,10 @@ def parse_uv_lock(path: Path) -> Source:
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
-    source.uv_pyproject = path.with_name("pyproject.toml")
+    if path.name.endswith(".py.lock"):
+        source.uv_script = path.name.removesuffix(".lock")
+    else:
+        source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
         src = p.get("source", {})
         pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)

@@ -1948,11 +1948,16 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             sources = (
                 [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
             )
-        if args.print_gap_wheel_snippet and (len(sources) != 1 or sources[0].kind not in gapwheels.SNIPPET_KINDS):
+        if args.print_gap_wheel_snippet and (
+            len(sources) != 1
+            or sources[0].kind not in gapwheels.SNIPPET_KINDS
+            or sources[0].uv_script is not None  # a script's lock: its config goes in the script, as for a script
+        ):
             # Decided from the inputs, before any lookup, so the exit code doesn't depend on what the index has.
             raise SourceError(
                 f"--print-gap-wheel-snippet has no snippet for {', '.join(s.label for s in sources)}: it takes one "
-                "uv.lock, one requirements file or package names on the command line (--fix alone covers the others)"
+                "uv.lock (not a script's), one requirements file or package names on the command line "
+                "(--fix alone covers the others)"
             )
         for source in sources:
             check_report_targets(source, targets)

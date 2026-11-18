@@ -10,7 +10,7 @@ from test_cli import _assert_matches_output_schema, run
 
 from wheelgap import cli, gapwheels, pypi
 from wheelgap.check import Row, Status
-from wheelgap.sources import Package, Source
+from wheelgap.sources import Package, Source, load_inputs
 from wheelgap.targets import build_targets
 
 INDEX = "https://wheelgap.github.io/wheels/simple/"
@@ -414,8 +414,62 @@ def test_uv_way_for_a_script_goes_in_its_script_block(capsys, fake_pypi, gap_whe
         "\n"
         "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
     )
-    # No lockfile advice (wheelgap doesn't read example.py.lock) and no pip line: uv run reads the block.
+    # No lockfile advice and no pip line: uv run reads the block.
     assert "pins each file" not in out and "lock again" not in out and "--extra-index-url" not in out
+
+
+def script_lock(registry="https://pypi.org/simple"):
+    """A lock as `uv lock --script example.py` writes it: the script lists parent, which brings in nowheels."""
+    return (
+        'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n[manifest]\nrequirements = [{ name = "parent" }]\n\n'
+        f'[[package]]\nname = "parent"\nversion = "1"\nsource = {{ registry = "{registry}" }}\n'
+        'dependencies = [{ name = "nowheels" }]\n'
+        'wheels = [{ url = "https://files.example/parent-1-py3-none-any.whl" }]\n\n'
+        f'[[package]]\nname = "nowheels"\nversion = "0.9"\nsource = {{ registry = "{registry}" }}\n'
+        'sdist = { url = "https://files.example/nowheels-0.9.tar.gz" }\n'
+    )
+
+
+def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, gap_wheels, tmp_path):
+    # A pyproject.toml beside it is another project's: uv run doesn't take the script's sources from it.
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "app"\nversion = "0"\n', encoding="utf-8")
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(script_lock(), encoding="utf-8")
+    args = [str(lock), "-p", "3.14t", "-t", "win-arm64"]
+    code_plain, out_plain, _ = run(capsys, *args)
+    code, out, _ = run(capsys, *args, "--fix")
+    assert code == code_plain == 1
+    assert out.removeprefix(out_plain) == (
+        "\n"
+        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        "  nowheels 0.9: win-arm64\n"
+        "\n"
+        "To install them with uv run, add this at the end of example.py's # /// script block, then run "
+        "uv lock --script example.py:\n"
+        "\n"
+        "# [[tool.uv.index]]\n"
+        '# name = "wheelgap"\n'
+        f'# url = "{INDEX}"\n'
+        "# explicit = true\n"
+        "#\n"
+        "# [tool.uv.sources]\n"
+        '# nowheels = { index = "wheelgap" }\n'
+        "\n"
+        'uv only applies [tool.uv.sources] to a script\'s own dependencies, so also list "nowheels" in its '
+        "dependencies.\n"
+        f"{gapwheels.SCRIPT_MERGE}\n"
+        "\n"
+        "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
+    )
+    assert "pyproject.toml" not in out and "pins each file" not in out and "--extra-index-url" not in out
+    # Markdown, from the same parsed lock.
+    (source,) = load_inputs([str(lock)])
+    fill = _fill("uv")
+    md = "\n".join(gapwheels.markdown_lines([gapwheels.Fill(fill.row, fill.target, fill.wheel, source)], False))
+    assert "`example.py`'s `# /// script` block, then run `uv lock --script example.py`:" in md
+    assert '- uv only applies `[tool.uv.sources]` to a script\'s own dependencies, so also list `"x"`' in md
+    assert "`pyproject.toml`" not in md
 
 
 def test_script_fix_says_to_list_a_transitive_package_and_renders_in_markdown():
@@ -644,10 +698,20 @@ def test_print_gap_wheel_snippet_refuses_other_inputs_before_any_lookup(
     code, out, err = run(capsys, *inputs(fixtures, tmp_path), *SNIPPET)
     assert code == 2 and out == ""
     assert err == (
-        f"wheelgap: error: --print-gap-wheel-snippet has no snippet for {named}: it takes one uv.lock, one "
-        "requirements file or package names on the command line (--fix alone covers the others)\n"
+        f"wheelgap: error: --print-gap-wheel-snippet has no snippet for {named}: it takes one uv.lock "
+        "(not a script's), one requirements file or package names on the command line (--fix alone covers the others)\n"
     )
     assert gap_wheels.calls == 0 and fake_pypi == []  # decided from the inputs alone, so the same every run
+
+
+def test_print_gap_wheel_snippet_refuses_a_script_lock(capsys, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(script_lock(), encoding="utf-8")
+    code, out, err = run(capsys, str(lock), *SNIPPET)
+    assert code == 2 and out == ""
+    assert "--print-gap-wheel-snippet has no snippet for example.py.lock: it takes one uv.lock (not a script's)" in err
+    assert gap_wheels.calls == 0
 
 
 @pytest.mark.parametrize(

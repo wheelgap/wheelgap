@@ -374,8 +374,8 @@ empty `FILE` is an error, as for `--junit`.
 
 After the usual output, say which gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/)
 fills, and how to install from it: a `[tool.uv.index]` and `[tool.uv.sources]` snippet for `pyproject.toml` with a
-uv.lock input, the same entries for the `# /// script` block of a script, and an `--extra-index-url` line for
-pip otherwise. A cell counts only when it's `source` or `missing`
+uv.lock input, the same entries for the `# /// script` block of a script (or of the script beside a script's lock,
+`example.py.lock`, then `uv lock --script example.py`), and an `--extra-index-url` line for pip otherwise. A cell counts only when it's `source` or `missing`
 (and not `--ignore`d), the package passes [the PyPI-origin rule](how-it-works.md#pypi-origin), and the index has a
 wheel of exactly that version whose tags the target accepts. It reads the index's list from wheelgap.github.io in one
 request that names no package, and only when a gap could use it. A list it could read is kept in the 24-hour
@@ -410,7 +410,7 @@ snippet; when no gap wheel fits, stdout is empty.
   dependency. Add them to an existing `[tool.uv.sources]` table rather than a second one, then run `uv lock`.
 
 It refuses, with exit code 2 and before any lookup, more than one input and any other input: `pyproject.toml`, a
-script, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`, a pip report and an `environment.yml`.
+script or a script's lock (`example.py.lock`), `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`, a pip report and an `environment.yml`.
 Use `--fix` alone for those. It can't be used with `--explain` (and its add-ons), `--all`, `--from-log`, `--dist`, `--json`, `--markdown`, `--junit`, `--sarif`, `--gitlab-code-quality`, `--badge`,
 `--write-constraints` or `--github-annotations`.
 

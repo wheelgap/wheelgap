@@ -1950,3 +1950,19 @@ def test_script_lock_read_when_its_script_sets_other_uv_settings(tmp_path, capsy
     assert main([str(lock), "-p", "3.13", "-t", "win-arm64", "--json"]) == 0
     packages = json.loads(capsys.readouterr().out)["packages"]
     assert [(p["name"], p["results"]) for p in packages] == [("purewheel", {"win-arm64": "wheel"})]
+
+
+@pytest.mark.parametrize("flag", ["--no-dev", "--all-extras"])
+def test_script_lock_ignores_the_default_groups_of_a_pyproject_beside_it(tmp_path, capsys, fake_pypi, flag):
+    # uv run takes no dependency groups from the project beside a script, so its default-groups don't apply.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\n\n[dependency-groups]\ndocs = ["purewheel"]\n\n'
+        '[tool.uv]\ndefault-groups = ["docs"]\n',
+        encoding="utf-8",
+    )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64", flag, "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert [(p["name"], p["results"]) for p in packages] == [("purewheel", {"win-arm64": "wheel"})]
+    assert fake_pypi == []
