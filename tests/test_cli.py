@@ -4418,5 +4418,5 @@ def test_script_deps_refuses_private_index(capsys, fake_pypi, tmp_path):
     code, out, err = run(capsys, str(script), "--deps", "-p", "3.13", "-t", "win-arm64")
     assert code == 2
     assert "the script configures an installer index or source; --deps uses only PyPI" in err
-    assert "lockfile" not in err  # wheelgap can't read example.py.lock
+    assert "--deps uses only PyPI, so check its lock (uv lock --script) instead" in err
     assert fake_pypi == []

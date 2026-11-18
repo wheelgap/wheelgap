@@ -489,7 +489,7 @@ def test_check_lockfile_deps_refuses_a_script_naming_an_index(index, tmp_path): 
     with pytest.raises(SourceError) as e:
         wheelgap.check_lockfile(script, deps=True)
     assert "the script configures an installer index or source; --deps uses only PyPI" in str(e.value)
-    assert "lockfile" not in str(e.value)
+    assert "--deps uses only PyPI, so check its lock (uv lock --script) instead" in str(e.value)
     assert index == []
 
 

@@ -2036,8 +2036,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # can't see, so it refuses rather than answer for the wrong index.
                 if not (source.requirements or source.pyproject_extras is not None):
                     continue
-                # wheelgap can't read a script's lock (example.py.lock), so a script gets no lockfile advice.
-                instead = "" if source.kind == "script" else ", so check a lockfile instead"
+                instead = (
+                    ", so check its lock (uv lock --script) instead"
+                    if source.kind == "script"
+                    else ", so check a lockfile instead"
+                )
                 if not source.pypi_only:
                     what = "the script" if source.kind == "script" else "the project"
                     raise SourceError(

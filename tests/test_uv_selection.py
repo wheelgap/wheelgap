@@ -1923,3 +1923,30 @@ def test_script_lock_diff(tmp_path, capsys, fake_pypi):
         "1 new package has gaps.",
     ]
     assert fake_pypi == []
+
+
+@pytest.mark.parametrize("setting", ['no-binary-package = ["purewheel"]', "no-build = true"])
+def test_script_lock_refused_when_its_script_sets_build_restrictions(tmp_path, capsys, fake_pypi, setting):
+    (tmp_path / "example.py").write_text(
+        f'# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# {setting}\n# ///\nprint("hi")\n',
+        encoding="utf-8",
+    )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 2
+    err = capsys.readouterr().err
+    assert "example.py.lock: the script example.py sets" in err
+    assert setting.split(" ")[0] in err
+    assert fake_pypi == []
+
+
+def test_script_lock_read_when_its_script_sets_other_uv_settings(tmp_path, capsys, fake_pypi):
+    (tmp_path / "example.py").write_text(
+        '# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# exclude-newer = "2025-01-01T00:00:00Z"\n# ///\n',
+        encoding="utf-8",
+    )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert [(p["name"], p["results"]) for p in packages] == [("purewheel", {"win-arm64": "wheel"})]

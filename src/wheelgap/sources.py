@@ -363,12 +363,37 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
     return out
 
 
+_UV_BUILD_RESTRICTIONS = ("no-build", "no-binary", "no-build-package", "no-binary-package")
+
+
+def _refuse_script_build_restrictions(path: Path) -> None:
+    """A script's lock (example.py.lock) doesn't record the build restrictions in the script's own [tool.uv], which
+    `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them."""
+    if not path.name.endswith(".py.lock"):
+        return
+    script = path.with_name(path.name.removesuffix(".lock"))
+    if not script.is_file():
+        return
+    try:
+        data = _script_metadata(script)
+    except SourceError:
+        return  # no readable block beside it: nothing to apply, and the lock itself is still read
+    uv = data.get("tool", {}).get("uv", {}) if isinstance(data.get("tool"), dict) else {}
+    keys = [key for key in _UV_BUILD_RESTRICTIONS if isinstance(uv, dict) and key in uv]
+    if keys:
+        raise SourceError(
+            f"{path.name}: the script {script.name} sets {', '.join(keys)} in its [tool.uv], which wheelgap "
+            "doesn't read for a script's lock yet, so it can't say what `uv run` would install"
+        )
+
+
 def _uv_build_restrictions(path: Path, source: Source) -> None:
     """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
 
     uv.toml takes precedence over [tool.uv] in pyproject.toml when both are present.
     uv's pip-only [tool.uv.pip] options do not apply to uv sync.
     """
+    _refuse_script_build_restrictions(path)
     config_path = path.with_name("uv.toml")
     standalone = config_path.is_file()
     if not standalone:
@@ -1191,8 +1216,8 @@ def parse_pyproject(path: Path) -> Source:
 _SCRIPT_BLOCK = re.compile(r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
 
 
-def parse_script(path: Path) -> Source:
-    """Read a script's one PEP 723 `# /// script` block; never execute the Python file."""
+def _script_metadata(path: Path) -> dict:
+    """The TOML of a script's one PEP 723 `# /// script` block; never execute the Python file."""
     try:
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:
@@ -1210,6 +1235,12 @@ def parse_script(path: Path) -> Source:
         data = tomllib.loads(content)
     except tomllib.TOMLDecodeError as e:
         raise SourceError(f"{path}: invalid TOML in the # /// script block: {e}") from None
+    return data
+
+
+def parse_script(path: Path) -> Source:
+    """Read a script's one PEP 723 `# /// script` block; never execute the Python file."""
+    data = _script_metadata(path)
     return _project_source(
         {
             "project": {key: data[key] for key in ("dependencies", "requires-python") if key in data},

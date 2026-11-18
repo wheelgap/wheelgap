@@ -497,8 +497,11 @@ def _check_lockfile(
             raise SourceError(
                 "offline=True: deps=True would look packages up on PyPI; pass deps=False, or set offline=False"
             )
-        # wheelgap can't read a script's lock (example.py.lock), so a script gets no lockfile advice.
-        instead = "" if source.kind == "script" else ", so check a lockfile instead"
+        instead = (
+            ", so check its lock (uv lock --script) instead"
+            if source.kind == "script"
+            else ", so check a lockfile instead"
+        )
         if not source.pypi_only:
             what = "the script" if source.kind == "script" else "the project"
             raise SourceError(

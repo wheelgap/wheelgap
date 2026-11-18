@@ -74,6 +74,9 @@ another index keep their locked files and are never looked up on PyPI.
 
 A script's lock from `uv lock --script example.py`, `example.py.lock`, has the same format and is read the same way,
 from the script's `[manifest] requirements`: `wheelgap example.py.lock` and `wheelgap diff old.py.lock new.py.lock`.
+The lock doesn't record `no-build`, `no-binary`, `no-build-package` or `no-binary-package` set in the script's own
+`[tool.uv]`, so when the script beside the lock sets any of them, the lock is refused (exit 2) rather than read without
+them.
 
 **Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
 `no-binary-package` from the adjacent `pyproject.toml`'s `[tool.uv]` table or `uv.toml`. When both
@@ -387,7 +390,7 @@ errors here.
 If the block's `[tool.uv]` sets an index or sources (or a `uv.toml` or `pyproject.toml` beside the script or above it
 does), its packages may not be PyPI's: `--deps` refuses the script, and their names aren't sent to the services other
 flags use ([which names leave the run](how-it-works.md#pypi-origin)). [`--fix`](cli.md#fix) gives the `[tool.uv]`
-lines to add to the block for `uv run`. To check exactly what the script installs, pass its lock instead
+lines to add to the block for `uv run`. To check what the script installs, pass its lock instead
 (`example.py.lock`, from `uv lock --script`), which is read as a [`uv.lock`](#uvlock). Without `--deps`,
 `check_lockfile()` and `wheelgap diff` don't read a script.
 
