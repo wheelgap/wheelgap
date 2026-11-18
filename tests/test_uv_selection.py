@@ -1951,6 +1951,43 @@ def test_script_lock_refused_when_its_script_sets_build_restrictions(tmp_path, c
     assert fake_pypi == []
 
 
+@pytest.mark.parametrize(
+    ("name", "config"),
+    [("pyproject.toml", '[tool.uv]\nno-binary-package = ["purewheel"]\n'), ("uv.toml", "no-build = true\n")],
+)
+def test_script_lock_refused_when_a_folder_above_sets_build_restrictions(tmp_path, capsys, fake_pypi, name, config):
+    # uv run applies the nearest uv.toml or pyproject.toml, which for a script lock is often in a folder above it.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / name).write_text(config, encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    lock = tmp_path / "scripts" / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 2
+    err = capsys.readouterr().err
+    assert f"example.py.lock: {tmp_path.resolve() / name} sets" in err
+    assert fake_pypi == []
+
+
+def test_script_lock_ignores_a_folder_above_when_its_own_folder_has_config(tmp_path, capsys, fake_pypi):
+    # The pyproject.toml beside the lock is the nearest one; the restriction above it doesn't apply.
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\nno-build = true\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "pyproject.toml").write_text('[project]\nname = "s"\nversion = "0"\n', encoding="utf-8")
+    lock = tmp_path / "scripts" / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 0
+
+
+@pytest.mark.parametrize("setting", ["no-build = false", "no-binary-package = []"])
+def test_script_lock_read_when_its_script_turns_no_restriction_on(tmp_path, capsys, fake_pypi, setting):
+    (tmp_path / "example.py").write_text(
+        f'# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# {setting}\n# ///\n', encoding="utf-8"
+    )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 0
+
+
 def test_script_lock_read_when_its_script_sets_other_uv_settings(tmp_path, capsys, fake_pypi):
     (tmp_path / "example.py").write_text(
         '# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# exclude-newer = "2025-01-01T00:00:00Z"\n# ///\n',

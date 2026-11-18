@@ -446,7 +446,7 @@ def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, gap_wheels, 
         "  nowheels 0.9: win-arm64\n"
         "\n"
         "To install them with uv run, add this at the end of example.py's # /// script block, then run "
-        "uv lock --script example.py:\n"
+        f"uv lock --script {tmp_path / 'example.py'}:\n"
         "\n"
         "# [[tool.uv.index]]\n"
         '# name = "wheelgap"\n'
@@ -467,7 +467,7 @@ def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, gap_wheels, 
     (source,) = load_inputs([str(lock)])
     fill = _fill("uv")
     md = "\n".join(gapwheels.markdown_lines([gapwheels.Fill(fill.row, fill.target, fill.wheel, source)], False))
-    assert "`example.py`'s `# /// script` block, then run `uv lock --script example.py`:" in md
+    assert f"`example.py`'s `# /// script` block, then run `uv lock --script {tmp_path / 'example.py'}`:" in md
     assert '- uv only applies `[tool.uv.sources]` to a script\'s own dependencies, so also list `"x"`' in md
     assert "`pyproject.toml`" not in md
 

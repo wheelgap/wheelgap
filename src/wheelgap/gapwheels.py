@@ -16,6 +16,7 @@ import json
 import re
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -326,7 +327,7 @@ def _script_parts(
     for fs in by_script.values():
         source = fs[0].source
         if source.uv_script is not None:
-            label, direct = source.uv_script, _script_lock_direct_keys(source)
+            label, direct = Path(source.uv_script).name, _script_lock_direct_keys(source)
             relock: str | None = f"uv lock --script {source.uv_script}"
         else:
             label, direct, relock = source.label, _script_direct_keys(source), None

@@ -146,8 +146,9 @@ class Source:
     uv_packages: list[dict] | None = None
     uv_manifest: dict = field(default_factory=dict)
     uv_pyproject: Path | None = None
-    # A script's lock (example.py.lock, from uv lock --script): the script's file name. uv takes no dependency
-    # groups for it from a pyproject.toml beside it, so uv_pyproject is None; --fix's config goes in the script's block.
+    # A script's lock (example.py.lock, from uv lock --script): the script's path, as the lock's was given. uv takes
+    # no dependency groups for it from a pyproject.toml beside it, so uv_pyproject is None; --fix's config goes in the
+    # script's block.
     uv_script: str | None = None
     uv_default_groups: list[str] = field(default_factory=lambda: ["dev"])
     uv_selection: UvSelection | None = None
@@ -369,21 +370,46 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
 _UV_BUILD_RESTRICTIONS = ("no-build", "no-binary", "no-build-package", "no-binary-package")
 
 
+def _sets_build_restriction(uv: object) -> list[str]:
+    """The build restrictions a [tool.uv] table (or uv.toml) turns on: true, or a non-empty list."""
+    return [key for key in _UV_BUILD_RESTRICTIONS if isinstance(uv, dict) and uv.get(key)]
+
+
 def _refuse_script_build_restrictions(path: Path) -> None:
     """A script's lock (example.py.lock) doesn't record the build restrictions in the script's own [tool.uv], which
-    `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them."""
+    `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them.
+    The same goes for a uv.toml or pyproject.toml [tool.uv] in a folder above the lock (up to the repository root),
+    which uv also applies when there's none beside it: _uv_build_restrictions reads only the lock's own folder."""
     if not path.name.endswith(".py.lock"):
         return
+    folder = path.resolve().parent
+    if not ((folder / "uv.toml").is_file() or (folder / "pyproject.toml").is_file() or (folder / ".git").exists()):
+        for directory in folder.parents:
+            config = next((directory / n for n in ("uv.toml", "pyproject.toml") if (directory / n).is_file()), None)
+            if config is not None:
+                try:
+                    data = tomllib.loads(config.read_text(encoding="utf-8-sig"))
+                except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                    break
+                tool = data.get("tool", {})
+                uv = data if config.name == "uv.toml" else tool.get("uv", {}) if isinstance(tool, dict) else {}
+                if keys := _sets_build_restriction(uv):
+                    raise SourceError(
+                        f"{path.name}: {config} sets {', '.join(keys)}, which wheelgap doesn't read from a folder "
+                        "above a script's lock yet, so it can't say what `uv run` would install"
+                    )
+                break
+            if (directory / ".git").exists():
+                break
     script = path.with_name(path.name.removesuffix(".lock"))
     if not script.is_file():
         return
     try:
         data = _script_metadata(script)
-    except SourceError:
+    except (SourceError, OSError):
         return  # no readable block beside it: nothing to apply, and the lock itself is still read
     uv = data.get("tool", {}).get("uv", {}) if isinstance(data.get("tool"), dict) else {}
-    keys = [key for key in _UV_BUILD_RESTRICTIONS if isinstance(uv, dict) and key in uv]
-    if keys:
+    if keys := _sets_build_restriction(uv):
         raise SourceError(
             f"{path.name}: the script {script.name} sets {', '.join(keys)} in its [tool.uv], which wheelgap "
             "doesn't read for a script's lock yet, so it can't say what `uv run` would install"
@@ -464,7 +490,7 @@ def parse_uv_lock(path: Path) -> Source:
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
     if path.name.endswith(".py.lock"):
-        source.uv_script = path.name.removesuffix(".lock")
+        source.uv_script = str(path).removesuffix(".lock")  # as given, so --fix's `uv lock --script` runs from here
     else:
         source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
