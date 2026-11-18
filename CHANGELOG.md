@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A script's lock from `uv lock --script example.py` (`example.py.lock`) is read as a `uv.lock`: `wheelgap example.py.lock` checks exactly what the script installs, offline, and `wheelgap diff` compares two of them. A script called `requirements.py` gets its lock read the same way, not as a requirements file. (#528)
 - MCP server: a new `explain_install_failure` tool takes the text of a failed pip, uv, Poetry or PDM install log (up to 1 MB) and the Python and platform the install ran on, reads it as `--from-log` does, and checks each package that failed to build as `check_package` does with `explain: true`: its gaps, the rejected wheels and `--suggest`'s way out. The log is treated as untrusted text: the reply and errors repeat no more of it than package names and versions. (#478, thanks [@YVTOMAZ](https://github.com/YVTOMAZ))
 - `--suggest-targets`: quoted values get the same strictness on one line and over several — a control character, an invalid escape or `''` in a single-quoted value now refuses the file either way (a one-line `''` already did). (#515, thanks [@Seyamalam](https://github.com/Seyamalam))
 - Ctrl-C while packages are being looked up on the index (and during `--deps`) exits at once, without waiting for lookups already in flight. (#516, thanks [@Golden007-prog](https://github.com/Golden007-prog))
