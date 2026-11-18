@@ -44,13 +44,13 @@ A **file** is read by its name:
 
 | file name | read as |
 | --- | --- |
-| `uv.lock`, or another `*.lock` name containing `uv` | `uv.lock` |
+| `uv.lock`, a script's `*.py.lock`, or another `*.lock` name containing `uv` | `uv.lock` |
 | `pylock.toml`, `pylock.*.toml` | `pylock.toml` |
 | `poetry.lock` | `poetry.lock` |
 | `pdm.lock` | `pdm.lock` |
 | `Pipfile.lock` | `Pipfile.lock` |
 | `pixi.lock` | `pixi.lock` |
-| `requirements*.lock`, `*.txt`, `*.in` | a requirements file |
+| `requirements*.lock` (but not `requirements*.py.lock`), `*.txt`, `*.in` | a requirements file |
 | `*.json` | a pip installation report |
 | `environment*.yml`, `environment*.yaml` | a conda environment file (pip packages) |
 | `pyproject.toml` | a project's direct dependencies |
@@ -71,6 +71,9 @@ only a Windows-only dependency pulls in isn't reported on Linux.
 
 **Skipped:** packages whose source is `editable`, `virtual`, `git`, `path`, `directory` or `url`. Packages from
 another index keep their locked files and are never looked up on PyPI.
+
+A script's lock from `uv lock --script example.py`, `example.py.lock`, has the same format and is read the same way,
+from the script's `[manifest] requirements`: `wheelgap example.py.lock` and `wheelgap diff old.py.lock new.py.lock`.
 
 **Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
 `no-binary-package` from the adjacent `pyproject.toml`'s `[tool.uv]` table or `uv.toml`. When both
@@ -384,8 +387,9 @@ errors here.
 If the block's `[tool.uv]` sets an index or sources (or a `uv.toml` or `pyproject.toml` beside the script or above it
 does), its packages may not be PyPI's: `--deps` refuses the script, and their names aren't sent to the services other
 flags use ([which names leave the run](how-it-works.md#pypi-origin)). [`--fix`](cli.md#fix) gives the `[tool.uv]`
-lines to add to the block for `uv run`. wheelgap doesn't read a script's lock (`example.py.lock`, from
-`uv lock --script`) yet. Without `--deps`, `check_lockfile()` and `wheelgap diff` don't read a script.
+lines to add to the block for `uv run`. To check exactly what the script installs, pass its lock instead
+(`example.py.lock`, from `uv lock --script`), which is read as a [`uv.lock`](#uvlock). Without `--deps`,
+`check_lockfile()` and `wheelgap diff` don't read a script.
 
 A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 

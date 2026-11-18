@@ -11,6 +11,7 @@ from wheelgap.sources import (
     SourceError,
     UvSelection,
     _poetry_extras_declared_elsewhere,
+    file_kind,
     load_inputs,
     select_uv_dependencies,
 )
@@ -1859,3 +1860,66 @@ def test_uv_manifest_requirement_with_two_sources_is_input_error(tmp_path):
     )
     with pytest.raises(SourceError, match="the manifest has a dependency 'example' with conflicting sources"):
         load_inputs([str(tmp_path)])
+
+
+def _script_lock(*packages: str) -> str:
+    """A lock as `uv lock --script example.py` writes it, from purewheel (a py3 wheel) and puresdist (sdist only)."""
+    files = {
+        "purewheel": '[[package]]\nname = "purewheel"\nversion = "3.1"\nsource = {{ registry = "{pypi}" }}\n'
+        'wheels = [{{ url = "{files}/purewheel-3.1-py3-none-any.whl", hash = "sha256:00" }}]\n',
+        "puresdist": '[[package]]\nname = "puresdist"\nversion = "1.0"\nsource = {{ registry = "{pypi}" }}\n'
+        'sdist = {{ url = "{files}/puresdist-1.0.tar.gz", hash = "sha256:00" }}\n',
+    }
+    requirements = ", ".join(f'{{ name = "{name}" }}' for name in packages)
+    body = "\n".join(files[name].format(pypi=_PYPI, files=_FILES) for name in packages)
+    header = 'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n'
+    return f"{header}\n[manifest]\nrequirements = [{requirements}]\n\n{body}"
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("example.py.lock", "uv"),
+        ("requirements.py.lock", "uv"),
+        ("requirements.lock", "requirements"),
+        ("requirements-dev.lock", "requirements"),
+    ],
+)
+def test_script_lock_names_are_read_as_uv(tmp_path, name, kind):
+    assert file_kind(tmp_path / name) == kind
+
+
+def test_script_lock_is_checked_offline(tmp_path, capsys, fake_pypi):
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel", "puresdist"), encoding="utf-8")
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64", "--json"]) == 1
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert sorted((p["name"], p["results"]) for p in packages) == [
+        ("puresdist", {"win-arm64": "source"}),
+        ("purewheel", {"win-arm64": "wheel"}),
+    ]
+    assert fake_pypi == []
+
+
+def test_script_lock_named_requirements_is_not_a_requirements_file(tmp_path):
+    lock = tmp_path / "requirements.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    (src,) = load_inputs([str(lock)])
+    assert src.kind == "uv"
+    assert [(p.name, p.version) for p in src.packages] == [("purewheel", "3.1")]
+
+
+def test_script_lock_diff(tmp_path, capsys, fake_pypi):
+    from wheelgap.diff import main as diff_main
+
+    old = tmp_path / "old.py.lock"
+    new = tmp_path / "new.py.lock"
+    old.write_text(_script_lock("purewheel"), encoding="utf-8")
+    new.write_text(_script_lock("purewheel", "puresdist"), encoding="utf-8")
+    assert diff_main([str(old), str(new), "-p", "3.13", "-t", "win-arm64"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "puresdist 1.0 (new)",
+        "  win-arm64: ● source",
+        "1 new package has gaps.",
+    ]
+    assert fake_pypi == []

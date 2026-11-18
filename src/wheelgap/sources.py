@@ -2463,6 +2463,8 @@ def file_kind(path: Path) -> str:
         return PARSERS[name]
     if name.startswith("pylock.") and name.endswith(".toml"):
         return "pylock"
+    if name.endswith(".py.lock"):  # uv lock --script example.py, before requirements*.lock (requirements.py.lock)
+        return "uv"
     if name.startswith("requirements") and name.endswith(".lock"):
         return "requirements"
     if name.endswith(".lock") and "uv" in name:
@@ -2473,8 +2475,9 @@ def file_kind(path: Path) -> str:
         return "pip-report"
     raise SourceError(
         f"don't know how to read {path} "
-        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, requirements.lock, "
-        "requirements.txt, pip report.json, environment.yml, pyproject.toml or a script.py with a # /// script block)"
+        "(expected uv.lock, script.py.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, "
+        "requirements.lock, requirements.txt, pip report.json, environment.yml, pyproject.toml "
+        "or a script.py with a # /// script block)"
     )
 
 
