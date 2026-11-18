@@ -375,24 +375,38 @@ def _sets_build_restriction(uv: object) -> list[str]:
     return [key for key in _UV_BUILD_RESTRICTIONS if isinstance(uv, dict) and uv.get(key)]
 
 
+def _uv_config(directory: Path) -> tuple[Path, object] | None:
+    """The uv settings uv reads in `directory`: its uv.toml, else a pyproject.toml with a [tool.uv] table. uv skips a
+    pyproject.toml without one (and one it can't read) and keeps looking in the folders above."""
+    for name in ("uv.toml", "pyproject.toml"):
+        config = directory / name
+        if not config.is_file():
+            continue
+        try:
+            data = tomllib.loads(config.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        if name == "uv.toml":
+            return config, data
+        tool = data.get("tool")
+        if isinstance(tool, dict) and "uv" in tool:
+            return config, tool["uv"]
+    return None
+
+
 def _refuse_script_build_restrictions(path: Path) -> None:
     """A script's lock (example.py.lock) doesn't record the build restrictions in the script's own [tool.uv], which
     `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them.
     The same goes for a uv.toml or pyproject.toml [tool.uv] in a folder above the lock (up to the repository root),
-    which uv also applies when there's none beside it: _uv_build_restrictions reads only the lock's own folder."""
+    which uv also applies when there's none beside it (a pyproject.toml without [tool.uv] doesn't count):
+    _uv_build_restrictions reads only the lock's own folder."""
     if not path.name.endswith(".py.lock"):
         return
     folder = path.resolve().parent
-    if not ((folder / "uv.toml").is_file() or (folder / "pyproject.toml").is_file() or (folder / ".git").exists()):
+    if _uv_config(folder) is None and not (folder / ".git").exists():
         for directory in folder.parents:
-            config = next((directory / n for n in ("uv.toml", "pyproject.toml") if (directory / n).is_file()), None)
-            if config is not None:
-                try:
-                    data = tomllib.loads(config.read_text(encoding="utf-8-sig"))
-                except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-                    break
-                tool = data.get("tool", {})
-                uv = data if config.name == "uv.toml" else tool.get("uv", {}) if isinstance(tool, dict) else {}
+            if (found := _uv_config(directory)) is not None:
+                config, uv = found
                 if keys := _sets_build_restriction(uv):
                     raise SourceError(
                         f"{path.name}: {config} sets {', '.join(keys)}, which wheelgap doesn't read from a folder "

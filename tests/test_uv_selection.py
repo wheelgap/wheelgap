@@ -1968,14 +1968,24 @@ def test_script_lock_refused_when_a_folder_above_sets_build_restrictions(tmp_pat
     assert fake_pypi == []
 
 
-def test_script_lock_ignores_a_folder_above_when_its_own_folder_has_config(tmp_path, capsys, fake_pypi):
-    # The pyproject.toml beside the lock is the nearest one; the restriction above it doesn't apply.
+@pytest.mark.parametrize(
+    ("beside", "code"),
+    [
+        # uv skips a pyproject.toml without [tool.uv] and keeps looking, so the restriction above applies.
+        ('[project]\nname = "s"\nversion = "0"\n', 2),
+        # One with [tool.uv] is the nearest config, so the restriction above it doesn't.
+        ('[tool.uv]\nexclude-newer = "2025-01-01T00:00:00Z"\n', 0),
+    ],
+)
+def test_script_lock_folder_above_and_the_pyproject_beside_it(tmp_path, capsys, fake_pypi, beside, code):
     (tmp_path / "pyproject.toml").write_text("[tool.uv]\nno-build = true\n", encoding="utf-8")
     (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "pyproject.toml").write_text('[project]\nname = "s"\nversion = "0"\n', encoding="utf-8")
+    (tmp_path / "scripts" / "pyproject.toml").write_text(beside, encoding="utf-8")
     lock = tmp_path / "scripts" / "example.py.lock"
     lock.write_text(_script_lock("purewheel"), encoding="utf-8")
-    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 0
+    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == code
+    if code == 2:
+        assert "no-build" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("setting", ["no-build = false", "no-binary-package = []"])
