@@ -157,7 +157,7 @@ repos:
       - id: wheelgap
 ```
 
-The hook runs when a lockfile, requirements file, `pyproject.toml`, `uv.toml` or `.python-version` changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms.
+The hook runs when a lockfile, requirements file, `pyproject.toml`, `uv.toml` or `.python-version` changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms. The hook checks the lockfile in the repo's root; to check a script's lock (`example.py.lock`) instead, add `args: [example.py.lock]` and `files: ^example\.py(\.lock)?$` to the hook.
 
 ## From Python
 
