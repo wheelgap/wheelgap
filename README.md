@@ -15,7 +15,9 @@
 
 Point it at your lockfile and the platforms you ship to (ARM servers, Alpine images, Windows on ARM, free-threaded Python 3.14t). It tells you which packages pip or uv will have to compile from source, and which can't be installed at all.
 
-📊 **New: [wheel coverage for the top 5,000 PyPI packages](https://wheelgap.github.io/tracker/)**, by platform and Python version, updated nightly.
+🔎 **Try it on any public repo, in your browser: [wheelgap.github.io/tracker/check](https://wheelgap.github.io/tracker/check/).** Paste a GitHub repository. It reads the lockfile, works out the platforms the repo ships to from its CI and Dockerfiles, and lists every dependency with no prebuilt wheel there, with the release that fixes it. Nothing to install.
+
+📊 **[Wheel coverage for the top 5,000 PyPI packages](https://wheelgap.github.io/tracker/)**, by platform and Python version, updated nightly. 📚 **[Case studies](https://wheelgap.github.io/wheelgap/case-studies/)**: what wheelgap found in FastAPI, pydantic, Poetry, PDM, Streamlit, Typer and other projects, each pinned to a commit you can re-run.
 
 ![wheelgap demo](https://raw.githubusercontent.com/wheelgap/wheelgap/main/docs/demo.gif)
 
