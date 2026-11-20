@@ -51,9 +51,6 @@ These packages are a gap in more than one study:
   scan of pydantic.
 - **cryptography 50.0.2** has no macOS Intel wheel (mitmproxy) and no Windows on ARM wheel (HERD), and no newer
   release has either. Two studies.
-- **onnxruntime** is `missing` in two studies, at different versions and for different reasons, because it publishes
-  no sdist to fall back on: 1.20.0 in Buzz, where its macOS wheel needs macOS 13.0 and the floor is 11.0, and 1.30.0
-  in Pydantic AI, where its wheels stop at CPython 3.14 and no 3.15 install selects the pin.
 
 ## The studies
 
