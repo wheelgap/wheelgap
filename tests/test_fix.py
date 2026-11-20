@@ -175,6 +175,15 @@ def test_entry_requires_python_must_admit_the_target(capsys, fake_pypi, gap_whee
     assert data["gap_wheels"] == [] and NOTHING_FITS in err
 
 
+def test_entry_requires_python_null_means_no_limit(capsys, fake_pypi, gap_wheels):
+    # The wheels pipeline writes null when PyPI states no Requires-Python.
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL, requires_python=None)
+    _, data, _ = gap_wheels_json(capsys, *NOWHEELS, "--fix")
+    assert [g["wheel"] for g in data["gap_wheels"]] == [FT_WHEEL]
+    (entry,) = gapwheels.parse({"schema": 1, "wheels": [{**GOOD, "requires_python": None}]})
+    assert entry.requires_python is None
+
+
 def test_private_package_gets_no_suggestion_and_no_request(capsys, fake_pypi, gap_wheels, tmp_path):
     gap_wheels.add("nowheels", "0.9", FT_WHEEL)
     (tmp_path / "uv.lock").write_text(uv_lock("https://pkgs.example.com/simple"), encoding="utf-8")

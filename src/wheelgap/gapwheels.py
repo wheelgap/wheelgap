@@ -83,8 +83,8 @@ def _entry(e: object) -> GapWheel | None:
     if not tags:
         return None
     requires_python = None
-    if "requires_python" in e:
-        spec = e["requires_python"]
+    spec = e.get("requires_python")  # null: PyPI states no Requires-Python, so there's no limit
+    if spec is not None:
         if not isinstance(spec, str):
             return None
         try:
