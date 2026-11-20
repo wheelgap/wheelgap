@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `--dockerfile-inputs` reads a Dockerfile whose `# syntax=` pins docker/dockerfile by digest (`docker/dockerfile:1@sha256:…`), as plain `--dockerfile` does, instead of refusing it as another frontend. A heredoc under it is still refused, since the digest doesn't say which version's heredoc rules apply.
+- `--dockerfile-inputs` reads a Dockerfile whose `# syntax=` pins docker/dockerfile by digest (`docker/dockerfile:1@sha256:…`), as plain `--dockerfile` does, instead of refusing it as another frontend. A heredoc under it is still refused, since the digest doesn't say which version's heredoc rules apply. (#585)
 - Text and Markdown reports suggest `--fix` when a gap may be filled by a wheel on wheelgap's gap wheel index, without looking up the list. (#574, thanks [@kunalkshah1](https://github.com/kunalkshah1))
 - A `pyproject.toml` beside the lock (its `[tool.wheelgap]` table and uv's `[tool.uv]` build restrictions) and a `uv.toml` beside the lock are read with a byte order mark tolerated, and a file that isn't UTF-8 is an input error naming the file, instead of a bare `UnicodeDecodeError` that names nothing (#570, thanks [@bfs2021](https://github.com/bfs2021))
 - A `uv.lock` checked with no `--extra` or `--group` is now checked the way `uv sync --all-packages --all-extras --all-groups` installs it: a dependency's extras count only where some edge asks for them on that target. Before, every extra of every package was followed, which could list packages no install reaches, such as numpy, onnxruntime and flatbuffers on Python 3.15 for pydantic-ai's lock. (#572)
