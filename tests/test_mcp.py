@@ -2955,7 +2955,7 @@ def test_check_lockfile_dependencies_skips_build_info_when_configured(fake_pypi,
 @pytest.mark.parametrize(
     ("selection", "packages", "gaps"),
     [
-        ({}, 11, {"gpu", "devtool", "docstool", "unused"}),
+        ({}, 10, {"gpu", "devtool", "docstool"}),
         ({"no_dev": True}, 4, set()),
         ({"extras": ["api"], "no_dev": True}, 7, set()),
         ({"all_extras": True}, 9, {"gpu", "devtool"}),

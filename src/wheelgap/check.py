@@ -623,9 +623,11 @@ def _narrow_candidates(
 def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
     """Walk selected uv roots, re-visiting a package when another edge activates more extras."""
     selection = source.uv_selection
-    assert selection is not None
+    everything = selection is None
+    if selection is None:
+        selection = UvSelection(all_extras=True)
     packages = source.uv_packages or []
-    roots = uv_selected_roots(source)
+    roots = source.roots if everything else uv_selected_roots(source)
     available_groups = {canonicalize_name(name) for name in source.uv_manifest.get("dependency-groups", {})} | {
         name for i in roots for name in uv_group_names(packages[i])
     }
@@ -634,6 +636,8 @@ def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | 
     else:
         defaults = available_groups if "*" in source.uv_default_groups else frozenset(source.uv_default_groups)
         groups = selection.groups | defaults
+    if everything:  # `uv sync --all-packages --all-extras --all-groups`
+        groups = frozenset(available_groups)
     if selection.no_dev:
         groups = groups - {"dev"}
     groups = frozenset(groups)
@@ -729,7 +733,7 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
 
     The walk is breadth-first from the roots, so following the parents gives a shortest path.
     """
-    if source.uv_selection is not None:
+    if source.uv_selection is not None or source.uv_packages is not None:
         return _uv_reachable(source, target)
     by_name: dict[str, list[int]] = {}
     for i, p in enumerate(source.packages):
@@ -972,7 +976,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
             installed = paths
         elif source.edges is not None:
             installed = {
-                t: _uv_reachable(source, t, paths[t]) if source.uv_selection is not None else reachable(source, t)
+                t: _uv_reachable(source, t, paths[t]) if source.uv_packages is not None else reachable(source, t)
                 for t in targets
             }
         else:

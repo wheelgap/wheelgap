@@ -25,7 +25,9 @@ def installed(fixtures, selection=None, platform="linux-x86_64"):
     return {r.package.name for r in check(sources, build_targets(["3.13"], [platform])) if r.needed}
 
 
-def test_unselected_graph_stays_conservative(fixtures):
+def test_whole_lock_is_what_uv_sync_all_installs(fixtures):
+    # No selection checks what `uv sync --all-packages --all-extras --all-groups` installs: every member's extras and
+    # groups, and a dependency's extras only where an edge asks for them (`unused` is an extra nothing requests).
     assert installed(fixtures) == {
         "common",
         "library",
@@ -33,12 +35,48 @@ def test_unselected_graph_stays_conservative(fixtures):
         "one",
         "two",
         "three",
-        "unused",
         "api",
         "gpu",
         "devtool",
         "docstool",
     }
+
+
+# pydantic-ai's lock (4df9988f) in miniature: an extra lists `defender` plainly and `defender[onnx]` only below 3.15,
+# so no install of the lock reaches `onnxruntime` on 3.15; `uv export --all-packages --all-extras --all-groups` agrees.
+EXTRA_BELOW_315_LOCK = """
+version = 1
+requires-python = ">=3.11"
+[[package]]
+name = "app"
+version = "1.0"
+source = { editable = "." }
+[package.optional-dependencies]
+ml = [
+    { name = "defender" },
+    { name = "defender", extra = ["onnx"], marker = "python_full_version < '3.15'" },
+]
+[[package]]
+name = "defender"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/defender-1.0-py3-none-any.whl" }]
+[package.optional-dependencies]
+onnx = [{ name = "onnxruntime" }]
+[[package]]
+name = "onnxruntime"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://example.invalid/onnxruntime-1.0-cp314-cp314-manylinux_2_28_x86_64.whl" }]
+"""
+
+
+@pytest.mark.parametrize(("python", "expected"), [("3.14", {"defender", "onnxruntime"}), ("3.15", {"defender"})])
+def test_whole_lock_follows_a_dependency_extra_only_where_it_is_requested(tmp_path, python, expected):
+    (tmp_path / "uv.lock").write_text(EXTRA_BELOW_315_LOCK, encoding="utf-8")
+    sources = load_inputs([str(tmp_path / "uv.lock")])
+    rows = check(sources, build_targets([python], ["linux-x86_64"]))
+    assert {r.package.name for r in rows if r.needed} == expected
 
 
 def test_no_dev_checks_runtime_without_unrequested_optional_packages(fixtures):
