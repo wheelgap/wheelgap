@@ -125,7 +125,8 @@ Edge = tuple[str, str | None, str | None, dict[str, object] | None]
 
 @dataclass(frozen=True)
 class UvSelection:
-    """Explicit installation selection. None on a Source keeps the conservative all-dependencies walk."""
+    """Explicit installation selection. None on a uv.lock Source checks what
+    `uv sync --all-packages --all-extras --all-groups` installs."""
 
     extras: frozenset[str] = frozenset()
     all_extras: bool = False

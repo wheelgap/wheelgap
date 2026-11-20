@@ -113,7 +113,8 @@ dependencies and default groups. Combine `--only-group` with `--group` to add mo
 
 Without any selector, a `uv.lock` is checked the way `uv sync --all-packages --all-extras --all-groups` installs it:
 every workspace member with all its extras and groups, and a dependency's extras only where some edge requests them on
-that target.
+that target. Where a lock declares conflicting extras, which `uv sync --all-extras` refuses, wheelgap checks both
+sides.
 
 With selection enabled, rooted workspaces start at the root project (members outside the selection aren't checked,
 and a note on stderr names them); virtual workspaces start at their members. Dependency-requested extras are followed
