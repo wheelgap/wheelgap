@@ -65,7 +65,7 @@ Both lockfiles are checked and packages are matched by name. Per target:
 - A package listed more than once (a `uv.lock` fork) takes its worst status on each target.
 
 With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source, is
-missing or (after 0.13.0) couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
+missing or couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
 or `(via mcp +1)` when more than one does. The Action's PR comment shows the same.
 
 A requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) is matched by its path, so it shows up

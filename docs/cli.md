@@ -13,7 +13,7 @@ Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ign
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
-`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.13.0**
+`wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.14.0**
 aren't in a release yet.
 
 ## Targets
@@ -92,7 +92,7 @@ heredoc), or a nested `-r` or `-c` in `FILE`. Without this flag, `--dockerfile` 
 
 ### `--dockerfile-context` {#dockerfile-context}
 
-`--dockerfile-context DIR` (with `--dockerfile-inputs`, **after 0.13.0**): the build context, for a Dockerfile that
+`--dockerfile-context DIR` (with `--dockerfile-inputs`): the build context, for a Dockerfile that
 isn't built from its own folder. For `docker build -f docker/Dockerfile .`, run
 `wheelgap --dockerfile docker/Dockerfile --dockerfile-inputs --dockerfile-context .`. `COPY` sources are looked for in
 `DIR`, a path or symlink that leaves `DIR` is refused, and `[tool.wheelgap]` and `.python-version` are read from `DIR`.
@@ -272,7 +272,7 @@ Show every package in the table, not just the ones with gaps.
 
 For each gap, list the wheels that were rejected and why, closest misses first, and the dependency path that installs
 the package where the input has one. With `--json`, adds `rejected` and `via` to each package. Text output can't
-combine it with quiet mode. See [Output](output.md#explain). With [`--fix`](#fix) (**after 0.13.0**), a gap that a
+combine it with quiet mode. See [Output](output.md#explain). With [`--fix`](#fix), a gap that a
 gap wheel fills also gets a `gap wheel` line.
 
 A wheel that would fit but whose release was yanked is named with the reason `yanked`.
@@ -420,7 +420,7 @@ reads nothing. If the list can't be read, a note on stderr says so. With `--json
 [`gap_wheels`](output.md#fix). There's no config key for it.
 See [Installing from the gap wheel index](recipes.md#installing-from-the-gap-wheel-index).
 
-With `--explain` too (**after 0.13.0**), each package a gap wheel fills gets a `gap wheel` line under its first filled
+With `--explain` too, each package a gap wheel fills gets a `gap wheel` line under its first filled
 target, naming the targets it fills and saying the wheel is unofficial: built by wheelgap from the PyPI sdist, not from
 the package's maintainers. For inputs pip installs from as they are (a requirements file, a `pyproject.toml`, a pip
 report, an `environment.yml`'s `pip:` list or package names) it gives the `pip install --extra-index-url` command;
@@ -430,7 +430,7 @@ script likewise, since `uv run` reads the index from its `# /// script` block. W
 
 ### `--print-gap-wheel-snippet` {#print-gap-wheel-snippet}
 
-With [`--fix`](#fix) (**after 0.13.0**), print only the configuration that installs the gap wheels, instead of the
+With [`--fix`](#fix), print only the configuration that installs the gap wheels, instead of the
 usual output, for you to copy into your project. It never writes to your project. Comment lines say the wheels are unofficial
 (built by wheelgap from the PyPI sdist, not by the package's maintainers), link to how they're built, and name each
 package and the targets it fills. The exit code is the check's own, so a run with gaps still exits 1 after printing a

@@ -8,7 +8,7 @@ Python is checked.
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.13.0
+- uses: wheelgap/wheelgap@v0.14.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: wheelgap/wheelgap@v0.13.0
+      - uses: wheelgap/wheelgap@v0.14.0
         with:
           args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64,musl-aarch64
           compare-to: base
@@ -108,7 +108,7 @@ summary for the comparison, and can comment on the pull request.
 - uses: actions/checkout@v7
   with:
     fetch-depth: 0  # so git can read the base branch's lockfile
-- uses: wheelgap/wheelgap@v0.13.0
+- uses: wheelgap/wheelgap@v0.14.0
   with:
     args: diff origin/${{ github.base_ref }}:uv.lock uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
     summary: "false"
@@ -149,7 +149,7 @@ Markdown report to the summary page:
 ```yaml
 - run: |
     set -o pipefail
-    pipx run --spec wheelgap==0.13.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+    pipx run --spec wheelgap==0.14.0 wheelgap uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
 ## pre-commit
@@ -157,7 +157,7 @@ Markdown report to the summary page:
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.13.0
+    rev: v0.14.0
     hooks:
       - id: wheelgap
 ```
@@ -209,7 +209,7 @@ wheelgap:
         - uv.lock
         - pyproject.toml
   script:
-    - uvx wheelgap@0.13.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
+    - uvx wheelgap@0.14.0 uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --junit wheelgap-junit.xml
   artifacts:
     when: always
     reports:
@@ -258,7 +258,7 @@ Windows on ARM wheels that every release since 46.0.0 had:
 ```yaml
 - name: Build
   run: uv build
-- uses: wheelgap/wheelgap@v0.13.0
+- uses: wheelgap/wheelgap@v0.14.0
   with:
     dist: dist
     args: -p 3.13 -t win-arm64,linux-aarch64,musl-aarch64

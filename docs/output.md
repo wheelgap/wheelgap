@@ -24,7 +24,7 @@ Add `set -o pipefail` when you pipe the output, so input errors still fail.
 ## Text
 
 ```text
-wheelgap 0.13.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.14.0 · uv.lock · 5 packages · Python 3.13
 
 package    version  linux-aarch64  musl-aarch64
 fastlib    2.0.0    ● source       ● source
@@ -96,7 +96,7 @@ uvloop 0.21.0 on win-arm64: ● source
 Other inputs have no dependency graph, so they show no path. If you think wheelgap got a package wrong, this output
 (or `--json --explain`) is all a bug report needs, with no need to share your lockfile.
 
-For a `uv.lock` checked with `--online`, `--explain` also names (after 0.13.0) each package that uv installs and pip
+For a `uv.lock` checked with `--online`, `--explain` also names each package that uv installs and pip
 would refuse (uv ignores `Requires-Python` upper bounds; see [uv.lock](inputs.md#uvlock)), whether or not it has a
 gap:
 
@@ -406,7 +406,7 @@ package that isn't one of the block's own `dependencies` (uv applies sources onl
 on stderr names them. `--markdown` renders the same section with fenced code blocks, and `-q` keeps it. With nothing to fill, a
 note on stderr says so instead (not with `-q`).
 
-With `--explain` too (**after 0.13.0**), each package a gap wheel fills gets a `gap wheel` line under its first
+With `--explain` too, each package a gap wheel fills gets a `gap wheel` line under its first
 filled target in the `--explain` output, naming the targets it fills. The wheel is unofficial: built by wheelgap from
 the PyPI sdist, not from the package's maintainers. For an input pip installs from as it is, the line gives the pip
 command; for a lockfile it points to the section above, since the lockfile's own tool has to pick up the index:
@@ -450,17 +450,17 @@ gaps = [p["name"] for p in data["packages"] if p["results"].get(key) in ("source
 ```
 
 With `--json --explain`, each package gets `rejected` (`{"file", "reason"}` objects) and `via` (the dependency path),
-both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph, and (after 0.13.0) also
+both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph, and also
 covers targets where the package couldn't be looked up. It also
 gets `issues_url`: the package's issue tracker URL from its PyPI metadata, or `null`, and `direct`:
-for each gap target, and (after 0.13.0) each target where the package couldn't be looked up (`unknown`), the direct
+for each gap target, and each target where the package couldn't be looked up (`unknown`), the direct
 dependencies that lead to the package, as the table's `cryptography (via mcp)` names
 them (`{"win-arm64": ["mcp", "httpx"]}`). `direct` has entries only for uv.lock, Poetry 1.x and `--deps` inputs. It
 leaves out a target where the package is itself a direct dependency, and may leave one out when the lockfile doesn't
 record which direct dependency asked for an extra that leads to the package (Poetry 1.x).
 
 For a `uv.lock` checked with `--online`, a package with files that uv installs and pip would refuse (uv ignores
-`Requires-Python` upper bounds) also gets `pip_refuses` (after 0.13.0), with or without `--explain`: those files, each
+`Requires-Python` upper bounds) also gets `pip_refuses`, with or without `--explain`: those files, each
 mapped to the reason, as in `{"agent_client_protocol-0.11.1-py3-none-any.whl": "requires Python <3.15,>=3.10"}`. Its
 `results` are still uv's. See [uv.lock](inputs.md#uvlock).
 
@@ -488,7 +488,7 @@ wheels go in a collapsed section.
 ```markdown
 ### wheelgap: 3 of 5 packages have gaps
 
-wheelgap 0.13.0 · `uv.lock` · 5 packages · Python 3.13
+wheelgap 0.14.0 · `uv.lock` · 5 packages · Python 3.13
 
 | package | version | linux-aarch64 | musl-aarch64 |
 | --- | --- | --- | --- |

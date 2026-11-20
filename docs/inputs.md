@@ -72,7 +72,7 @@ only a Windows-only dependency pulls in isn't reported on Linux.
 **Answers follow `uv sync`**, with and without `--online` (0.13.0 followed pip with `--online`). uv
 [ignores `Requires-Python` upper bounds](https://docs.astral.sh/uv/reference/internals/resolver/#requires-python), so
 a pin whose release says `<3.15` still counts on Python 3.15, where pip would refuse it (when installing from a
-requirements file exported from the lock, for example). With `--online` (after 0.13.0), wheelgap says where the two
+requirements file exported from the lock, for example). With `--online`, wheelgap says where the two
 differ: a note on stderr gives the number of such packages, `--explain` names them, and `--json` lists the files in
 each package's `pip_refuses`. Without `--online` it can't tell, because the lock doesn't record each file's
 `Requires-Python`. Only a plain `<` or `<=` bound is read this way: a file left out by `==3.14.*`, `~=` or `!=` stays
@@ -142,7 +142,7 @@ targets; see [Targets](targets.md#how-targets-are-chosen).
 **Read:** each package's wheel and sdist filenames, its `marker`, its `index`, and the file's `requires-python`
 (with the same re-check as `uv.lock` for Pythons it leaves out).
 
-A package's own `requires-python` is applied to the target Python (after 0.13.0): where the range leaves the Python
+A package's own `requires-python` is applied to the target Python: where the range leaves the Python
 out, the pin is `missing` there, because an installer must refuse it
 ([the pylock.toml specification](https://packaging.python.org/en/latest/specifications/pylock-toml/#installation)),
 and `--explain` gives the range. With `--online`, a package looked up on the index goes by the index's per-file
@@ -157,7 +157,7 @@ selection flags don't apply.
 
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` in older locks) and its markers.
 
-A package's `python-versions` is applied to the target Python (after 0.13.0) in locks from lock-version 2.1 on: where
+A package's `python-versions` is applied to the target Python in locks from lock-version 2.1 on: where
 the range leaves the Python out, the pin is `missing` there and `--explain` gives the range. Poetry only locks a
 package for the Pythons its markers select, so this changes an answer only for a Python outside the range the project
 was locked for (`-p 3.14` when the project says `<3.14`), where it shows which pins hold the project back. `*`, and a
@@ -206,7 +206,7 @@ the lock alone can't tell, wheelgap checks a superset of what any Poetry 2.x ins
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` before PDM 2.8) and its `marker`.
 A package with no recorded files is looked up on the index.
 
-A package's `requires_python` is applied to the target Python (after 0.13.0) in locks made with the
+A package's `requires_python` is applied to the target Python in locks made with the
 `inherit_metadata` strategy (PDM's default since 2.11), which records each package's marker: where the range leaves
 the Python out, the pin is `missing` there and `--explain` gives the range. As with `poetry.lock`, this changes an
 answer only for a Python outside the range the project was locked for. It isn't applied to a lock without
