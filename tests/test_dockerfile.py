@@ -1240,6 +1240,41 @@ def test_dockerfile_requirements_reads_system_package_commands(tmp_path):
     assert dockerfile_requirements(path) == [(5, tmp_path / "requirements.txt")]
 
 
+_DIGEST = "@sha256:" + "0123456789abcdef" * 4
+
+
+@pytest.mark.parametrize(
+    "frontend",
+    [f"docker/dockerfile:1{_DIGEST}", f"docker/dockerfile{_DIGEST}", f"docker.io/docker/dockerfile:1.7{_DIGEST}"],
+)
+def test_dockerfile_requirements_reads_a_digest_pinned_docker_dockerfile_frontend(tmp_path, frontend):
+    body = "FROM python:3.13-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
+    path = _context(tmp_path, f"# syntax={frontend}\n{body}")
+    assert dockerfile_requirements(path) == [(5, tmp_path / "requirements.txt")]
+    # Its version is unknown, so a heredoc anywhere is still refused.
+    path.write_text(f"# syntax={frontend}\n{body}RUN <<EOF\necho hi\nEOF\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match="may read the heredocs in 'RUN <<EOF'"):
+        dockerfile_requirements(path)
+
+
+@pytest.mark.parametrize(
+    "frontend",
+    [
+        "example.com/frontend:1",
+        f"example.com/frontend:1{_DIGEST}",
+        f"docker/dockerfile:1@sha256:{'0' * 63}",  # not a full digest
+        f"docker/dockerfile:1@sha256:{'A' * 64}",  # digests are lower-case hex
+    ],
+)
+def test_dockerfile_requirements_still_refuses_other_frontends(tmp_path, frontend):
+    path = _context(
+        tmp_path,
+        f"# syntax={frontend}\nFROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\n",
+    )
+    with pytest.raises(DockerfileError, match="only reads Dockerfiles for docker/dockerfile frontends"):
+        dockerfile_requirements(path)
+
+
 def test_dockerfile_requirements_refuses_a_pip_config_file(tmp_path):
     path = _context(
         tmp_path,
