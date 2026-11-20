@@ -2260,6 +2260,7 @@ def _assert_matches_output_schema(data):
             "suggest",
             "last_with_wheel",
             "gap_wheel",
+            "pip_refuses",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -2312,6 +2313,8 @@ def _assert_matches_output_schema(data):
                 assert wheel.get("install", "pip install --extra-index-url ").startswith(
                     "pip install --extra-index-url "
                 )
+        if "pip_refuses" in pkg:  # files uv installs from a uv.lock and pip would refuse: never an empty object
+            assert pkg["pip_refuses"] and all(isinstance(why, str) and why for why in pkg["pip_refuses"].values())
         if "last_with_wheel" in pkg:  # an older release for gap targets no newer one has a wheel for
             assert "suggest" in pkg and not set(pkg["last_with_wheel"]) & set(pkg["suggest"])
             assert set(pkg["last_with_wheel"]) <= set(pkg["rejected"])
@@ -2905,6 +2908,23 @@ def test_directory_without_lockfile_suggests_pyproject(capsys, fake_pypi, tmp_pa
     assert code == 2
     assert "no lockfile found" in err
     assert f"wheelgap {tmp_path / 'pyproject.toml'}" in err
+
+
+def test_directory_with_groups_only_pyproject_suggests_group(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY_PYPROJECT, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert "no lockfile found" in err
+    assert f"wheelgap {tmp_path / 'pyproject.toml'} --group NAME` (groups: shared, test)." in err
+    assert not fake_pypi
+
+
+def test_directory_with_groups_only_pyproject_in_a_buildable_project_has_no_group_hint(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY_PYPROJECT, encoding="utf-8")
+    (tmp_path / "setup.py").write_text("", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert "no lockfile found" in err and "--group" not in err
 
 
 # --github-annotations
@@ -4311,6 +4331,169 @@ def test_default_uv_extra_is_attributed_only_to_the_direct_requester(capsys, tmp
     assert fake_pypi == []
 
 
+def test_whole_lock_hints_gap_reached_through_second_member_extra(capsys, tmp_path, fake_pypi):
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["second"]\n'
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[[package]]\n"
+        'name = "second"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/second" }\n'
+        "[package.optional-dependencies]\n"
+        'extra = [{ name = "cryptography" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via second)" in out
+    assert fake_pypi == []
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and "via: second → cryptography" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--no-dev", "--offline")
+    assert code == 0 and "cryptography" not in out
+
+
+def test_whole_lock_hints_gap_reached_through_non_default_group(capsys, tmp_path, fake_pypi):
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[package.dev-dependencies]\n"
+        'lint = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_hints_gap_in_second_member_group_name_the_group_dependency(capsys, tmp_path, fake_pypi):
+    # --explain starts a group's path at the group, not the member, so the hint names the group's dependency.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["second"]\n'
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        "[[package]]\n"
+        'name = "second"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/second" }\n'
+        "[package.dev-dependencies]\n"
+        'lint = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out and "via second" not in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and "via: (lint group) → tool → cryptography" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_explain_path_goes_through_the_edge_that_asks_for_the_extra(capsys, tmp_path, fake_pypi):
+    # app needs alpha and beta; only beta asks for alpha[x], which pulls in cryptography. The path must go through beta.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "app"\n'
+        'version = "1"\n'
+        'source = { editable = "." }\n'
+        'dependencies = [{ name = "alpha" }, { name = "beta" }]\n'
+        "[[package]]\n"
+        'name = "alpha"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "https://files.example/alpha-1-py3-none-any.whl" }]\n'
+        "[package.optional-dependencies]\n"
+        'x = [{ name = "cryptography" }]\n'
+        "[[package]]\n"
+        'name = "beta"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "alpha", extra = ["x"] }]\n'
+        'wheels = [{ url = "https://files.example/beta-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--explain")
+    assert code == 1 and not err
+    assert "cryptography (via beta)" in out
+    assert "via: app → beta → alpha → cryptography" in out
+    assert fake_pypi == []
+
+
+def test_whole_lock_hints_in_virtual_workspace_name_the_direct_dependency(capsys, tmp_path, fake_pypi):
+    # With no project at the root, every member is where uv sync starts, so hints name the dependency, not the member.
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[manifest]\n"
+        'members = ["api"]\n'
+        "[[package]]\n"
+        'name = "api"\n'
+        'version = "1"\n'
+        'source = { editable = "packages/api" }\n'
+        'dependencies = [{ name = "tool" }]\n'
+        "[[package]]\n"
+        'name = "tool"\n'
+        'version = "1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "cryptography" }]\n'
+        'wheels = [{ url = "https://files.example/tool-1-py3-none-any.whl" }]\n'
+        "[[package]]\n"
+        'name = "cryptography"\n'
+        'version = "50.0.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cryptography-50.0.2.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline")
+    assert code == 1 and not err
+    assert "cryptography (via tool)" in out and "via api" not in out
+    assert fake_pypi == []
+
+
 def test_poetry_extra_edge_credits_nobody(capsys, tmp_path, fake_pypi):
     # Poetry's graph doesn't record which parent asked for an extra, so a package behind one gets no (via ...) hint.
     (tmp_path / "poetry.lock").write_text(
@@ -4900,3 +5083,195 @@ def test_project_exclude_newer_applies_to_selected_extra(fake_pypi, capsys, tmp_
     code, out, err = run(capsys, str(path), "--extra", "test", "-p", "3.13", "-t", "win-arm64", "--json")
     assert code == 0
     assert [(p["name"], p["version"]) for p in json.loads(out)["packages"]] == [("dated", "1.0")]
+
+
+LOCKED_PYTHON_FILES = {
+    "poetry.lock": ("[[package]]", "python-versions", 'files = [{file = "purewheel-3.1-py3-none-any.whl"}]'),
+    # inherit_metadata: the lock records each package's marker, which the range needs (see the test below)
+    "pdm.lock": (
+        "[[package]]",
+        "requires_python",
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n\n[metadata]\nstrategy = ["inherit_metadata"]',
+    ),
+    "pylock.toml": ("[[packages]]", "requires-python", 'wheels = [{name = "purewheel-3.1-py3-none-any.whl"}]'),
+}
+
+
+@pytest.mark.parametrize("lockfile", LOCKED_PYTHON_FILES)
+def test_offline_locked_package_python_range(capsys, tmp_path, fake_pypi, lockfile, monkeypatch):
+    from conftest import FAKE_INDEX
+
+    from wheelgap import check_lockfile, make_targets
+
+    table, key, files = LOCKED_PYTHON_FILES[lockfile]
+    path = tmp_path / lockfile
+    path.write_text(f'{table}\nname = "purewheel"\nversion = "3.1"\n{key} = "<3.13"\n{files}\n', encoding="utf-8")
+    args = (str(path), "--offline", "--explain", "-t", "linux-x86_64", "-p", "3.12,3.13")
+    code, out, _ = run(capsys, *args, "--json")
+    assert code == 1
+    packages = json.loads(out)["packages"]
+    assert [r["results"] for r in packages] == [
+        {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "n/a"},
+        {"3.12 linux-x86_64": "n/a", "3.13 linux-x86_64": "missing"},
+    ]
+    assert packages[1]["rejected"]["3.13 linux-x86_64"] == [
+        {"file": "purewheel-3.1-py3-none-any.whl", "reason": "requires Python <3.13"}
+    ]
+    assert "requires Python <3.13" in run(capsys, *args)[1]
+    targets = make_targets(["3.12", "3.13"], "linux-x86_64")
+    results = check_lockfile(path, targets, offline=True)
+    assert results[0].statuses[targets[0]] is Status.WHEEL
+    assert results[1].statuses[targets[1]] is Status.MISSING
+    assert fake_pypi == []
+    assert run(capsys, str(path), "--online", "--no-cache", "-t", "linux-x86_64", "-p", "3.13")[0] == 0
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "purewheel",
+        {"3.1": [{"filename": "purewheel-3.1-py3-none-any.whl", "requires_python": "<3.13"}]},
+    )
+    assert run(capsys, str(path), "--online", "--no-cache", "-t", "linux-x86_64", "-p", "3.13")[0] == 1
+
+
+@pytest.mark.parametrize("order", ["3.13,3.12", "3.12,3.13"])
+def test_offline_locked_python_range_without_a_version(capsys, tmp_path, fake_pypi, order):
+    """pylock.toml lets a package leave `version` out. Each Python still gets its own answer, whatever the -p order."""
+    path = tmp_path / "pylock.toml"
+    path.write_text(
+        '[[packages]]\nname = "purewheel"\nrequires-python = "<3.13"\n'
+        'wheels = [{name = "purewheel-3.1-py3-none-any.whl"}]\n',
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", order, "--json")
+    assert code == 1
+    statuses = {
+        target: status
+        for package in json.loads(out)["packages"]
+        for target, status in package["results"].items()
+        if status != "n/a"
+    }
+    assert statuses == {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "missing"}
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("lockfile", "key", "metadata"),
+    [
+        # Before lock-version 2.1, a direct dependency's Python marker is only in pyproject.toml.
+        ("poetry.lock", "python-versions", '[metadata]\nlock-version = "2.0"\n'),
+        # Without inherit_metadata, a pdm.lock has no markers on its packages.
+        ("pdm.lock", "requires_python", ""),
+        ("pdm.lock", "requires_python", '[metadata]\nstrategy = ["cross_platform"]\n'),
+    ],
+)
+def test_locked_python_range_needs_markers_on_packages(capsys, tmp_path, fake_pypi, lockfile, key, metadata):
+    """Poetry and PDM install a package only on the Pythons its markers select. A lock that doesn't record them per
+    package can't say whether the range leaves out a Python the package is installed on, so it's read as before."""
+    path = tmp_path / lockfile
+    path.write_text(
+        f'[[package]]\nname = "purewheel"\nversion = "3.1"\n{key} = "<3.13"\n'
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n\n' + metadata,
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", "3.12,3.13", "--json")
+    assert code == 0
+    assert [p["results"] for p in json.loads(out)["packages"]] == [
+        {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "wheel"}
+    ]
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("restriction", ["", 'python-versions = "*"', 'python-versions = "^3.12"'])
+def test_offline_locked_package_python_range_unrestricted(capsys, tmp_path, fake_pypi, restriction):
+    path = tmp_path / "poetry.lock"
+    path.write_text(
+        '[[package]]\nname = "purewheel"\nversion = "3.1"\n'
+        'files = [{file = "purewheel-3.1-py3-none-any.whl"}]\n' + restriction,
+        encoding="utf-8",
+    )
+    assert run(capsys, str(path), "--offline", "-t", "linux-x86_64", "-p", "3.13")[0] == 0
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize("lockname", ["uv.lock", "app.py.lock"])
+def test_uv_lock_online_ignores_python_upper_bound(capsys, tmp_path, fake_pypi, monkeypatch, lockname):
+    from conftest import FAKE_INDEX
+
+    from wheelgap import check_lockfile, make_targets
+
+    filename = "purewheel-3.1-py3-none-any.whl"
+    monkeypatch.setitem(FAKE_INDEX, "purewheel", {"3.1": [{"filename": filename, "requires_python": ">=3.10,<3.15"}]})
+    lock = tmp_path / lockname
+    manifest = '[manifest]\nrequirements = [{ name = "purewheel" }]\n' if lockname.endswith(".py.lock") else ""
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.12"\n' + manifest + "\n[[package]]\n"
+        'name = "purewheel"\nversion = "3.1"\nsource = {registry = "https://pypi.org/simple"}\n'
+        f'wheels = [{{url = "https://files.pythonhosted.org/{filename}"}}]\n',
+        encoding="utf-8",
+    )
+    args = (str(lock), "--no-cache", "-p", "3.15", "-t", "linux-x86_64")
+    assert run(capsys, *args, "--offline")[0] == 0
+    code, out, err = run(capsys, *args, "--online", "--json", "--explain")
+    assert code == 0
+    _assert_matches_output_schema(json.loads(out))
+    package = json.loads(out)["packages"][0]
+    assert package["results"] == {"linux-x86_64": "wheel"}
+    assert package["pip_refuses"] == {filename: "requires Python >=3.10,<3.15"}
+    assert "note: 1 package is checked as uv installs it, though pip would refuse it" in err
+    assert (
+        "purewheel 3.1 on linux-x86_64: checked as uv installs it (uv ignores Requires-Python upper bounds); "
+        "pip refuses it: requires Python >=3.10,<3.15"
+    ) in run(capsys, *args, "--online", "--explain")[1]
+    targets = make_targets("3.15", "linux-x86_64")
+    result = check_lockfile(lock, targets, online=True)[0]
+    assert result.statuses[targets[0]] is Status.WHEEL
+    assert result.to_dict()["pip_refuses"] == package["pip_refuses"]
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(requirements), *args[1:], "--online", "--json")
+    assert code == 1
+    assert json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "missing"}
+
+
+def test_uv_lock_online_python_upper_bound_is_per_python(capsys, tmp_path, fake_pypi, monkeypatch):
+    """With several Pythons, only the one pip refuses gets its files back, and only its entry has pip_refuses."""
+    from conftest import FAKE_INDEX
+
+    filename = "purewheel-3.1-py3-none-any.whl"
+    monkeypatch.setitem(FAKE_INDEX, "purewheel", {"3.1": [{"filename": filename, "requires_python": ">=3.10,<3.15"}]})
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\n'
+        'name = "purewheel"\nversion = "3.1"\nsource = {registry = "https://pypi.org/simple"}\n'
+        f'wheels = [{{url = "https://files.pythonhosted.org/{filename}"}}]\n',
+        encoding="utf-8",
+    )
+    args = (str(lock), "--no-cache", "--online", "--json", "-p", "3.14,3.15", "-t", "linux-x86_64")
+    code, out, err = run(capsys, *args)
+    assert code == 0
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert [(p["results"], p.get("pip_refuses")) for p in data["packages"]] == [
+        ({"3.14 linux-x86_64": "wheel", "3.15 linux-x86_64": "n/a"}, None),
+        ({"3.14 linux-x86_64": "n/a", "3.15 linux-x86_64": "wheel"}, {filename: "requires Python >=3.10,<3.15"}),
+    ]
+    assert "note: 1 package is checked as uv installs it" in err
+    assert "pip would refuse" not in run(capsys, *args, "-q")[2]
+
+
+@pytest.mark.parametrize(
+    ("requires", "python", "ignores"),
+    [
+        (">=3.10,<3.15", "3.15", True),
+        ("<=3.14", "3.15", True),
+        ("<3.15", "3.14", False),
+        (">=3.10,<3.15", "3.9", False),
+        ("==3.14.*,<3.15", "3.15", False),
+        ("~=3.13.0,<3.15", "3.15", False),
+        ("!=3.15.*,<3.15", "3.15", False),
+        ("invalid", "3.15", False),
+    ],
+)
+def test_uv_ignores_only_explicit_python_upper_bounds(requires, python, ignores):
+    from wheelgap.sources import uv_ignores_python_rejection
+
+    assert uv_ignores_python_rejection(requires, python) is ignores

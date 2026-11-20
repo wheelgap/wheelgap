@@ -71,9 +71,10 @@ final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--mus
 `--dockerfile-inputs` (with `--dockerfile`, and no `INPUT`): check the requirements files the Dockerfile's final stage
 installs with `RUN pip install -r FILE`, on the image's Python and platform, so "will this image build without
 compiling anything?" is one command (add `--deps` for what they pull in). `FILE` is followed back through `WORKDIR` and
-`COPY` to a file in the build context, taken to be the Dockerfile's folder, and each one gets a note on stderr
-(`Dockerfile:4: RUN pip install -r reads requirements.txt`). `[tool.wheelgap]` and `.python-version` are read from the
-Dockerfile's folder too. Only a strict subset is read:
+`COPY` to a file in the build context, taken to be the Dockerfile's folder unless
+[`--dockerfile-context DIR`](#dockerfile-context) names another, and each one gets a note on stderr
+(`Dockerfile:4: RUN pip install -r reads requirements.txt`). `[tool.wheelgap]` and `.python-version` are read from
+that folder too. Only a strict subset is read:
 
 - a final stage built `FROM` an image, not an earlier stage;
 - `WORKDIR` with a literal path;
@@ -88,6 +89,16 @@ holds: any other `RUN` (`&&` with other commands, redirects, variables, `--mount
 `pip.conf` or `pip.ini` anywhere in the image, a `.dockerignore`, a `# syntax=` frontend other than
 `docker/dockerfile` (one pinned by digest, `docker/dockerfile:1@sha256:…`, is read when the Dockerfile has no
 heredoc), or a nested `-r` or `-c` in `FILE`. Without this flag, `--dockerfile` reads only the image.
+
+### `--dockerfile-context` {#dockerfile-context}
+
+`--dockerfile-context DIR` (with `--dockerfile-inputs`, **after 0.13.0**): the build context, for a Dockerfile that
+isn't built from its own folder. For `docker build -f docker/Dockerfile .`, run
+`wheelgap --dockerfile docker/Dockerfile --dockerfile-inputs --dockerfile-context .`. `COPY` sources are looked for in
+`DIR`, a path or symlink that leaves `DIR` is refused, and `[tool.wheelgap]` and `.python-version` are read from `DIR`.
+The ignore files are looked for where Docker reads them: `.dockerignore` at the root of `DIR`, and
+`<Dockerfile name>.dockerignore` beside the Dockerfile. A `DIR` that isn't a folder exits 2. This isn't
+`docker buildx build --build-context`, which adds named contexts.
 
 ### `--build-arg` {#build-arg}
 

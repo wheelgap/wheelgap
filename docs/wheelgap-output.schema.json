@@ -299,6 +299,11 @@
                 "bundled_version_differs": {
                     "description": "Present with bundled: true when Pyodide's version isn't the one pinned, or is outside the required range (it still counts as bundled). Always false for an unpinned requirement.",
                     "type": "boolean"
+                },
+                "pip_refuses": {
+                    "description": "Present for a uv.lock or a script's lock checked with --online, when the package has files that uv installs and pip would refuse: each such file mapped to why, such as \"requires Python <3.15,>=3.10\". uv ignores Requires-Python upper bounds, so these files count in results, which follow uv sync; pip (on an exported requirements file, say) refuses them on these targets' Python. With several Pythons the package has one entry per differing answer, and the key is on the entry for the Python pip refuses. Never empty: left out when pip refuses nothing.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string", "description": "Keyed by filename, not by target label: why pip refuses that file."}
                 }
             }
         }

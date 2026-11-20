@@ -8,7 +8,7 @@ import re
 import shlex
 import tomllib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -86,6 +86,18 @@ class Package:
     resolutions: dict[str, Package] = field(default_factory=dict)
     # Files of a pinned release whose Requires-Python excludes the target Python, mapped to their --explain reason.
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
+    # The release's Requires-Python as the lock records it for the package (pylock.toml's requires-python,
+    # poetry.lock's python-versions, pdm.lock's requires_python), applied to the lock's own files per target Python
+    # (pypi.apply_locked_python_ranges). Only kept where the lock also records each package's markers (always in a
+    # pylock.toml; Poetry from lock-version 2.1; PDM with inherit_metadata). Poetry and PDM lock a package only for
+    # the Pythons its markers select, so there a range that leaves a target out says something only for a Python
+    # outside the project's own range. Without the markers the package would be reported `missing` on a Python the
+    # installer never installs it for (numpy = [{version = "1.26.4", python = "<3.13"}, ...] in pyproject.toml).
+    locked_requires_python: str | None = None
+    # Yanked status of Python-rejected files, needed when applying uv's upper-bound policy.
+    python_rejected_yanked: frozenset[str] = frozenset()
+    # Files admitted by uv that pip would refuse for this Python.
+    pip_refuses: dict[str, str] = field(default_factory=dict)
     # Distribution selection policy from requirements files or uv project configuration.
     no_binary: bool = False
     only_binary: bool = False
@@ -265,6 +277,51 @@ def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_on
         if not any(spec.contains(v, prereleases=True) for v in tries):
             out.append(t.python)
     return list(dict.fromkeys(out))
+
+
+def uv_ignores_python_rejection(requires: str, python: str) -> bool:
+    """Whether the target misses only an explicit upper bound, using the index check's late-patch version."""
+    try:
+        spec = SpecifierSet(requires)
+        if any(clause.operator not in {"<", "<=", ">", ">=", "=="} or clause.version.endswith(".*") for clause in spec):
+            return False
+        version = f"{python}.99"
+        lower = SpecifierSet(",".join(str(clause) for clause in spec if clause.operator not in {"<", "<="}))
+        return not spec.contains(version) and lower.contains(version)
+    except (InvalidSpecifier, InvalidVersion):
+        return False
+
+
+def restore_uv_python_files(packages: Iterable[Package], pythons: Iterable[str]) -> None:
+    """Apply uv's policy to the looked-up distributions for each Python."""
+    for pkg in packages:
+        restored_variants: list[Package] = []
+        for python in pythons:
+            variant = pkg.resolutions.get(python, pkg)
+            if variant.files is None or variant.error:
+                continue
+            # Index resolution coalesces identical answers. Copy before restoring files for just one Python.
+            refusals = {
+                filename: reason
+                for filename, reason in variant.requires_python_rejected.items()
+                if uv_ignores_python_rejection(reason.removeprefix("requires Python "), python)
+            }
+            if not refusals:
+                continue
+            restored = replace(
+                variant,
+                files=[*variant.files, *refusals],
+                requires_python_rejected={
+                    file: reason for file, reason in variant.requires_python_rejected.items() if file not in refusals
+                },
+                yanked=variant.yanked | (variant.python_rejected_yanked & refusals.keys()),
+                pip_refuses=refusals,
+                resolutions={},
+            )
+            variant = next((p for p in restored_variants if p == restored), restored)
+            if variant is restored:
+                restored_variants.append(restored)
+            pkg.resolutions[python] = variant
 
 
 def _filename(entry: dict, origin: str, package: str) -> str | None:
@@ -912,6 +969,9 @@ def parse_pylock(path: Path) -> Source:
                 files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
+        requires = p.get("requires-python")
+        if pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         pkgs.append(pkg)
     requires = data.get("requires-python")
     return Source(path.name, pkgs, requires_python=requires if isinstance(requires, str) else None)
@@ -933,6 +993,8 @@ def parse_poetry_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     metadata = data.get("metadata", {})
     legacy_files = metadata.get("files", {})
+    # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on packages.
+    edge_markers_only = _version_tuple(str(metadata.get("lock-version", "2.1"))) < (2, 1)
     pkgs: list[Package] = []
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
@@ -966,10 +1028,14 @@ def parse_poetry_lock(path: Path) -> Source:
                 None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             )
         edges[len(pkgs)] = _poetry_edges(p)
+        requires = p.get("python-versions")
+        # Not before 2.1: a direct dependency's Python marker is only in pyproject.toml there, so the range could
+        # report a package for a Python that Poetry never installs it on (see Package.locked_requires_python).
+        if not edge_markers_only and pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         pkgs.append(pkg)
-    # Lock files before 2.1 (all of Poetry 1.x) only record markers on dependency edges, not on
-    # packages, so walk the graph from the packages nothing depends on, as for uv.lock.
-    if _version_tuple(str(metadata.get("lock-version", "2.1"))) < (2, 1) and pkgs:
+    # With markers on edges only, walk the graph from the packages nothing depends on, as for uv.lock.
+    if edge_markers_only and pkgs:
         roots = set(_graph_roots(pkgs, edges))
         # The project's own dependencies are roots too, even if another package also depends on them
         # under a marker (colorama directly, and via click only on Windows).
@@ -1104,6 +1170,8 @@ def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], 
             first.registry = pkg.registry  # the other entry is from PyPI: this index decides for both
         else:
             first.skip = "private index"  # pinned to two indexes: no single lookup is safe for both
+    if first.locked_requires_python != pkg.locked_requires_python:
+        first.locked_requires_python = None  # conflicting entries can't establish a release-wide restriction
     if first.markers is not None:
         first.markers = None if pkg.markers is None else first.markers + pkg.markers
 
@@ -1114,6 +1182,7 @@ def parse_pdm_lock(path: Path) -> Source:
     legacy_files = metadata.get("files", {})
     locked_groups = metadata.get("groups")
     strategy = metadata.get("strategy")
+    inherit_metadata = isinstance(strategy, list) and "inherit_metadata" in strategy
     pkgs: list[Package] = []
     seen: dict[tuple[str, str | None], Package] = {}
     # Each package's groups, merged over its entries (PDM writes one per extras variant).
@@ -1148,6 +1217,10 @@ def parse_pdm_lock(path: Path) -> Source:
             if entries is not None:
                 pkg.files = [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
             # Not in either place: leave files as None so the PyPI lookup fills them in.
+        requires = p.get("requires_python")
+        # Only with inherit_metadata, which records each package's marker (see Package.locked_requires_python).
+        if inherit_metadata and pkg.files is not None and isinstance(requires, str):
+            pkg.locked_requires_python = requires
         _add_once(pkgs, seen, pkg)
     return Source(
         path.name,
@@ -1158,7 +1231,7 @@ def parse_pdm_lock(path: Path) -> Source:
             if isinstance(locked_groups, list)
             else None
         ),
-        pdm_inherit_metadata=isinstance(strategy, list) and "inherit_metadata" in strategy,
+        pdm_inherit_metadata=inherit_metadata,
         pdm_pyproject=path.parent / "pyproject.toml",
     )
 
@@ -1494,6 +1567,14 @@ def _builds_a_package(data: dict, path: Path) -> bool:
     return (isinstance(flit, dict) and "metadata" in flit) or (isinstance(pdm, dict) and "dependencies" in pdm)
 
 
+def _has_poetry_dependencies(data: dict) -> bool:
+    """Whether [tool.poetry.dependencies] names anything but python."""
+    tool = data.get("tool")
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
+    return isinstance(poetry_deps, dict) and any(dep.lower() != "python" for dep in poetry_deps)
+
+
 def _project_source(data: dict, path: Path, script: bool = False) -> Source:
     """Shared requirement and provenance handling for project and script metadata (`script`: a # /// script block,
     which errors name instead of [project])."""
@@ -1513,10 +1594,7 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         # poetry-core 2 builds [tool.poetry.dependencies] into the package whenever [project] lists no dependencies
         # or optional-dependencies (missing or empty: DependencyGroup.dependencies' "legacy mode"). A groups-only file
         # with them is a Poetry project too: --group would leave its dependencies out.
-        tool = data.get("tool")
-        poetry = tool.get("poetry") if isinstance(tool, dict) else None
-        poetry_deps = poetry.get("dependencies") if isinstance(poetry, dict) else None
-        if isinstance(poetry_deps, dict) and any(dep.lower() != "python" for dep in poetry_deps):
+        if _has_poetry_dependencies(data):
             raise SourceError(
                 f"{path}: the dependencies are in [tool.poetry.dependencies], not [project] dependencies, "
                 "so wheelgap can't read them; check poetry.lock instead"
@@ -2778,18 +2856,46 @@ def find_lockfile(directory: Path, pixi: bool = False) -> Path:
         if candidate.is_file():
             return candidate
     hint = "Pass a file, or package names like `wheelgap numpy psycopg2`."
-    if _has_project_table(directory / "pyproject.toml"):
-        pyproject = directory / "pyproject.toml"
-        hint = f"To check the direct dependencies in its pyproject.toml, run `wheelgap {pyproject}`. " + hint
+    pyproject = directory / "pyproject.toml"
+    project_hint = _pyproject_hint(pyproject)
+    if project_hint:
+        hint = project_hint + " " + hint
     raise SourceError(f"no lockfile found in {directory} (looked for {', '.join(LOCKFILES)}). {hint}")
 
 
-def _has_project_table(pyproject: Path) -> bool:
-    """For the "no lockfile" hint only: a missing or unreadable file just means no hint."""
+# A dependency group's name as PEP 735 allows it: letters, digits, `.`, `-` and `_`, starting and ending with a
+# letter or digit.
+_GROUP_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def _pyproject_hint(pyproject: Path) -> str | None:
+    """For the "no lockfile" error only: the command that checks the folder's pyproject.toml instead, when there is
+    one that would work. A missing or unreadable file just means no hint."""
     try:
-        return isinstance(tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project"), dict)
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return None
+    if isinstance(data.get("project"), dict):
+        return f"To check the direct dependencies in its pyproject.toml, run `wheelgap {pyproject}`."
+    groups = data.get("dependency-groups")
+    if "project" in data or not isinstance(groups, dict):
+        return None
+    # What _project_source refuses with --group: a setuptools, flit, PDM-legacy or Poetry project keeps its own
+    # dependencies outside [project], so the hint would only lead to that error.
+    if _builds_a_package(data, pyproject) or _has_poetry_dependencies(data):
+        return None
+    keys = [canonicalize_name(name) for name in groups]
+    if len(set(keys)) != len(keys):
+        return None  # two groups that are the same once normalized: refused whichever group is asked for
+    # The names are text from the file, and this message goes to a terminal, a CI log or an MCP client: only names
+    # PEP 735 allows are repeated, normalized as the `--group` error lists them.
+    names = sorted({canonicalize_name(name) for name in groups if _GROUP_NAME.fullmatch(name)})
+    if not names:
+        return None
+    return (
+        f"To check a dependency group in its pyproject.toml, run `wheelgap {pyproject} --group NAME` "
+        f"(groups: {', '.join(names)})."
+    )
 
 
 def parse_dist(path: Path) -> Source:

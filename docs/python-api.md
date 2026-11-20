@@ -157,6 +157,7 @@ Each check returns a `Result` (a list of them for `check_packages()`, `check_loc
 | `gaps` | the targets with a gap (`source`, `missing` or `unknown`) |
 | `bundled_versions`, `bundled_version`, `bundled_version_differs` | with `pyodide_locks`: see [Pyodide](#pyodide) |
 | `issues_url` | the package's issue tracker URL from PyPI metadata, or `None` when absent or not on PyPI |
+| `pip_refuses` | for a `uv.lock` checked with `online=True` (after 0.13.0): the files uv installs and pip would refuse, each mapped to the reason (`"requires Python <3.15,>=3.10"`); empty otherwise. uv ignores `Requires-Python` upper bounds, and `statuses` follow uv. `to_dict()` includes `"pip_refuses"` when it isn't empty |
 | `to_dict()` | the package in the shape of a `--json` package entry, keyed by each target's full label (`"3.13 musl-aarch64"`, with the Python even when only one is checked) |
 
 ### Explaining a gap

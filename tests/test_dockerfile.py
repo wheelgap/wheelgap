@@ -1222,6 +1222,19 @@ def test_plain_dockerfile_still_ignores_what_the_image_installs(tmp_path, capsys
     [
         (["--dockerfile-inputs"], "--dockerfile-inputs reads what --dockerfile installs; pass --dockerfile too"),
         (["purewheel", "--dockerfile", "Dockerfile", "--dockerfile-inputs"], "can't be used with INPUT"),
+        (
+            ["--dockerfile-context", "."],
+            "--dockerfile-context is only used with --dockerfile-inputs; pass --dockerfile-inputs too",
+        ),
+        (
+            ["--dockerfile", "Dockerfile", "--dockerfile-inputs", "--dockerfile-context", "missing-context-folder-xyz"],
+            "--dockerfile-context: not a directory",
+        ),
+        # An empty DIR (an unset variable) is refused, not read as "no context given" or as the current folder.
+        (
+            ["--dockerfile", "Dockerfile", "--dockerfile-inputs", "--dockerfile-context", ""],
+            "--dockerfile-context: DIR is empty",
+        ),
     ],
 )
 def test_cli_dockerfile_inputs_usage_errors(capsys, argv, error):
@@ -1229,6 +1242,130 @@ def test_cli_dockerfile_inputs_usage_errors(capsys, argv, error):
         main(argv)
     assert exc.value.code == 2
     assert error in capsys.readouterr().err
+
+
+def test_cli_dockerfile_inputs_context_reads_from_context_dir(tmp_path, capsys, fake_pypi):
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    df = docker_dir / "Dockerfile"
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (docker_dir / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+
+    code = main(["--dockerfile", str(df), "--dockerfile-inputs", "--dockerfile-context", str(tmp_path), "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    data = json.loads(captured.out)
+    assert [p["name"] for p in data["packages"]] == ["purewheel"]
+    assert f"reads {tmp_path / 'requirements.txt'}" in captured.err
+    assert f"reads {docker_dir / 'requirements.txt'}" not in captured.err
+
+
+def test_cli_dockerfile_context_that_is_a_file_is_a_usage_error(tmp_path, capsys):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n",
+    )
+    file = tmp_path / "requirements.txt"
+    with pytest.raises(SystemExit) as exc:
+        main(["--dockerfile", str(path), "--dockerfile-inputs", "--dockerfile-context", str(file)])
+    assert exc.value.code == 2
+    assert f"--dockerfile-context: not a directory: {file}" in capsys.readouterr().err
+
+
+def test_cli_dockerfile_inputs_context_refuses_paths_outside_the_context(tmp_path, capsys, fake_pypi):
+    # The context is a folder below the Dockerfile's, so a file beside the Dockerfile is outside the build context.
+    context = tmp_path / "app"
+    context.mkdir()
+    df = tmp_path / "Dockerfile"
+    (tmp_path / "outside.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = ["--dockerfile", str(df), "--dockerfile-inputs", "--dockerfile-context", str(context)]
+
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY ../outside.txt .\nRUN pip install -r outside.txt\n",
+        encoding="utf-8",
+    )
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"{df}:3: COPY ../outside.txt: only paths inside the build context ({context}) are read" in err
+
+    # A file that is only in the Dockerfile's folder isn't found: the folder named is the one that was searched.
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY outside.txt .\nRUN pip install -r outside.txt\n",
+        encoding="utf-8",
+    )
+    assert main(argv) == 2
+    assert f"{df}:3: COPY outside.txt: not found in the build context ({context})" in capsys.readouterr().err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_inputs_context_refuses_a_symlink_out_of_the_context(tmp_path, capsys, fake_pypi):
+    # The link's target is in the Dockerfile's folder but not in the context, so the boundary checked is DIR's.
+    context = tmp_path / "app"
+    context.mkdir()
+    df = tmp_path / "Dockerfile"
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY link.txt .\nRUN pip install -r link.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "outside.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    try:
+        (context / "link.txt").symlink_to(tmp_path / "outside.txt")
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    assert main(["--dockerfile", str(df), "--dockerfile-inputs", "--dockerfile-context", str(context)]) == 2
+    err = capsys.readouterr().err
+    assert f"{df}:3: COPY link.txt: a symlink out of the build context isn't read by --dockerfile-inputs" in err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_inputs_context_refuses_dockerignore(tmp_path, capsys, fake_pypi):
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    df = docker_dir / "Dockerfile"
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = ["--dockerfile", str(df), "--dockerfile-inputs", "--dockerfile-context", str(tmp_path)]
+
+    # Docker reads neither a .dockerignore beside the Dockerfile nor a Dockerfile.dockerignore in the context's root
+    # when the two folders differ, so these leave nothing out of the build.
+    (docker_dir / ".dockerignore").write_text("*.txt\n", encoding="utf-8")
+    (tmp_path / "Dockerfile.dockerignore").write_text("*.txt\n", encoding="utf-8")
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    (tmp_path / ".dockerignore").write_text("*.txt\n", encoding="utf-8")
+    assert main(argv) == 2
+    assert f"{df}: .dockerignore may leave files out of the build context" in capsys.readouterr().err
+    (tmp_path / ".dockerignore").unlink()
+
+    (docker_dir / "Dockerfile.dockerignore").write_text("*.txt\n", encoding="utf-8")
+    assert main(argv) == 2
+    assert f"{df}: Dockerfile.dockerignore may leave files out of the build context" in capsys.readouterr().err
+
+
+def test_cli_dockerfile_inputs_context_reads_config_from_the_context(tmp_path, capsys, fake_pypi):
+    docker_dir = tmp_path / "docker"
+    docker_dir.mkdir()
+    df = docker_dir / "Dockerfile"
+    df.write_text(
+        "FROM python:3.13-alpine\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    # The one beside the Dockerfile isn't read: its unknown key would be an input error (exit 2).
+    (docker_dir / "pyproject.toml").write_text("[tool.wheelgap]\nno-such-key = true\n", encoding="utf-8")
+
+    code = main(["--dockerfile", str(df), "--dockerfile-inputs", "--dockerfile-context", str(tmp_path)])
+    assert code == 0
+    assert capsys.readouterr().out == ""  # quiet = true, and purewheel has a wheel
 
 
 def test_dockerfile_requirements_reads_system_package_commands(tmp_path):

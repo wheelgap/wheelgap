@@ -87,6 +87,9 @@ wheelgap --dockerfile Dockerfile
 # ...and check what it installs with RUN pip install -r requirements.txt
 wheelgap --dockerfile Dockerfile --dockerfile-inputs
 
+# ...built with `docker build -f docker/Dockerfile .`? Name the build context too
+wheelgap --dockerfile docker/Dockerfile --dockerfile-inputs --dockerfile-context .
+
 # Machine-readable, for scripts and CI
 wheelgap --json > wheelgap.json
 

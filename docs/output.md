@@ -96,6 +96,14 @@ uvloop 0.21.0 on win-arm64: ● source
 Other inputs have no dependency graph, so they show no path. If you think wheelgap got a package wrong, this output
 (or `--json --explain`) is all a bug report needs, with no need to share your lockfile.
 
+For a `uv.lock` checked with `--online`, `--explain` also names (after 0.13.0) each package that uv installs and pip
+would refuse (uv ignores `Requires-Python` upper bounds; see [uv.lock](inputs.md#uvlock)), whether or not it has a
+gap:
+
+```text
+agent-client-protocol 0.11.1 on linux-x86_64: checked as uv installs it (uv ignores Requires-Python upper bounds); pip refuses it: requires Python <3.15,>=3.10
+```
+
 When the package comes from PyPI and publishes an issue tracker in its metadata (or a GitHub repository fallback),
 each gap line also links to it so you can ask the maintainers for a wheel. Its `project_urls` labels are read the way
 PyPI reads its well-known labels ([PEP 753](https://peps.python.org/pep-0753/)), so `Issues`, `Issue-Tracker`,
@@ -450,6 +458,11 @@ dependencies that lead to the package, as the table's `cryptography (via mcp)` n
 them (`{"win-arm64": ["mcp", "httpx"]}`). `direct` has entries only for uv.lock, Poetry 1.x and `--deps` inputs. It
 leaves out a target where the package is itself a direct dependency, and may leave one out when the lockfile doesn't
 record which direct dependency asked for an extra that leads to the package (Poetry 1.x).
+
+For a `uv.lock` checked with `--online`, a package with files that uv installs and pip would refuse (uv ignores
+`Requires-Python` upper bounds) also gets `pip_refuses` (after 0.13.0), with or without `--explain`: those files, each
+mapped to the reason, as in `{"agent_client_protocol-0.11.1-py3-none-any.whl": "requires Python <3.15,>=3.10"}`. Its
+`results` are still uv's. See [uv.lock](inputs.md#uvlock).
 
 If an input can't be read (a missing lockfile, an unknown target, a bad `[tool.wheelgap]` value), `--json` prints an
 error object on stdout instead of results, next to the usual `wheelgap: error:` line on stderr and exit code 2:

@@ -805,13 +805,15 @@ def applies(pkg: Package, target: Target) -> bool:
 
 
 def _selected_direct_dependencies(
-    source: Source, target: Target, installed: dict[int, Parent] | dict[int, list[str]], selection: UvSelection
+    source: Source, target: Target, installed: dict[int, Parent] | dict[int, list[str]], selection: UvSelection | None
 ) -> dict[int, tuple[str, ...]]:
     """Attribute selected uv dependencies per direct root, keeping requested extras separate. With no --extra/--group
-    selection, `selection` is UvSelection(): the project's own dependencies and the dev group, no extras. That walks
-    less than reachable() installs, so some packages get no hint, but every one credited really is reached that way."""
+    selection, `selection` is None: the whole lock is checked (all members, extras, and groups)."""
     packages = source.uv_packages or []
-    roots = uv_selected_roots(source)
+    everything = selection is None
+    if selection is None:
+        selection = UvSelection(all_extras=True)
+    roots = source.roots if everything else uv_selected_roots(source)
     available = {canonicalize_name(n) for n in source.uv_manifest.get("dependency-groups", {})} | {
         n for i in roots for n in uv_group_names(packages[i])
     }
@@ -820,6 +822,8 @@ def _selected_direct_dependencies(
     else:
         defaults = available if "*" in source.uv_default_groups else frozenset(source.uv_default_groups)
         selected = selection.groups | defaults
+    if everything:
+        selected = frozenset(available)
     groups = frozenset(selected - {"dev"} if selection.no_dev else selected)
     by_name: dict[str, list[int]] = {}
     for i, pkg in enumerate(source.packages):
@@ -829,6 +833,8 @@ def _selected_direct_dependencies(
     owners: dict[int, dict[str, str]] = {}
     active: dict[tuple[int, str], frozenset[str]] = {}
     queue: deque[tuple[int, str]] = deque()
+    # The project (or, in a virtual workspace, every member) is where hints start; other members are named.
+    direct_roots = set(uv_selected_roots(source))
 
     def visit(i: int, owner: tuple[str, str], requested: frozenset[str]) -> None:
         key, label = owner
@@ -864,12 +870,13 @@ def _selected_direct_dependencies(
             p = packages[i]
             possible = uv_extra_names(p)
             extras = possible if selection.all_extras else selection.extras & possible
-            follow(p.get("dependencies", []), None, extras)
+            owner = None if i in direct_roots else (source.packages[i].key, source.packages[i].name)
+            follow(p.get("dependencies", []), owner, extras)
             for name, optional in p.get("optional-dependencies", {}).items():
                 if canonicalize_name(name) in extras:
-                    follow(optional, None, extras)
+                    follow(optional, owner, extras)
         follow(source.uv_manifest.get("requirements", []), None, selection.extras)
-    for i in roots:
+    for i in roots:  # a member's group, like the project's, starts at the group: --explain shows `(NAME group) → …`
         for name, items in packages[i].get("dev-dependencies", {}).items():
             if canonicalize_name(name) in groups:
                 follow(items, None, frozenset())
@@ -895,7 +902,7 @@ def direct_dependencies(
     if source.edges is None:
         return {}
     if source.uv_packages is not None:  # a uv.lock: walk extras per owner, selected or uv's defaults
-        return _selected_direct_dependencies(source, target, installed, source.uv_selection or UvSelection())
+        return _selected_direct_dependencies(source, target, installed, source.uv_selection)
     by_name: dict[str, list[int]] = {}
     for i, pkg in enumerate(source.packages):
         by_name.setdefault(pkg.key, []).append(i)
@@ -1014,7 +1021,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i]
-                        if source.uv_selection is not None or source.deps_paths is not None
+                        if source.uv_packages is not None or source.deps_paths is not None
                         else dependency_path(source, installed[t], i)  # type: ignore[arg-type]
                     )
                     if source.deps_paths is not None:

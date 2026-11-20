@@ -1,9 +1,9 @@
 name: Accuracy
 
-# Weekly: compare wheelgap's answers with pip's on about 50 real PyPI packages and the targets in
+# Weekly: compare wheelgap's answers with pip and uv on about 50 real PyPI packages and the targets in
 # scripts/check_against_pip.py (#226). It needs the network, so it's kept out of CI's test job, which stays
-# offline. It fails when wheelgap and pip disagree, or when a check couldn't be made; the run's summary page
-# lists them, with the pip command for each disagreement.
+# offline. It fails when wheelgap and an installer disagree, or when a check couldn't be made; the run's summary page
+# lists them, with a command for each disagreement.
 #
 # Read-only and no secrets: it only reads the repo and PyPI.
 
@@ -33,16 +33,27 @@ jobs:
         # pinned pip out of the environment, so --with pip resolves the newest release.
         run: |
           set -o pipefail
-          uv run --python 3.14 --no-dev --with pip python scripts/check_against_pip.py | tee accuracy.log
+          uv run --python 3.14 --no-dev --with pip python scripts/check_against_pip.py | tee accuracy-pip.log
+      - name: Compare wheelgap with uv
+        # The uv that setup-uv installs, the latest release, on purpose, as for pip. The script reads uv's
+        # diagnostics by their exact wording: if a release changes it, those checks fail as "couldn't compare"
+        # (exit 2), never as an answer. --python 3.14 without the t: the script refuses a free-threaded build.
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          uv run --python 3.14 --no-dev python scripts/check_against_pip.py --installer uv | tee accuracy-uv.log
       - name: Summarise
         if: always()
         run: |
-          [ -s accuracy.log ] || exit 0  # failed before the script reported: the log says why
-          {
-            echo "### wheelgap against pip"
-            echo
-            echo '~~~~~~~~~~text'
-            head -c 60000 accuracy.log | sed 's/^~~~~/ ~~~~/'  # the log can't close the fence
-            echo
-            echo '~~~~~~~~~~'
-          } >> "$GITHUB_STEP_SUMMARY"
+          for installer in pip uv; do
+            log="accuracy-$installer.log"
+            [ -s "$log" ] || continue  # failed before the script reported: the log says why
+            {
+              echo "### wheelgap against $installer"
+              echo
+              echo '~~~~~~~~~~text'
+              head -c 60000 "$log" | sed 's/^~~~~/ ~~~~/'  # the log can't close the fence
+              echo
+              echo '~~~~~~~~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done

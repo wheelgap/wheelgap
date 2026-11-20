@@ -97,7 +97,7 @@ uv run --group dev pytest
 A wrong answer from wheelgap that pip proves wrong is the most useful report there is. You may open a bug report for one yourself, and then fix it.
 
 1. Run wheelgap with `--explain` on a real lockfile, such as a popular open-source project's `uv.lock`, `poetry.lock` or pinned `requirements.txt`, across a few targets: `uvx wheelgap uv.lock -t all -p 3.13 -p 3.14t --explain`.
-2. Check a cell you doubt with pip, which has the last word. pip takes `manylinux` and `musllinux` tags literally, so pass every tag the target accepts, from its glibc or musl version down. For `linux-x86_64` with wheelgap's default glibc (2.36), in bash:
+2. Check a cell you doubt with pip, which has the last word (for a `uv.lock`, uv has it: see below). pip takes `manylinux` and `musllinux` tags literally, so pass every tag the target accepts, from its glibc or musl version down. For `linux-x86_64` with wheelgap's default glibc (2.36), in bash:
 
    ```bash
    platforms="$(for m in $(seq 36 -1 5); do printf -- '--platform manylinux_2_%s_x86_64 ' "$m"; done)"
@@ -116,6 +116,7 @@ A wrong answer from wheelgap that pip proves wrong is the most useful report the
    - **Reading the result:**
      - if pip downloads a wheel, wheelgap should say `wheel`;
      - if pip says "No matching distribution found", wheelgap should say `source` or `missing`. This check can't tell those two apart.
+   - **`uv.lock` cells:** check them with uv, not only pip. A `uv.lock` is answered the way `uv sync` installs it, and uv ignores `Requires-Python` upper bounds that pip enforces. So when pip refuses a pin only because its `Requires-Python` says `<3.15`, see what `uv sync --locked --python 3.15` does in a copy of the project before calling it a bug; `--online --explain` names the pins where the two differ.
 3. **Open an issue only when wheelgap and pip disagree** and no open issue covers it already. Use the [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) template with both commands and both outputs.
 4. Limits:
    - one open self-filed issue per person at a time;

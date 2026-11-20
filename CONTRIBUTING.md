@@ -65,7 +65,7 @@ Using AI tools (coding agents, bug-fix bots and the like) is fine, and [AGENTS.m
 
 Found a package that wheelgap misjudges? Open a [bug report](https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml) with the output of the same command plus `--explain`. It lists the wheel filenames and why each was rejected, which is everything needed to write a test, so you don't have to share your lockfile. If you checked the package with `pip download --only-binary=:all: --platform …`, paste that too: it settles who's right.
 
-## Checking wheelgap against pip
+## Checking wheelgap against pip and uv
 
 `scripts/check_against_pip.py` compares wheelgap with pip on about 50 real PyPI packages: for each package's latest release and each of its targets (manylinux and musllinux on x86_64 and aarch64, Windows on x86_64 and ARM, macOS on Apple silicon, free-threaded 3.14t and glibc 2.17), it asks pip what it would install (`pip install --dry-run --no-deps --only-binary=:all:`, which picks a file as `pip download` does but fetches only its metadata) with the tags [AGENTS.md](AGENTS.md#no-issue-fits-find-a-real-bug) lists, and checks that pip picks a wheel exactly when wheelgap says `wheel`. It needs the network and pip, and takes a few minutes:
 
@@ -73,9 +73,14 @@ Found a package that wheelgap misjudges? Open a [bug report](https://github.com/
 uv run --with pip python scripts/check_against_pip.py                 # everything
 uv run --with pip python scripts/check_against_pip.py numpy orjson    # just these packages
 uv run --with pip python scripts/check_against_pip.py -t win-arm64    # just this target (a platform or a label)
+uv run python scripts/check_against_pip.py --installer uv numpy       # compare with uv
 ```
 
-It prints a table of every disagreement, with the pip command that shows it, and exits 1 if there is any (2 if a check couldn't be made, for example because pip couldn't reach PyPI). The [Accuracy](.github/workflows/accuracy.yml) workflow runs it every Monday.
+The uv check uses `uv pip compile` to resolve the wheel without installing it. The report lists unsupported targets such as free-threaded 3.14t with a reason. Run it on a default (GIL) build of CPython, because uv takes the implementation and free-threaded ABI of its tags from the interpreter.
+
+Both checks ask wheelgap about a pin (`NAME==VERSION`), which wheelgap answers as pip installs it; a `uv.lock` it answers as uv does. pip and uv differ on one thing here: uv ignores an upper bound in `Requires-Python`, so it takes a wheel pip leaves out. The uv report lists such a check as not compared, with the reason, and it isn't a wheelgap error. Before filing any other disagreement with uv, check the same pin in the pip run.
+
+Both modes print every disagreement with a command to reproduce it. The script exits 1 if any comparison disagrees and 2 if a check failed (for example, PyPI was unreachable) or there were no comparable targets. The [Accuracy](.github/workflows/accuracy.yml) workflow runs both modes every Monday.
 
 ## Questions
 

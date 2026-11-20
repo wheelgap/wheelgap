@@ -877,6 +877,7 @@ def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
             rejected_entries = [e for e in entries if not _supports_python(e, python, "requires-python")]
             pkg.files = [e["filename"] for e in live_entries]
             pkg.yanked = frozenset(e["filename"] for e in live_entries if _is_yanked(e))
+            pkg.python_rejected_yanked = frozenset(e["filename"] for e in rejected_entries if _is_yanked(e))
             pkg.requires_python_rejected = {
                 e["filename"]: f"requires Python {e['requires-python']}" for e in rejected_entries
             }
@@ -990,6 +991,36 @@ def _resolve_pythons(
             pkg.resolutions[py] = next((p for p in pkg.resolutions.values() if p == resolved), resolved)
         return pkg
     return resolve(pkg, versions[0] if versions else python)
+
+
+def _filter_locked_python(pkg: Package, python: str | None) -> Package:
+    files = pkg.files
+    requires = pkg.locked_requires_python
+    if files and requires and not _supports_python({"requires_python": requires}, python):
+        pkg.requires_python_rejected = dict.fromkeys(files, f"requires Python {requires}")
+        pkg.files = []
+    return pkg
+
+
+def apply_locked_python_ranges(packages: list[Package], pythons: tuple[str, ...], *, online: bool) -> None:
+    """Apply metadata only to the recorded files that weren't replaced by an explicit index lookup."""
+    versions = tuple(dict.fromkeys(pythons))
+    for pkg in packages:
+        if (
+            pkg.locked_requires_python
+            and pkg.files
+            and not pkg.skip
+            and not pkg.error
+            and (not online or keeps_locked_files(pkg))
+        ):
+            if len(versions) < 2:
+                _filter_locked_python(pkg, versions[0] if versions else None)
+                continue
+            # Not _resolve_pythons: it gives a package with no version (pylock.toml allows that) the first
+            # Python's answer on every Python.
+            for py in versions:
+                resolved = _filter_locked_python(replace(pkg, resolutions={}), py)
+                pkg.resolutions[py] = next((p for p in pkg.resolutions.values() if p == resolved), resolved)
 
 
 def fill(
@@ -1106,6 +1137,7 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
             rejected = [u for u in urls if not _supports_python(u, python)]
             pkg.files = [u["filename"] for u in live]
             pkg.yanked = frozenset(u["filename"] for u in live if u.get("yanked"))
+            pkg.python_rejected_yanked = frozenset(u["filename"] for u in rejected if u.get("yanked"))
             pkg.requires_python_rejected = {u["filename"]: f"requires Python {u['requires_python']}" for u in rejected}
         else:
             urls = _files(data.get("urls", []))

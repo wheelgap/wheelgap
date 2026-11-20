@@ -69,6 +69,15 @@ Packages that can't come from an index, such as Git, path or URL dependencies, a
 is walked per target from the project and workspace members (and the lock's dependency groups), so a package that
 only a Windows-only dependency pulls in isn't reported on Linux.
 
+**Answers follow `uv sync`**, with and without `--online` (0.13.0 followed pip with `--online`). uv
+[ignores `Requires-Python` upper bounds](https://docs.astral.sh/uv/reference/internals/resolver/#requires-python), so
+a pin whose release says `<3.15` still counts on Python 3.15, where pip would refuse it (when installing from a
+requirements file exported from the lock, for example). With `--online` (after 0.13.0), wheelgap says where the two
+differ: a note on stderr gives the number of such packages, `--explain` names them, and `--json` lists the files in
+each package's `pip_refuses`. Without `--online` it can't tell, because the lock doesn't record each file's
+`Requires-Python`. Only a plain `<` or `<=` bound is read this way: a file left out by `==3.14.*`, `~=` or `!=` stays
+left out with `--online`.
+
 **Skipped:** packages whose source is `editable`, `virtual`, `git`, `path`, `directory` or `url`. Packages from
 another index keep their locked files and are never looked up on PyPI.
 
@@ -133,6 +142,12 @@ targets; see [Targets](targets.md#how-targets-are-chosen).
 **Read:** each package's wheel and sdist filenames, its `marker`, its `index`, and the file's `requires-python`
 (with the same re-check as `uv.lock` for Pythons it leaves out).
 
+A package's own `requires-python` is applied to the target Python (after 0.13.0): where the range leaves the Python
+out, the pin is `missing` there, because an installer must refuse it
+([the pylock.toml specification](https://packaging.python.org/en/latest/specifications/pylock-toml/#installation)),
+and `--explain` gives the range. With `--online`, a package looked up on the index goes by the index's per-file
+`Requires-Python` instead.
+
 **Skipped:** `vcs`, `directory` and `archive` packages that list no wheels or sdist.
 
 `pylock.toml` has no dependency graph that wheelgap reads, so `--explain` shows no dependency path, and dependency
@@ -142,6 +157,13 @@ selection flags don't apply.
 
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` in older locks) and its markers.
 
+A package's `python-versions` is applied to the target Python (after 0.13.0) in locks from lock-version 2.1 on: where
+the range leaves the Python out, the pin is `missing` there and `--explain` gives the range. Poetry only locks a
+package for the Pythons its markers select, so this changes an answer only for a Python outside the range the project
+was locked for (`-p 3.14` when the project says `<3.14`), where it shows which pins hold the project back. `*`, and a
+Poetry constraint that isn't a PEP 440 specifier (`^3.9`), restrict nothing. With `--online`, a package looked up on
+the index goes by the index's per-file `Requires-Python` instead.
+
 **Skipped:** packages whose source type is `git`, `hg`, `svn`, `bzr`, `directory`, `file` or `url`. A package from
 another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. Old locks that record only
 hashes and no file names are looked up on the index; packages in them from another index are skipped as
@@ -149,7 +171,10 @@ hashes and no file names are looked up on the index; packages in them from anoth
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
-next to the lock. `--explain` shows the dependency path for these locks.
+next to the lock. `--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
+lock doesn't say which Pythons a direct dependency is installed for (`numpy = [{version = "1.26.4", python = "<3.13"},
+...]` is only in `pyproject.toml`), so the range would report a pin as `missing` on a Python Poetry never installs it
+on.
 
 **Dependency selection** (Poetry 2.x locks): `--group`, `--only-group` and `--no-dev` work with Poetry's meanings, and
 configured `groups` apply too. `main` and every group not marked `optional = true` in `pyproject.toml` count;
@@ -180,6 +205,13 @@ the lock alone can't tell, wheelgap checks a superset of what any Poetry 2.x ins
 
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` before PDM 2.8) and its `marker`.
 A package with no recorded files is looked up on the index.
+
+A package's `requires_python` is applied to the target Python (after 0.13.0) in locks made with the
+`inherit_metadata` strategy (PDM's default since 2.11), which records each package's marker: where the range leaves
+the Python out, the pin is `missing` there and `--explain` gives the range. As with `poetry.lock`, this changes an
+answer only for a Python outside the range the project was locked for. It isn't applied to a lock without
+`inherit_metadata`, which doesn't say which Pythons a package is installed for. With `--online`, a package looked up
+on the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** `git`, `hg`, `svn`, `bzr`, `path`, `url` and `file` packages.
 

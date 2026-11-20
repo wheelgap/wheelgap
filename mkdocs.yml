@@ -90,6 +90,7 @@ nav:
       - Litestar: case-studies/litestar.md
       - FastMCP: case-studies/fastmcp.md
       - Pydantic AI: case-studies/pydantic-ai.md
+      - MCP Python SDK: case-studies/mcp-python-sdk.md
   - Integrations:
       - Python API: python-api.md
       - MCP server: mcp.md

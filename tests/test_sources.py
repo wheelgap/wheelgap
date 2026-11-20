@@ -1064,6 +1064,97 @@ def test_no_lockfile_without_project_table_has_no_pyproject_hint(tmp_path):
     assert "pyproject.toml`" not in str(e.value)
 
 
+GROUPS_ONLY = '[dependency-groups]\ntest = ["pytest", "numpy"]\nlint = ["ruff"]\n'
+
+
+def test_no_lockfile_groups_only_suggests_sorted_group_selection(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(GROUPS_ONLY, encoding="utf-8")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    message = str(e.value)
+    assert f"wheelgap {tmp_path / 'pyproject.toml'} --group NAME` (groups: lint, test)." in message
+    assert message.endswith("Pass a file, or package names like `wheelgap numpy psycopg2`.")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["[dependency-groups]\n", "[project]\nname = 'x'\n[dependency-groups]\n", "[project]\nname = 'x'\n" + GROUPS_ONLY],
+    ids=["no-groups", "project-and-no-groups", "project-and-groups"],
+)
+def test_no_lockfile_empty_groups_or_project_keeps_existing_hint_rules(tmp_path, contents):
+    (tmp_path / "pyproject.toml").write_text(contents, encoding="utf-8")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    message = str(e.value)
+    assert "--group" not in message
+    if "[project]" in contents:
+        assert f"wheelgap {tmp_path / 'pyproject.toml'}`" in message
+    else:
+        assert "pyproject.toml`" not in message
+
+
+@pytest.mark.parametrize(
+    "contents,beside",
+    [
+        (GROUPS_ONLY, "setup.py"),
+        (GROUPS_ONLY, "setup.cfg"),
+        ('[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n' + GROUPS_ONLY, None),
+        ('[tool.flit.metadata]\nmodule = "mypkg"\nrequires = ["numpy"]\n' + GROUPS_ONLY, None),
+        ('[tool.pdm]\ndependencies = ["numpy"]\n' + GROUPS_ONLY, None),
+        ('[tool.poetry.dependencies]\npython = "^3.10"\nnumpy = "*"\n' + GROUPS_ONLY, None),
+        ('project = "invalid"\n' + GROUPS_ONLY, None),
+    ],
+    ids=["setup-py", "setup-cfg", "build-system", "flit-metadata", "pdm-dependencies", "poetry", "project-not-a-table"],
+)
+def test_no_lockfile_groups_only_in_a_buildable_project_has_no_group_hint(tmp_path, contents, beside):
+    # `wheelgap pyproject.toml --group NAME` refuses these (the project's own dependencies are outside [project]),
+    # so the hint mustn't send anyone there.
+    (tmp_path / "pyproject.toml").write_text(contents, encoding="utf-8")
+    if beside:
+        (tmp_path / beside).write_text("", encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "--group" not in str(e.value)
+
+
+def test_no_lockfile_group_hint_repeats_only_valid_group_names(tmp_path):
+    # A quoted TOML key can hold anything: line breaks, escape codes, a workflow command, a sentence.
+    (tmp_path / "pyproject.toml").write_text(
+        "[dependency-groups]\n"
+        'Type_Check = []\n"lint.fast" = []\ndocs = []\n'
+        '"a\\n::error::b" = []\n"\\u001b[2J" = []\n"run this instead" = []\n"-x" = []\n"caf\\u00e9" = []\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    assert str(e.value).isprintable()
+    assert "(groups: docs, lint-fast, type-check). Pass a file" in str(e.value)
+
+
+def test_no_lockfile_groups_that_collide_once_normalized_have_no_hint(tmp_path):
+    # `--group` refuses this file whichever group is asked for, so there is no command to suggest.
+    (tmp_path / "pyproject.toml").write_text(
+        '[dependency-groups]\nType_Check = []\n"type.check" = []\ndocs = []\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "--group" not in str(e.value)
+
+
+def test_no_lockfile_groups_with_no_valid_name_has_no_hint(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[dependency-groups]\n"a\\n::error::b" = ["numpy"]\n', encoding="utf-8")
+    with pytest.raises(SourceError, match="no lockfile found") as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value) and "::error::" not in str(e.value)
+
+
+def test_no_lockfile_unreadable_pyproject_has_no_hint(tmp_path):
+    (tmp_path / "pyproject.toml").write_bytes(b"[dependency-groups]\xff")
+    with pytest.raises(SourceError) as e:
+        find_lockfile(tmp_path)
+    assert "pyproject.toml`" not in str(e.value)
+
+
 def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
