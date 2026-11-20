@@ -1188,6 +1188,13 @@ def _dockerfile_requirements(
         )
     instructions: list[tuple[int, str]] = []
     froms, _ = _parse_froms(text, instructions=instructions)
+    if _heredoc_rules(syntax) is None:  # a digest-pinned docker/dockerfile: any version, so any `<<` may be a heredoc
+        for number, instruction in instructions:
+            if _heredoc_args(instruction, "\\") is not None:
+                raise DockerfileError(
+                    f"line {number}: # syntax={syntax} may read the heredocs in {instruction.strip()[:60]!r} "
+                    "differently from docker/dockerfile 1.16 and later, which wheelgap follows"
+                )
     if not froms:
         raise DockerfileError("no FROM line found")
     final_line = froms[-1][0]

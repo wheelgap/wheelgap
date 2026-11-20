@@ -1245,7 +1245,12 @@ _DIGEST = "@sha256:" + "0123456789abcdef" * 4
 
 @pytest.mark.parametrize(
     "frontend",
-    [f"docker/dockerfile:1{_DIGEST}", f"docker/dockerfile{_DIGEST}", f"docker.io/docker/dockerfile:1.7{_DIGEST}"],
+    [
+        f"docker/dockerfile:1{_DIGEST}",
+        f"docker/dockerfile{_DIGEST}",
+        f"docker.io/docker/dockerfile:1.7{_DIGEST}",
+        f"docker/dockerfile:1.16{_DIGEST}",  # the digest, not the tag, picks the image
+    ],
 )
 def test_dockerfile_requirements_reads_a_digest_pinned_docker_dockerfile_frontend(tmp_path, frontend):
     body = "FROM python:3.13-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
@@ -1254,6 +1259,11 @@ def test_dockerfile_requirements_reads_a_digest_pinned_docker_dockerfile_fronten
     # Its version is unknown, so a heredoc anywhere is still refused.
     path.write_text(f"# syntax={frontend}\n{body}RUN <<EOF\necho hi\nEOF\n", encoding="utf-8")
     with pytest.raises(DockerfileError, match="may read the heredocs in 'RUN <<EOF'"):
+        dockerfile_requirements(path)
+    # Versions read `<<` differently, so it's refused even where 1.16 finds no heredoc (a here-string here),
+    # before the final stage's RUN rules are checked.
+    path.write_text(f"# syntax={frontend}\n{body}RUN cat <<<hi\n", encoding="utf-8")
+    with pytest.raises(DockerfileError, match="may read the heredocs"):
         dockerfile_requirements(path)
 
 
