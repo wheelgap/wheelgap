@@ -79,6 +79,8 @@ nav:
       - FastAPI: case-studies/fastapi.md
       - Buzz: case-studies/buzz.md
       - Aider: case-studies/aider.md
+      - pydantic: case-studies/pydantic.md
+      - HERD: case-studies/herd.md
       - Textual: case-studies/textual.md
       - Poetry: case-studies/poetry.md
       - Fava: case-studies/fava.md
@@ -88,8 +90,6 @@ nav:
       - Litestar: case-studies/litestar.md
       - FastMCP: case-studies/fastmcp.md
       - Pydantic AI: case-studies/pydantic-ai.md
-      - pydantic: case-studies/pydantic.md
-      - HERD: case-studies/herd.md
   - Integrations:
       - Python API: python-api.md
       - MCP server: mcp.md
