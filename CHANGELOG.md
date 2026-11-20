@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `uv.lock` checked with no `--extra` or `--group` is now checked the way `uv sync --all-packages --all-extras --all-groups` installs it: a dependency's extras count only where some edge asks for them on that target. Before, every extra of every package was followed, which could list packages no install reaches, such as numpy, onnxruntime and flatbuffers on Python 3.15 for pydantic-ai's lock. (#572)
 - Scripts and `pyproject.toml` honour uv's `exclude-newer` and `exclude-newer-package` (from `[tool.uv]`, or a `uv.toml` beside the `pyproject.toml`; for a uv workspace member, from the workspace root's, as uv does), with and without `--deps`: files uploaded after the cutoff are left out, exact pins' included, and a file with no upload time makes its package unknown rather than a guess. Relative durations are refused. (#542, thanks [@kushaldave002](https://github.com/kushaldave002))
 - The Python API's `check_lockfile()` selects extras and dependency groups, including PEP 735 groups with `deps=True`, through explicit keyword arguments (#539, thanks [@kushaldave002](https://github.com/kushaldave002)).
 - MCP `check_lockfile` accepts `extras`, `all_extras`, `groups`, `only_groups` and `no_dev` to match the deployment without changing project config, including selecting PEP 735 groups from `pyproject.toml`. Invalid selections return the command line's error. (#538, thanks [@kushaldave002](https://github.com/kushaldave002))
