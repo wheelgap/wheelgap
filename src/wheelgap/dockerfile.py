@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
 import os
@@ -1003,12 +1004,6 @@ _UV_IMAGE_RE = re.compile(r"ghcr\.io/astral-sh/uv(?::[\w][\w.-]*)?(?:@sha256:[0-
 _UV_CONFIG_NAMES = ("uv.toml", "pyproject.toml")
 _COPY_FLAG_RE = re.compile(r"--(?:chown=[\w.:-]+|chmod=[0-7]{3,4}|link)", re.ASCII)
 _PLAIN = "no quotes, variables, escapes, globs, comments or shell operators"
-# RUN lines other than `pip install -r FILE` that are read as not changing what pip installs: system package managers
-# and a few file-mode commands, joined by &&, with rm only under the package caches.
-_SYSTEM_COMMANDS = {"apt-get", "apt", "apk", "yum", "dnf", "microdnf", "useradd", "adduser", "groupadd", "addgroup"}
-_SYSTEM_COMMANDS |= {"mkdir", "chown", "chmod", "rm"}
-_SYSTEM_ARGS_RE = re.compile(r"[A-Za-z0-9_./:=,+*& \t-]*", re.ASCII)
-_RM_PATHS = ("/var/lib/apt/lists/", "/var/cache/", "/root/.cache/")
 _PIP_CONFIG = ("/etc/pip.conf", "/etc/xdg/pip/", "/root/.config/pip/", "/root/.pip/")
 _PIP_CONFIG_NAMES = ("pip.conf", "pip.ini")
 
@@ -1282,23 +1277,6 @@ def _check_includes(
     return tuple(found)
 
 
-def _system_command(args: str) -> bool:
-    """Whether a RUN is only system package commands (see _SYSTEM_COMMANDS), which don't change what pip installs."""
-    if args.startswith(("--", "[")) or not _SYSTEM_ARGS_RE.fullmatch(args):
-        return False
-    for command in args.split("&&"):
-        words = command.split()
-        if not words or "&" in command or words[0] not in _SYSTEM_COMMANDS:
-            return False
-        if words[0] == "rm":
-            paths = [word for word in words[1:] if not word.startswith("-")]
-            if not all(path.startswith(_RM_PATHS) and ".." not in path for path in paths):
-                return False
-        elif "*" in command:
-            return False
-    return True
-
-
 # `pip install` flags that don't change which files pip picks: read and ignored. Spelled out in full only, since pip
 # also takes any unambiguous prefix of a long option and wheelgap doesn't guess at those.
 _PIP_HARMLESS_FLAGS = (
@@ -1355,37 +1333,835 @@ def _refuse_uv_option_lines(file: Path, number: int) -> None:
         )
 
 
-def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bool, bool]:
-    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given, whether uv installs them) of a RUN that is
-    exactly `pip install -r FILE...` (or `python -m pip ...`, or `uv pip install --system -r FILE...`) with flags
-    that don't change what the installer picks."""
-    unread = (
-        "only `RUN pip install -r FILE`, `RUN uv pip install --system -r FILE` and "
-        "system package commands (apt-get, apk, dnf...) are read by "
-        "--dockerfile-inputs, and this RUN may change what pip installs"
+# --dockerfile-inputs, RUN lines. A shell-form RUN is one string handed to `/bin/sh -c` as written (dispatchRun and
+# withShell in dockerfile2llb/convert.go: the shell, then the args joined; no Dockerfile-level substitution), with the
+# stage's ENV values and the ARGs that have a value in its environment (dispatchArg: `d.state.AddEnv` only when
+# `arg.Value != nil`).
+# https://github.com/moby/buildkit/blob/dd75b4955087a5a2d52188d6ce25b509b323280e/frontend/dockerfile/dockerfile2llb/convert.go
+# wheelgap splits that string into simple commands with the POSIX shell's token rules
+# (https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html, 2.2 Quoting, 2.3 Token Recognition,
+# 2.6 Word Expansions, 2.9 Shell Commands) for the subset below, and stops on what it doesn't model.
+class _ShellError(Exception):
+    """A RUN the tokenizer doesn't read: a heredoc, an unterminated quote or substitution."""
+
+
+_SAFE_VALUE_RE = re.compile(r"[A-Za-z0-9_./:=,@%+-]+", re.ASCII)  # expands to itself, unquoted: one field, no glob
+_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=", re.ASCII)
+_SHELL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+_OPERATORS = ("&&", "||", ";;", "|&", ";", "|", "&", "(", ")", "\n")
+_REDIRECTS = ("<<<", "<<-", "&>>", "<<", ">>", ">&", "<&", ">|", "<>", "&>", ">", "<")
+
+
+@dataclass
+class _Word:
+    text: str  # as the shell would pass it, where `exact`; else as written, for messages and for name checks
+    exact: bool = True  # False: an expansion wheelgap can't resolve, a glob, a tilde or a brace list is in it
+    assigns: str | None = None  # NAME, for a word that starts with an unquoted NAME=
+
+
+@dataclass
+class _Command:
+    words: list[_Word] = field(default_factory=list)
+    assigns: list[tuple[str, _Word]] = field(default_factory=list)  # NAME=value words before the command name
+    redirects: list[tuple[str, _Word]] = field(default_factory=list)
+    before: str = ""  # the operator before it: "", "&&", "||", ";", "|", "&", "(", ")"
+    after: str = ""
+    nested: bool = False  # inside a command substitution, or the string of `sh -c`
+    subshell: bool = False  # inside ( )
+
+
+class _Shell:
+    """Splits a shell command line into simple commands. `env` holds the variables whose value is known; one set by
+    an assignment or `export` on the line is followed, and any other way a variable can change (`read`, `for`,
+    `unset`, an assignment whose value isn't known) forgets it."""
+
+    def __init__(self, text: str, env: Mapping[str, str]) -> None:
+        self.text = text
+        self.pos = 0
+        self.env = dict(env)
+        self.commands: list[_Command] = []
+        self.unknown: set[str] = set()  # variables the line changed to a value wheelgap doesn't know
+        self.forgotten = False  # an eval or a sourced file may have set any variable
+        self.parens = False  # a function definition is on the line
+        self.depth = 0  # of ( ) subshells
+
+    def parse(self, nested: bool = False) -> list[_Command]:
+        text = self.text
+        command = _Command(nested=nested)
+        before = ""
+        while True:
+            while self.pos < len(text) and text[self.pos] in " \t":
+                self.pos += 1
+            if text.startswith("\\\n", self.pos):
+                self.pos += 2
+                continue
+            if self.pos >= len(text):
+                break
+            ch = text[self.pos]
+            if ch == "#":  # a comment: only where a word would start
+                end = text.find("\n", self.pos)
+                self.pos = len(text) if end < 0 else end
+                continue
+            if operator := next((op for op in _OPERATORS if text.startswith(op, self.pos)), None):
+                if operator == "&" and text.startswith(("&>", "&>>"), self.pos):
+                    operator = None
+            if operator:
+                self.pos += len(operator)
+                paren = operator if operator in "()" else ""
+                operator = {"\n": ";", ";;": ";", "|&": "|", "(": ";", ")": ";"}.get(operator, operator)
+                if command.words or command.assigns or command.redirects:
+                    if paren == "(":
+                        self.parens = True  # `name()`: a function definition, whose body runs when it is called
+                    self._finish(command, before, operator)
+                    command = _Command(nested=nested)
+                    before = operator
+                elif operator != ";":
+                    before = operator
+                self.depth = max(self.depth + {"(": 1, ")": -1}.get(paren, 0), 0)
+                continue
+            if redirect := self._redirect():
+                command.redirects.append(redirect)
+                continue
+            start = self.pos
+            word = self._word()
+            if not command.words and (m := _ASSIGNMENT_RE.match(text, start)) and m.end() <= self.pos:
+                value = _Word(word.text[len(m.group(0)) :], word.exact)
+                command.assigns.append((m.group(1), value))
+            else:
+                if m := _ASSIGNMENT_RE.match(text, start):
+                    word.assigns = m.group(1)
+                command.words.append(word)
+        if command.words or command.assigns or command.redirects:
+            self._finish(command, before, "")
+        return self.commands
+
+    def _finish(self, command: _Command, before: str, after: str) -> None:
+        command.before, command.after = before, after
+        command.subshell = self.depth > 0
+        self.commands.append(command)
+        # Follow what the line itself sets, so `VERSION=1.2 && pip install x==$VERSION` reads as the shell runs it.
+        name = command.words[0].text if command.words and command.words[0].exact else None
+        if not command.words:
+            for variable, value in command.assigns:
+                self._set(variable, value.text if value.exact else None)
+        elif name in ("export", "readonly", "local", "declare", "typeset"):
+            for word in command.words[1:]:
+                if word.assigns:
+                    self._set(word.assigns, word.text.partition("=")[2] if word.exact else None)
+        elif name in ("read", "unset", "for", "getopts", "eval", "source", ".", "set", "shift"):
+            for word in command.words[1:]:
+                self._set(word.text, None)
+            if name in ("eval", "source", "."):
+                self.env.clear()  # it may set anything
+                self.forgotten = True
+
+    def _set(self, name: str, value: str | None) -> None:
+        if value is None:
+            self.env.pop(name, None)
+            self.unknown.add(name)
+        else:
+            self.env[name] = value
+            self.unknown.discard(name)
+
+    def _redirect(self) -> tuple[str, _Word] | None:
+        text = self.text
+        m = re.compile(r"\d*").match(text, self.pos)
+        at = m.end() if m else self.pos
+        operator = next((op for op in _REDIRECTS if text.startswith(op, at)), None)
+        if operator is None:
+            return None
+        if operator in ("<<", "<<-"):
+            raise _ShellError("a heredoc")
+        self.pos = at + len(operator)
+        while self.pos < len(text) and text[self.pos] in " \t":
+            self.pos += 1
+        return operator, self._word()
+
+    def _word(self) -> _Word:
+        text = self.text
+        parts: list[str] = []
+        exact = True
+        start = self.pos
+        while self.pos < len(text):
+            ch = text[self.pos]
+            if ch in " \t\n;|&()<>":
+                break
+            if ch == "\\":
+                if text.startswith("\\\n", self.pos):
+                    self.pos += 2
+                    continue
+                parts.append(text[self.pos + 1 : self.pos + 2])
+                self.pos += 2
+            elif ch == "'":
+                end = text.find("'", self.pos + 1)
+                if end < 0:
+                    raise _ShellError("an unterminated ' quote")
+                parts.append(text[self.pos + 1 : end])
+                self.pos = end + 1
+            elif ch == '"':
+                self.pos += 1
+                while True:
+                    if self.pos >= len(text):
+                        raise _ShellError('an unterminated " quote')
+                    ch = text[self.pos]
+                    if ch == '"':
+                        self.pos += 1
+                        break
+                    if ch == "\\" and text[self.pos + 1 : self.pos + 2] in ('"', "$", "\\", "`", "\n"):
+                        if text[self.pos + 1] != "\n":
+                            parts.append(text[self.pos + 1])
+                        self.pos += 2
+                    elif ch in "$`":
+                        value, known = self._expansion(quoted=True)
+                        parts.append(value)
+                        exact = exact and known
+                    else:
+                        parts.append(ch)
+                        self.pos += 1
+            elif ch in "$`":
+                value, known = self._expansion(quoted=False)
+                parts.append(value)
+                exact = exact and known
+            else:
+                # A glob, a tilde or (in bash) a brace list is expanded by the shell: the word isn't what is written.
+                if (
+                    ch in "*?"
+                    or (ch == "[" and re.compile(r"\[[^\s\]]+\]").match(text, self.pos))
+                    or (ch == "~" and self.pos == start)
+                    or (ch == "{" and self._brace_list())
+                ):
+                    exact = False
+                parts.append(ch)
+                self.pos += 1
+        return _Word("".join(parts), exact)
+
+    def _brace_list(self) -> bool:
+        m = re.compile(r"\{[^\s{}]*(?:,|\.\.)[^\s{}]*\}").match(self.text, self.pos)
+        return m is not None
+
+    def _matching(self, opener: str, closer: str) -> str:
+        """The text up to the `closer` that matches the opener just read, quotes and nesting counted."""
+        text = self.text
+        depth = 1
+        start = self.pos
+        while self.pos < len(text):
+            ch = text[self.pos]
+            if ch == "\\":
+                self.pos += 2
+                continue
+            if ch == "'":
+                end = text.find("'", self.pos + 1)
+                if end < 0:
+                    break
+                self.pos = end + 1
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    self.pos += 1
+                    return text[start : self.pos - 1]
+            self.pos += 1
+        raise _ShellError(f"an unterminated {opener}")
+
+    def _expansion(self, quoted: bool) -> tuple[str, bool]:
+        """A `$...` or backquote expansion at self.pos: its value and True if known, else its text and False."""
+        text = self.text
+        start = self.pos
+        if text[self.pos] == "`":
+            end = self.pos + 1
+            while end < len(text) and text[end] != "`":
+                end += 2 if text[end] == "\\" else 1
+            if end >= len(text):
+                raise _ShellError("an unterminated ` substitution")
+            self._substitution(text[self.pos + 1 : end])
+            self.pos = end + 1
+            return text[start : self.pos], False
+        self.pos += 1
+        if text.startswith("((", self.pos):
+            self.pos += 1
+            self._matching("(", ")")
+            return text[start : self.pos], False
+        if text.startswith("(", self.pos):
+            self.pos += 1
+            self._substitution(self._matching("(", ")"))
+            return text[start : self.pos], False
+        if text.startswith("{", self.pos):
+            self.pos += 1
+            inner = self._matching("{", "}")
+            m = _SHELL_NAME_RE.match(inner)
+            name = m.group(0) if m else ""
+            rest = inner[len(name) :]
+            if name and name in self.env and not self.forgotten:
+                value = self.env[name]
+                # ${NAME}, and ${NAME:-word} / ${NAME-word} when NAME is set and not empty: NAME's value.
+                if value and (not rest or rest.startswith((":-", "-"))) and (quoted or _SAFE_VALUE_RE.fullmatch(value)):
+                    return value, True
+            return text[start : self.pos], False
+        m = _SHELL_NAME_RE.match(text, self.pos)
+        if m is None:
+            if self.pos < len(text) and text[self.pos] in "@*#?-$!0123456789":
+                self.pos += 1
+                return text[start : self.pos], False
+            return "$", True  # a lone $ is a $
+        self.pos = m.end()
+        name = m.group(0)
+        if name in self.env and not self.forgotten:
+            value = self.env[name]
+            if quoted or _SAFE_VALUE_RE.fullmatch(value):
+                return value, True
+        return text[start : self.pos], False
+
+    def _substitution(self, inner: str) -> None:
+        sub = _Shell(inner, self.env)
+        self.commands.extend(sub.parse(nested=True))
+
+
+# What a command that isn't a pip or uv install is taken to be, by its name. None of these installs Python packages
+# with pip or uv, so a RUN made of them is passed over, and reported by class (InputsReport.passed_over):
+# system package and account commands,
+_SYSTEM_COMMANDS = frozenset(
+    "apt-get apt apt-cache apt-key apt-mark add-apt-repository dpkg dpkg-reconfigure debconf-set-selections apk yum "
+    "dnf microdnf zypper rpm yum-config-manager install_packages useradd adduser groupadd addgroup usermod groupmod "
+    "userdel deluser chpasswd locale-gen update-locale localedef update-ca-certificates update-alternatives ldconfig "
+    "fc-cache gpg gpgconf setcap".split()
+)
+# shell builtins and file commands,
+_SHELL_COMMANDS = frozenset(
+    ": true false echo printf cd export set unset test [ [[ exit umask ulimit shopt wait sleep pwd readonly local "
+    "return break continue read trap hash type which mkdir chmod chown chgrp rm rmdir cp mv ln touch cat ls sed awk "
+    "grep egrep fgrep head tail tee sort uniq cut tr wc tar unzip gunzip gzip xz bzip2 zip install date basename "
+    "dirname realpath readlink id whoami uname mktemp du df stat file diff patch dd truncate md5sum sha1sum sha256sum "
+    "sha512sum nproc arch getent hostname yes seq lsb_release dpkg-query dpkg-architecture".split()
+)
+# commands that only read: the files they name can't change (their redirects still can),
+_READ_COMMANDS = frozenset(
+    "echo printf test [ [[ cat ls grep egrep fgrep head tail sort uniq cut wc basename dirname realpath readlink stat "
+    "file diff md5sum sha1sum sha256sum sha512sum du df which type".split()
+)
+# commands that don't change what is in a file (rm isn't one: an install of a file it removed fails the build),
+_UNCHANGING_COMMANDS = _READ_COMMANDS | frozenset("cd mkdir chmod chown chgrp find touch export".split())
+# and other programs: downloads, version control, compilers and build tools, JavaScript tooling. They can run a
+# project's own scripts (`npm run build`), which wheelgap doesn't look into: the note names each program passed over.
+_PROGRAMS = frozenset(
+    "curl wget git git-lfs npm npx yarn pnpm node corepack bun deno go cargo rustup rustc gcc g++ cc c++ clang cmake "
+    "ninja java javac mvn gradle dotnet ruby gem bundle composer php openssl ssh-keygen ssh-keyscan jq envsubst strip "
+    "ldd pkg-config autoreconf autoconf automake playwright".split()
+)
+# Tools that install Python packages in ways --dockerfile-inputs doesn't read: a line running one is an error.
+_INSTALLERS = frozenset(
+    "poetry pdm pipenv conda mamba micromamba pipx easy_install hatch pixi rye uvx pip-sync flit".split()
+)
+_SHELLS = frozenset("sh bash dash ash zsh ksh".split())
+# A distribution's own build of a Python package (Alpine's py3-yaml, Debian's python3-numpy), as against the
+# interpreter's own pieces.
+_SYSTEM_PYTHON_RE = re.compile(r"(?:py3|python3?(?:\.\d+)?)-([a-z0-9][a-z0-9.+_-]*)", re.ASCII)
+_SYSTEM_PYTHON_TOOLS = frozenset(
+    "dev devel pip venv virtualenv setuptools wheel distutils minimal full tk dbg doc libs apt pkg-resources "
+    "is-python3 software-properties".split()
+)
+# A `pip install` of only these, with no -r FILE, sets up the installer itself: passed over, with a note that says
+# they aren't checked and that the pip the later lines run isn't known.
+_INSTALLER_TOOLS = frozenset("pip setuptools wheel uv poetry pipenv pdm virtualenv".split())
+_BIN_DIRS = frozenset({"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"})
+PASSED_OVER = {
+    "system-packages": "system package and account commands",
+    "shell": "shell and file commands",
+    "programs": "other programs",
+    "venv": "virtual environment set-up",
+    "cache-mounts": "cache mounts",
+}
+
+# Environment variables that don't change which files pip picks, by pip's rule that PIP_<OPTION> sets the option
+# --<option> (https://pip.pypa.io/en/stable/topics/configuration/#environment-variables): the cache, what is printed,
+# prompts, network patience, and where pip may write. Every other PIP_ name is an error.
+_PIP_HARMLESS_ENV = frozenset(
+    "PIP_NO_CACHE_DIR PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK PIP_ROOT_USER_ACTION PIP_NO_INPUT PIP_PROGRESS_BAR "
+    "PIP_NO_COLOR PIP_DEFAULT_TIMEOUT PIP_TIMEOUT PIP_RETRIES PIP_QUIET PIP_VERBOSE PIP_NO_WARN_SCRIPT_LOCATION "
+    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING".split()
+)
+# The same for uv (https://docs.astral.sh/uv/reference/environment/): the cache, bytecode, how files are linked,
+# what is printed, network patience, where uv keeps Pythons and tools, and UV_PROJECT_ENVIRONMENT, which only
+# project commands (`uv sync`, not read) use. UV_SYSTEM_PYTHON is read as --system. UV_VERSION isn't a uv setting
+# (not in that reference, nor a string in the uv 0.13.1 binary): Dockerfiles use the name for the uv they install.
+_UV_HARMLESS_ENV = frozenset(
+    "UV_NO_CACHE UV_CACHE_DIR UV_COMPILE_BYTECODE UV_LINK_MODE UV_NO_PROGRESS UV_HTTP_TIMEOUT UV_HTTP_RETRIES "
+    "UV_CONCURRENT_DOWNLOADS UV_CONCURRENT_BUILDS UV_CONCURRENT_INSTALLS UV_PYTHON_DOWNLOADS UV_PYTHON_INSTALL_DIR "
+    "UV_TOOL_BIN_DIR UV_TOOL_DIR UV_INSTALL_DIR UV_BREAK_SYSTEM_PACKAGES UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON "
+    "UV_VERSION".split()
+)
+# Words that name a pip or uv configuration file: a command that isn't read and names one may be writing it.
+_CONFIG_WORDS = ("pip.conf", "pip.ini", ".config/pip", ".pip/", "uv.toml", ".netrc", "pydistutils.cfg", "sitecustomize")
+_SHELL_RE = re.compile(
+    r'\[\s*"(?:/bin/|/usr/bin/)?(?:sh|bash|dash|ash)"\s*,(?:\s*"(?:-[euxo]+|pipefail)"\s*,)*\s*"-[euxo]*c"\s*\]'
+)
+
+
+def _installer_setting(name: str) -> bool:
+    """Whether an environment variable is a pip or uv setting that may change what is installed. pip reads a name
+    that starts with PIP_ (in capitals) and lowercases the rest; uv's names are all capitals."""
+    return name.startswith(("PIP_", "UV_")) and name.upper() not in _PIP_HARMLESS_ENV | _UV_HARMLESS_ENV
+
+
+@dataclass
+class InputsReport:
+    """What --dockerfile-inputs didn't read, for the caller to say: the answer is the packages of the install lines
+    wheelgap can read, and this is the rest."""
+
+    # RUN lines passed over because nothing on them installs Python packages with pip or uv, by class (the keys of
+    # PASSED_OVER, and "installer-tools").
+    passed_over: dict[str, list[int]] = field(default_factory=dict)
+    programs: list[str] = field(default_factory=list)  # the programs of the "programs" class, in order
+    tools: list[str] = field(default_factory=list)  # what the "installer-tools" lines install
+    # (line, what it runs) for lines that may install Python packages wheelgap can't see: a script, make, a program
+    # it doesn't know. The answer doesn't cover them, and the caller must say so where it can't be missed.
+    warnings: list[tuple[int, str]] = field(default_factory=list)
+    notes: list[tuple[int, str, str]] = field(default_factory=list)  # (line, kind, message)
+    # (line, name) for each Python package a system package command installs (apk add py3-yaml, apt-get install
+    # python3-numpy): pip keeps one that satisfies a requirement, where wheelgap checks a fresh install.
+    system_python: list[tuple[int, str]] = field(default_factory=list)
+
+    def passed(self, kind: str, number: int) -> None:
+        lines = self.passed_over.setdefault(kind, [])
+        if number not in lines:
+            lines.append(number)
+
+
+@dataclass
+class _Install:
+    """One `pip install` or `uv pip install` command of a RUN."""
+
+    uv: bool
+    files: list[str]
+    constraints: list[str]
+    prefer_binary: bool
+    cwd: str | None  # the folder a relative FILE is in, or None with cwd_error
+    cwd_error: str | None
+    seen: int = 0  # how many of the reader's mentions come before it
+
+
+def _requirement_name(text: str) -> str | None:
+    """The normalised project name of a requirement written on a command line, or None if it isn't a plain one."""
+    m = re.fullmatch(
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)(\[[A-Za-z0-9._,-]*\])?\s*((?:[<>=!~]=?|===)[A-Za-z0-9.*+!,<>=~ -]+)?", text
     )
-    if args.startswith("--"):
-        raise DockerfileError(f"line {number}: RUN flags such as --mount aren't read by --dockerfile-inputs")
-    if args.startswith("[") or "<<" in args:
-        raise DockerfileError(f"line {number}: {unread} in shell form, without a heredoc")
-    if not _PLAIN_ARGS_RE.fullmatch(args):
-        raise DockerfileError(f"line {number}: {unread} ({_PLAIN})")
-    words = args.split()
-    uv = words[:2] == ["uv", "pip"]
-    if uv:
-        rest = words[2:]
-    elif words[:1] and _PIP_RE.fullmatch(words[0]):
-        rest = words[1:]
-    elif len(words) >= 3 and _PYTHON_RE.fullmatch(words[0]) and words[1:3] == ["-m", "pip"]:
-        rest = words[3:]
-    else:
-        raise DockerfileError(f"line {number}: {unread}")
-    if rest[:1] != ["install"]:
-        raise DockerfileError(f"line {number}: {unread}")
+    return re.sub(r"[-_.]+", "-", m.group(1)).lower() if m else None
+
+
+class _RunReader:
+    """Reads the RUN instructions of the stages --dockerfile-inputs follows. Each command of a RUN is one of: a pip
+    or uv install that is read (`installs`), a command that can't install Python packages (passed over, by class),
+    a command wheelgap can't see into (a warning), or one that installs in a way that isn't read (a DockerfileError).
+    """
+
+    def __init__(self, report: InputsReport) -> None:
+        self.report = report
+        self.venvs: set[str] = set()  # folders `python -m venv` made: their bin/pip is the image's Python's
+        # (line, word, folder) for each word of a command that wasn't read and may name a file it writes.
+        self.mentions: list[tuple[int, str, str | None]] = []  # with the folder the command ran in, if known
+        self.config_error: str | None = None  # a command that may have written a pip or uv config file
+
+    def read(
+        self,
+        number: int,
+        instruction: str,
+        args: str,
+        env: Mapping[str, str],
+        workdir: str | None,
+        workdir_error: str | None,
+        uv_system: bool,
+    ) -> list[_Install]:
+        def stop(message: str) -> NoReturn:
+            raise DockerfileError(f"line {number}: {message}")
+
+        rest = _args_after_flags(args, "\\").strip(_GO_SPACES)
+        if not args.endswith(rest) or any(c in args[: len(args) - len(rest)] for c in "\"'\\"):
+            stop("RUN flags with quotes or escapes aren't read by --dockerfile-inputs")
+        mounts = set()
+        for flag in args[: len(args) - len(rest)].split():
+            if flag.startswith("--mount="):
+                # type= defaults to bind (instructions/commands_runmount.go, parseMount).
+                fields = dict(part.partition("=")[::2] for part in flag.removeprefix("--mount=").split(","))
+                mounts.add(fields.get("type", "bind"))
+                if "$" in fields.get("type", ""):
+                    stop("RUN --mount with a variable for its type isn't read by --dockerfile-inputs")
+            elif not flag.startswith(("--network=", "--security=")):
+                stop(f"RUN {flag.split('=')[0]} isn't a RUN flag --dockerfile-inputs reads")
+        if mounts & {"cache", "tmpfs"}:
+            self.report.passed("cache-mounts", number)
+        # A bind mount can put a requirements file in front of the RUN with no COPY, and a secret or an ssh agent
+        # can carry an index's credentials or a pip.conf: an install under one isn't read.
+        special = sorted(mounts - {"cache", "tmpfs"})
+        parser: _Shell | None = None
+        if _is_exec_form(instruction, rest):
+            commands = [_Command(words=[_Word(item) for item in json.loads(rest)])]
+        elif _heredocs(instruction):
+            self.report.warnings.append((number, "a heredoc script"))
+            return []
+        else:
+            parser = _Shell(rest, env)
+            try:
+                commands = parser.parse()
+            except _ShellError as e:
+                stop(f"this RUN has {e}, which --dockerfile-inputs doesn't read")
+        # `sh -c 'COMMANDS'`: the string is a command line of its own, read like one in a command substitution.
+        index = 0
+        while index < len(commands):
+            words = commands[index].words
+            if (
+                len(words) == 3
+                and all(word.exact for word in words)
+                and posixpath.basename(words[0].text) in _SHELLS
+                and re.fullmatch(r"-[eux]*c", words[1].text)
+            ):
+                try:
+                    inner = _Shell(words[2].text, parser.env if parser else {}).parse(nested=True)
+                except _ShellError as e:
+                    stop(f"this RUN has {e}, which --dockerfile-inputs doesn't read")
+                commands[index : index + 1] = inner or [_Command(words=[_Word(":")])]
+            else:
+                index += 1
+        installs: list[_Install] = []
+        cwd, cwd_error = workdir, workdir_error
+        depth = 0  # inside if, for, while, until or { }
+        risky_setting: str | None = None
+        names_installer = False  # a pip or uv command, read or not
+        groups = self._and_or_lists(commands)
+        for index, command in enumerate(commands):
+            words = list(command.words)
+            texts = [word.text for word in words]
+            assigns = list(command.assigns)
+            conditional = None
+            # Reserved words (2.4): what follows `if`, `then`, `do`... is a command like any other, but it may not run.
+            while words and words[0].exact:
+                reserved = words[0].text
+                if reserved in ("if", "while", "until", "{"):
+                    depth += 1
+                elif reserved in ("fi", "done", "}"):
+                    depth = max(depth - 1, 0)
+                elif reserved not in ("then", "elif", "else", "do", "!", "time"):
+                    break
+                words = words[1:]
+            while words and words[0].assigns and words[0].exact is not None:  # `then NAME=value command`
+                assigns.append((words[0].assigns, _Word(words[0].text.partition("=")[2], words[0].exact)))
+                words = words[1:]
+            first = words[0].text if words and words[0].exact else None
+            if first in ("case", "function", "select", "coproc") or (parser is not None and parser.parens):
+                # `case` patterns and function bodies aren't split into commands the way the shell runs them.
+                what = first if first in ("case", "function", "select", "coproc") else "name()"
+                self._opaque_structure(number, commands, str(what), stop)
+                return []
+            if first == "for":
+                depth += 1
+                continue
+            if depth:
+                conditional = "inside if, for, while or { }"
+            elif command.nested:
+                conditional = "inside a command substitution or `sh -c`"
+            elif command.subshell:
+                conditional = "inside ( )"
+            elif groups[index]:
+                conditional = groups[index]
+            # Wrappers that run the rest as the command.
+            while words and words[0].exact and words[0].text in ("sudo", "exec", "command", "nice", "nohup", "env"):
+                wrapper = words[0].text
+                words = words[1:]
+                if wrapper == "command" and words and words[0].text in ("-v", "-V"):
+                    words = [_Word("type")]
+                while wrapper == "env" and words and words[0].assigns:
+                    assigns.append((words[0].assigns, _Word(words[0].text.partition("=")[2], words[0].exact)))
+                    words = words[1:]
+                if wrapper in ("sudo", "env") and words and words[0].text.startswith("-"):
+                    words = [_Word(f"{wrapper} {words[0].text}", exact=False)]
+            if words and words[0].exact and words[0].text == "export":
+                assigns += [(w.assigns, _Word(w.text.partition("=")[2], w.exact)) for w in words[1:] if w.assigns]
+            for name, _ in assigns:
+                if _installer_setting(name):
+                    risky_setting = name
+            kind, detail = self._classify(number, words, cwd, uv_system, stop) if words else ("shell", "")
+            if kind in ("install", "installer-tools", "pip"):
+                names_installer = True
+            if isinstance(detail, _Install):
+                if conditional:
+                    stop(f"`{' '.join(texts)}` is {conditional}, so --dockerfile-inputs can't tell whether it runs")
+                if special:
+                    stop(
+                        f"RUN --mount=type={special[0]} with an install isn't read by --dockerfile-inputs: it can "
+                        "bring files or credentials the Dockerfile doesn't show"
+                    )
+                if any(operator.endswith("<") for operator, _ in command.redirects):
+                    stop(f"`{' '.join(texts)}` reads its input from a redirect, which --dockerfile-inputs doesn't read")
+                detail.cwd, detail.cwd_error, detail.seen = cwd, cwd_error, len(self.mentions)
+                installs.append(detail)
+            elif kind == "warning":
+                assert isinstance(detail, str)
+                self.report.warnings.append((number, detail))
+            elif kind == "installer-tools":
+                self.report.passed(kind, number)
+                self.report.tools += [name for name in str(detail).split() if name not in self.report.tools]
+            elif kind != "pip":
+                self.report.passed(kind, number)
+                if kind == "programs" and detail not in self.report.programs:
+                    self.report.programs.append(str(detail))
+            if first == "cd" and kind == "shell":
+                target = words[1] if len(words) == 2 else None
+                if conditional or command.subshell or target is None or not target.exact or target.text == "-":
+                    cwd, cwd_error = None, f"line {number}: the folder after `{' '.join(texts)}` isn't known"
+                elif target.text.startswith("/"):
+                    cwd, cwd_error = posixpath.normpath(target.text), None
+                elif cwd is not None:
+                    cwd = posixpath.normpath(posixpath.join(cwd, target.text))
+            elif first in ("pushd", "popd"):
+                cwd, cwd_error = None, f"line {number}: the folder after `{first}` isn't known"
+            # What this command may write to. A command that only reads can't change the files it names.
+            written = [target.text for operator, target in command.redirects if ">" in operator]
+            if kind not in ("install", "pip", "system-packages") and first not in _UNCHANGING_COMMANDS:
+                written += [word.text for word in words[1:]]
+            self.mentions += [(number, text, cwd) for text in written]
+            if kind not in ("install", "pip") and (word := next((t for t in written if _names_config(t)), None)):
+                self.config_error = (
+                    f"line {number}: `{' '.join(texts)[:60]}` names {word}, which may be a pip or uv config file"
+                )
+        if risky_setting and names_installer:
+            stop(f"{risky_setting} is set on this RUN and may change what pip or uv installs")
+        return installs
+
+    def check_untouched(self, number: int, host: Path, target: str | None, seen: int) -> None:
+        """A requirements file an install line reads (`host`, at `target` in the image if that is known) must be the
+        file COPY put there: a command before the install that wasn't read, and that names the file, a glob that
+        matches it or a folder it is in, may have changed it."""
+        for line, word, cwd in self.mentions[:seen]:
+            named = host.name in word
+            if not named and target is not None and (word.startswith("/") or cwd is not None):
+                path = posixpath.normpath(posixpath.join(cwd or "/", word))
+                named = fnmatch.fnmatchcase(target, path) or target.startswith(path.rstrip("/") + "/")
+            if named:
+                raise DockerfileError(
+                    f"line {number}: {host.name} may have been changed by line {line}, which names {word} and "
+                    "isn't read by --dockerfile-inputs"
+                )
+
+    @staticmethod
+    def _and_or_lists(commands: list[_Command]) -> list[str | None]:
+        """For each command, why it may not run or may fail unnoticed: its and-or list (2.9.3) has a `||`, it is
+        part of a pipeline, or it runs in the background."""
+        reasons: list[str | None] = [None] * len(commands)
+        start = 0
+        for index, command in enumerate(commands):
+            if index and command.before not in ("&&", "||", "|"):
+                start = index
+            reason = None
+            if command.before == "||" or command.after == "||":
+                reason = "in a list with ||"
+            elif command.before == "|" or command.after == "|":
+                reason = "part of a pipeline"
+            elif command.after == "&":
+                reason = "run in the background"
+            if reason:
+                for other in range(start, len(commands)):
+                    if other > start and commands[other].before not in ("&&", "||", "|"):
+                        break
+                    reasons[other] = reasons[other] or reason
+        # A `||` later in the list also covers the commands before it.
+        for index in range(len(commands) - 2, -1, -1):
+            if commands[index + 1].before in ("&&", "||", "|") and reasons[index + 1] and not reasons[index]:
+                reasons[index] = reasons[index + 1]
+        return reasons
+
+    def _opaque_structure(self, number: int, commands: list[_Command], what: str, stop) -> None:  # type: ignore[no-untyped-def]
+        """A RUN with a structure wheelgap doesn't split: an error if any word names an installer, else a warning."""
+        for command in commands:
+            for word in command.words:
+                base = posixpath.basename(word.text)
+                if _PIP_RE.fullmatch(base) or _PYTHON_RE.fullmatch(base) or base in _INSTALLERS or base == "uv":
+                    stop(
+                        f"this RUN names {base} inside `{what}`, which --dockerfile-inputs doesn't read: "
+                        "it can't tell what is installed"
+                    )
+        self.report.warnings.append((number, f"a `{what}` command list"))
+
+    def _classify(self, number, words, cwd, uv_system, stop):  # type: ignore[no-untyped-def]
+        """(class, detail) for one simple command: ("install", _Install), ("warning", what it runs), or a class it is
+        passed over as. A command that installs Python packages in a way that isn't read is an error (`stop`)."""
+        first = words[0]
+        shown = " ".join(word.text for word in words)[:70]
+        if not first.exact:
+            return "warning", f"`{shown}`, a command name wheelgap can't resolve"
+        name = first.text
+        base = posixpath.basename(name)
+        if "/" in name and posixpath.dirname(name) not in _BIN_DIRS:
+            folder = posixpath.dirname(posixpath.dirname(posixpath.normpath(posixpath.join(cwd or "/", name))))
+            in_venv = posixpath.basename(posixpath.dirname(name)) == "bin" and folder in self.venvs
+            if (
+                base in _INSTALLERS
+                or base == "uv"
+                or ((_PIP_RE.fullmatch(base) or _PYTHON_RE.fullmatch(base)) and not in_venv)
+            ):
+                stop(
+                    f"`{shown}`: --dockerfile-inputs doesn't know which Python {name} belongs to (only pip, "
+                    "python -m pip and uv on the PATH, or in a virtual environment `python -m venv` made on an "
+                    "earlier line, are read)"
+                )
+            if not in_venv:
+                return "warning", f"`{shown}`, a script or program at a path"
+        args = words[1:]
+        if _PIP_RE.fullmatch(base):
+            return self._pip(number, args, False, uv_system, shown, stop)
+        if _PYTHON_RE.fullmatch(base):
+            while args and args[0].text in ("-u", "-B", "-E", "-s", "-I"):
+                args = args[1:]
+            if not args or args[0].text in ("-V", "--version", "-VV"):
+                return "shell", ""
+            option = args[0].text if args[0].exact else None
+            if option is not None and option.startswith("-m") and (len(option) > 2 or len(args) > 1):
+                module = option[2:] or (args[1].text if args[1].exact else None)
+                rest = args[1:] if len(option) > 2 else args[2:]
+                if module == "pip":
+                    return self._pip(number, rest, False, uv_system, shown, stop)
+                if module == "uv":
+                    return self._uv(number, rest, uv_system, shown, stop)
+                if module in ("venv", "virtualenv"):
+                    folders = [word for word in rest if not word.text.startswith("-")]
+                    if len(folders) == 1 and folders[0].exact and (cwd is not None or folders[0].text.startswith("/")):
+                        self.venvs.add(posixpath.normpath(posixpath.join(cwd or "/", folders[0].text)))
+                    return "venv", ""
+                if module == "ensurepip":
+                    return "installer-tools", "pip"
+                if module == "compileall":
+                    return "shell", ""
+                return "warning", f"`{shown}`, a Python module wheelgap doesn't look into"
+            if option is None or option.startswith("-"):
+                return "warning", f"`{shown}`, Python code wheelgap doesn't look into"
+            if posixpath.basename(option) == "setup.py":
+                stop(
+                    f"`{shown}` installs or builds a project from its setup.py, which --dockerfile-inputs doesn't read"
+                )
+            if posixpath.basename(option) == "get-pip.py":
+                return "installer-tools", "pip"
+            return "warning", f"`{shown}`, a Python script wheelgap doesn't look into"
+        if base == "uv":
+            return self._uv(number, args, uv_system, shown, stop)
+        if base in _INSTALLERS:
+            if [word.text for word in args] in (["--version"], ["-V"], ["--help"]):
+                return "shell", ""
+            stop(f"`{shown}`: {base} installs Python packages in a way --dockerfile-inputs doesn't read")
+        if base in (".", "source") and len(args) == 1 and args[0].exact and args[0].text.endswith("/bin/activate"):
+            return "venv", ""
+        if base in _SHELLS or base in (".", "source", "eval", "make", "xargs"):
+            return "warning", f"`{shown}`, which runs commands wheelgap can't see"
+        if base == "find" and any(word.text in ("-exec", "-execdir", "-ok", "-okdir") for word in args):
+            return "warning", f"`{shown}`, which runs commands wheelgap can't see"
+        if base in _SYSTEM_COMMANDS:
+            for word in args:
+                if (m := _SYSTEM_PYTHON_RE.fullmatch(word.text)) and m.group(1) not in _SYSTEM_PYTHON_TOOLS:
+                    self.report.system_python.append((number, word.text))
+            return "system-packages", ""
+        if base in _SHELL_COMMANDS or base == "find":
+            return "shell", ""
+        if base in _PROGRAMS:
+            return "programs", base
+        return "warning", f"`{shown}`, a program wheelgap doesn't know"
+
+    def _uv(self, number, args, uv_system, shown, stop):  # type: ignore[no-untyped-def]
+        texts = [word.text for word in args]
+        if texts[:1] == ["pip"]:
+            return self._pip(number, args[1:], True, uv_system, shown, stop)
+        if texts in (["--version"], ["-V"], ["self", "version"], ["cache", "clean"], ["cache", "prune"]):
+            return "shell", ""
+        stop(
+            f"`{shown}` isn't read by --dockerfile-inputs: of uv's commands, only `uv pip install --system -r FILE` is"
+        )
+
+    def _pip(self, number, args, uv, uv_system, shown, stop):  # type: ignore[no-untyped-def]
+        """`pip ARGS` or `uv pip ARGS`."""
+        tool = "uv pip" if uv else "pip"
+        while args and args[0].text in (_UV_HARMLESS_FLAGS if uv else _PIP_HARMLESS_FLAGS):
+            args = args[1:]  # before the subcommand, as in `pip --no-cache-dir install`
+        if not args:
+            return "shell", ""
+        subcommand = args[0].text if args[0].exact else None
+        if subcommand in ("--version", "-V", "list", "freeze", "check", "show", "cache", "help", "debug", "tree"):
+            return "pip", ""  # nothing is installed, and nothing is read
+        if subcommand != "install":
+            stop(f"`{shown}`: only `install` is read of {tool}'s commands, and this one may change what is installed")
+        if unknown := next((word for word in args if not word.exact), None):
+            stop(
+                f"`{shown}`: {unknown.text} isn't a value --dockerfile-inputs can read (a variable with no value in "
+                "the Dockerfile, a command substitution or a glob)"
+            )
+        rest = [word.text for word in args]
+        # Only installer tools, and no file: the installer's own set-up.
+        flags = _UV_HARMLESS_FLAGS + ("--system",) if uv else _PIP_HARMLESS_FLAGS + ("--prefer-binary",)
+        named = [text for text in rest[1:] if text not in flags and not text.startswith("--root-user-action")]
+        tools = [_requirement_name(text) for text in named]
+        if named and all(tool_name in _INSTALLER_TOOLS for tool_name in tools):
+            return "installer-tools", " ".join(dict.fromkeys(tools))
+        files, constraints, prefer_binary = _pip_install_files(number, rest, uv, uv_system)
+        return "install", _Install(uv, files, constraints, prefer_binary, None, None)
+
+
+def _env_pairs(
+    keyword: str, args: str, build_args: Mapping[str, str], global_defaults: Mapping[str, str]
+) -> list[tuple[str, str | None, bool]] | None:
+    """(name, value, unset) for each variable an ENV or ARG instruction sets: the value if it is a literal wheelgap
+    can read, else None; `unset` for an ARG that gets no value at all. None if the instruction isn't one wheelgap
+    splits with certainty (an escape, a quote in a name, `ENV --flag`).
+
+    ENV follows parseNameVal in parser/line_parsers.go: `ENV NAME value...` when the first word has no `=`, else
+    `NAME=value` words. ARG follows dispatchArg in dockerfile2llb/convert.go: a --build-arg value, else the default,
+    else the global ARG's value when the name is declared before the first FROM.
+    https://github.com/moby/buildkit/blob/dd75b4955087a5a2d52188d6ce25b509b323280e/frontend/dockerfile/parser/line_parsers.go
+    """
+    if "\\" in args or args.startswith("--") or not args:
+        return None
+    try:
+        words = _ShellLexer(args, raw_quotes=False, raw_escapes=False).words()
+        raw = _ShellLexer(args, raw_quotes=True, raw_escapes=False).words()
+    except (_LexError, RecursionError):
+        return None
+    if not words or len(words) != len(raw):
+        return None
+
+    def literal(value: str, written: str) -> str | None:
+        return None if "$" in written else value
+
+    name_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+    pairs: list[tuple[str, str | None, bool]] = []
+    if keyword == "ENV" and "=" not in words[0]:
+        legacy = re.split(r"[ \t]+", args, maxsplit=1)  # reWhitespace.Split(rest, 2)
+        if len(legacy) < 2 or not name_re.fullmatch(legacy[0]) or any(c in legacy[1] for c in "\"'"):
+            return None
+        return [(legacy[0], literal(legacy[1].strip(), legacy[1]), False)]
+    for word, written in zip(words, raw, strict=True):
+        name, equals, value = word.partition("=")
+        if not name_re.fullmatch(name) or not written.startswith(name) or (keyword == "ENV" and not equals):
+            return None
+        if keyword == "ENV":
+            pairs.append((name, literal(value, written), False))
+        elif name in build_args:
+            pairs.append((name, build_args[name], False))
+        elif equals:
+            pairs.append((name, literal(value, written), False))
+        elif name in global_defaults:
+            pairs.append((name, global_defaults[name], False))
+        else:
+            pairs.append((name, None, True))
+    return pairs
+
+
+def _names_config(text: str) -> bool:
+    return any(word in text for word in _CONFIG_WORDS)
+
+
+def _pip_install_files(number: int, rest: list[str], uv: bool, uv_system: bool) -> tuple[list[str], list[str], bool]:
+    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given) of the words of a `pip install ...` or
+    `uv pip install ...` command, from `install` on, with flags that don't change what the installer picks.
+    `uv_system` says UV_SYSTEM_PYTHON is set, which uv reads as --system."""
     files: list[str] = []
     constraints: list[str] = []
     prefer_binary = False
-    system = False
+    system = uv_system
     i = 1
     while i < len(rest):
         if uv:
@@ -1427,9 +2203,13 @@ def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bo
                 f"line {number}: pip install {rest[i]}: --dockerfile-inputs only reads {_PIP_FLAGS_READ}"
             )
     if not files:
-        raise DockerfileError(f"line {number}: {unread}")
+        raise DockerfileError(
+            f"line {number}: {'uv pip' if uv else 'pip'} install with no -r FILE isn't read by --dockerfile-inputs"
+        )
     if uv and not system:
-        raise DockerfileError(f"line {number}: uv pip install needs --system for --dockerfile-inputs")
+        raise DockerfileError(
+            f"line {number}: uv pip install needs --system (or ENV UV_SYSTEM_PYTHON=1) for --dockerfile-inputs"
+        )
     # uv picks the format of `-r FILE` by its name: pylock.toml is a lock, a .py file is a script with inline
     # metadata, and pyproject.toml, setup.py, setup.cfg and extensionless files are read in other ways again. A .txt
     # or .in file is a requirements file to uv and to wheelgap alike. The same names are asked of a `-c FILE`.
@@ -1441,7 +2221,7 @@ def _pip_install_files(number: int, args: str) -> tuple[list[str], list[str], bo
                     f"line {number}: uv pip install {option} {other}: uv reads a file by its name (a lock, a script, "
                     "a project), and --dockerfile-inputs only reads requirements files named *.txt or *.in for uv"
                 )
-    return files, constraints, prefer_binary, uv
+    return files, constraints, prefer_binary
 
 
 def dockerfile_requirements(
@@ -1453,19 +2233,24 @@ def dockerfile_requirements(
     constraints: dict[Path, tuple[Path, ...]] | None = None,
     dependencies: bool = False,
     uv_installs: set[tuple[int, Path]] | None = None,
+    report: InputsReport | None = None,
 ) -> list[tuple[int, Path]]:
-    """(line, requirements file) for each `RUN pip install -r FILE` in the Dockerfile's final stage.
+    """(line, requirements file) for each `pip install -r FILE` the RUN lines of the Dockerfile's final stage run.
 
-    FILE is followed back through the WORKDIR and COPY instructions before it to a file in the build context, taken
-    to be the Dockerfile's folder (or `context` if given). Only a strict subset is read: a final stage built FROM an
-    image (not an earlier stage), WORKDIR with a literal path, plain `COPY SRC... DEST` from the build context, and
-    RUN lines that are exactly `pip install -r FILE` (or `python -m pip install`, with `-c FILE` and the flags in
-    _PIP_FLAGS_READ) or only system package commands (_SYSTEM_COMMANDS). `constraints`, if given, is filled with each
-    requirements file's `-c` files, to pass to load_inputs; `dependencies` says the check will follow dependencies
-    (--deps), which --prefer-binary then can't be read for. Anything else that may change what pip installs or put
-    FILE in the image (any other RUN, ADD, COPY --from, SHELL, an ENV or ARG setting PIP_ or UV_ variables, a pip
-    config file, a `# syntax=` frontend other than docker/dockerfile) is a DockerfileError naming its line, never a
-    guess. The Docker ignore file is read (dockerignore.context_rules): a file its rules leave out of the build
+    The answer is the packages of the install lines wheelgap can read, not everything the image holds. FILE is
+    followed back through the WORKDIR and COPY instructions before it to a file in the build context, taken to be the
+    Dockerfile's folder (or `context` if given). Every command of every RUN is classified (_RunReader): an install
+    that is read; a command that can't install Python packages with pip or uv, passed over and listed by class in
+    `report`; a command wheelgap can't see into (a script, make, a program it doesn't know), passed over with a
+    warning in `report` that the caller must show; or one that installs in a way that isn't read, or that may change
+    what a read install fetches, which is a DockerfileError naming its line, never a guess. The same holds for ADD,
+    COPY --from, a SHELL that isn't sh or bash, an ENV or ARG that sets a PIP_ or UV_ variable off the harmless
+    list, a pip config file, a final stage built on an earlier stage, and a `# syntax=` frontend other than
+    docker/dockerfile.
+
+    `constraints`, if given, is filled with each requirements file's `-c` files, to pass to load_inputs;
+    `dependencies` says the check will follow dependencies (--deps), which --prefer-binary then can't be read for.
+    The Docker ignore file is read (dockerignore.context_rules): a file its rules leave out of the build
     context, whether FILE or one it includes, is a DockerfileError naming the rule, and is never read. A -r or -c
     inside a `-r FILE` or a `-c FILE` is followed only when a COPY puts that same file where pip looks for it in the
     image (_check_includes); `includes`, if given, is filled with the files each (line, FILE) includes, for the
@@ -1497,6 +2282,7 @@ def dockerfile_requirements(
             constraints=constraints,
             dependencies=dependencies,
             uv_installs=uv_installs,
+            report=report,
         )
     except DockerfileError as e:
         number, _, message = str(e).removeprefix("line ").partition(": ")
@@ -1516,6 +2302,7 @@ def _dockerfile_requirements(
     constraints: dict[Path, tuple[Path, ...]] | None = None,
     dependencies: bool = False,
     uv_installs: set[tuple[int, Path]] | None = None,
+    report: InputsReport | None = None,
 ) -> list[tuple[int, Path]]:
     df_dir = dockerfile_dir if dockerfile_dir is not None else context
     try:
@@ -1533,7 +2320,9 @@ def _dockerfile_requirements(
             f"# syntax={syntax}: --dockerfile-inputs only reads Dockerfiles for docker/dockerfile frontends"
         )
     instructions: list[tuple[int, str]] = []
-    froms, _ = _parse_froms(text, instructions=instructions)
+    froms, global_args = _parse_froms(text, build_args, instructions=instructions)
+    if report is None:
+        report = InputsReport()
     if _heredoc_rules(syntax) is None:  # a digest-pinned docker/dockerfile: any version, so any `<<` may be a heredoc
         for number, instruction in instructions:
             if _heredoc_args(instruction, "\\") is not None:
@@ -1574,18 +2363,18 @@ def _dockerfile_requirements(
     used_constraints: dict[Path, tuple[Path, ...]] = {}
     installed_by_uv: dict[Path, bool] = {}
 
-    def copied_requirements(file: str, option: str, uv: bool) -> Path:
+    def copied_requirements(file: str, option: str, uv: bool, install: _Install) -> Path:
         """The file in the build context that `-r FILE` or `-c FILE` on the RUN at `number` reads in the image, for
         pip or (`uv`) for uv pip."""
         if file.startswith("/"):
             target = posixpath.normpath(file)
-        elif workdir is None:
+        elif install.cwd is None:
             raise DockerfileError(
-                workdir_error
+                install.cwd_error
                 or f"line {number}: {option} {file} is relative, but no WORKDIR with an absolute path comes before it"
             )
         else:
-            target = posixpath.normpath(posixpath.join(workdir, file))
+            target = posixpath.normpath(posixpath.join(install.cwd, file))
         host = _find_copied_file(copies, target, context, number, ignore_rules)
         # A constraints file's includes are verified as a requirements file's are: a -r inside it is read as
         # requirements (pip's rule), so those packages are installed, and a -c inside it constrains them all.
@@ -1600,9 +2389,89 @@ def _dockerfile_requirements(
         if uv:
             for read in (host, *nested):
                 _refuse_uv_option_lines(read, number)
+        for read in (host, *nested):
+            reader.check_untouched(number, read, target if read == host else None, install.seen)
         if includes is not None:
             includes[number, host] = nested
         return host
+
+    reader = _RunReader(report)
+    env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
+    uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
+    global_defaults = global_args.defaults if not global_args.unreadable else {}
+
+    def read_install(install: _Install) -> None:
+        if run_error:
+            raise DockerfileError(run_error)
+        if reader.config_error:
+            raise DockerfileError(reader.config_error)
+        uv = install.uv
+        if uv and (config := next((copy for copy in copies if _copies_config(copy, _UV_CONFIG_NAMES)), None)):
+            raise DockerfileError(
+                f"line {config.line}: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads "
+                "settings from them: copy the requirements file alone and run uv pip install before this COPY"
+            )
+        if uv and dependencies:
+            # A dependency is a range, resolved here by pip's rules (see the pins asked for below).
+            raise DockerfileError(
+                f"line {number}: uv pip install isn't read with --deps: wheelgap follows dependencies as pip "
+                "resolves them, and uv can pick other versions"
+            )
+        constraint_paths = tuple(copied_requirements(file, "-c", uv, install) for file in install.constraints)
+        if constraint_paths and constraints is None:  # never read the requirements without their constraints
+            raise DockerfileError(f"line {number}: pip install -c FILE isn't read here")
+        for file in install.files:
+            host = copied_requirements(file, "-r", uv, install)
+            # Read as load_inputs will read it: with the line's -c files, and through every include, so a
+            # requirement in an included file (or in a -r inside a constraints file) counts, and a requirement
+            # that only a constraint pins with == counts as pinned.
+            unpinned = (
+                [p for p in parse_requirements(host, constraint_paths).packages if not p.version]
+                if (install.prefer_binary or uv) and not dependencies
+                else []
+            )
+            if uv and unpinned:
+                where = host.name
+                if unpinned[0].origin != host.name:
+                    where = f"{unpinned[0].origin} (read with {host.name})"
+                # wheelgap picks a release for a range as pip does, and pip skips releases whose Requires-Python
+                # upper bound leaves the image's Python out, which uv takes: only a pin gives both the same one.
+                raise DockerfileError(
+                    f"line {number}: uv pip install: {unpinned[0].name} in {where} isn't pinned with ==, and uv "
+                    "and pip can pick different versions for a range: pin it (in the file, or in a constraints "
+                    "file)"
+                )
+            if install.prefer_binary and (dependencies or unpinned):
+                where = host.name
+                if unpinned and unpinned[0].origin != host.name:
+                    where = f"{unpinned[0].origin} (read with {host.name})"
+                # With it pip takes an older release that has a wheel over a newer one that has none, and
+                # wheelgap checks the newest release a requirement allows: only a pin gives both the same one.
+                raise DockerfileError(
+                    f"line {number}: pip install --prefer-binary makes pip pick an older release that has a "
+                    f"wheel, so it's only read when every requirement in {where} is pinned with == "
+                    "and --deps isn't used"
+                )
+            if host in found and used_constraints[host] != constraint_paths:
+                raise DockerfileError(
+                    f"line {number}: {host.name} is installed again with other -c files than on line "
+                    f"{found[host]}, which --dockerfile-inputs doesn't read"
+                )
+            if host in found and installed_by_uv[host] != uv:
+                raise DockerfileError(
+                    f"line {number}: {host.name} is installed by pip on one line and by uv on another (line "
+                    f"{found[host]}), which --dockerfile-inputs doesn't read"
+                )
+            if uv:
+                if uv_installs is None:  # never check a file uv installs by pip's rules
+                    raise DockerfileError(f"line {number}: uv pip install -r FILE isn't read here")
+                uv_installs.add((number, host))
+            installed_by_uv[host] = uv
+            used_constraints[host] = constraint_paths
+            found.setdefault(host, number)
+        # An unread COPY or ADD before the one that copies FILE may still put a pip config file in the image.
+        if unread := next((copy for copy in copies if copy.error), None):
+            raise DockerfileError(f"line {unread.line}: {unread.error}")
 
     for number, instruction in instructions[start + 1 :]:
         parts = re.split(r"[ \t\v\f\r]+", instruction, maxsplit=1)
@@ -1623,81 +2492,55 @@ def _dockerfile_requirements(
         elif keyword == "ADD":
             copies.append(_Copy(number, (), "", False, "ADD isn't read by --dockerfile-inputs, use COPY"))
         elif keyword == "SHELL":
-            run_error = f"line {number}: SHELL changes how RUN lines run, which --dockerfile-inputs doesn't read"
-        elif keyword in ("ENV", "ARG") and re.search(r"(?<![A-Za-z0-9_])(?:PIP|UV)_", args):
-            run_error = f"line {number}: an {keyword} setting PIP_ or UV_ variables changes what pip installs"
-        elif keyword == "RUN" and not _system_command(args):
-            files, constraint_files, prefer_binary, uv = _pip_install_files(number, args)
-            if run_error:
-                raise DockerfileError(run_error)
-            if uv and (config := next((copy for copy in copies if _copies_config(copy, _UV_CONFIG_NAMES)), None)):
-                raise DockerfileError(
-                    f"line {config.line}: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads "
-                    "settings from them: copy the requirements file alone and run uv pip install before this COPY"
+            # RUN lines are split by the POSIX shell's rules, which sh, dash, ash and bash share for what is read
+            # (bash's own expansions, brace lists and process substitution, are never taken as plain words).
+            if not _SHELL_RE.fullmatch(args):
+                run_error = (
+                    f"line {number}: SHELL {args[:60]} changes how RUN lines run: --dockerfile-inputs only reads "
+                    "sh, dash, ash and bash run with -c (and -e, -u, -x, -o pipefail)"
                 )
-            if uv and dependencies:
-                # A dependency is a range, resolved here by pip's rules (see the pins asked for below).
-                raise DockerfileError(
-                    f"line {number}: uv pip install isn't read with --deps: wheelgap follows dependencies as pip "
-                    "resolves them, and uv can pick other versions"
-                )
-            constraint_paths = tuple(copied_requirements(file, "-c", uv) for file in constraint_files)
-            if constraint_paths and constraints is None:  # never read the requirements without their constraints
-                raise DockerfileError(f"line {number}: pip install -c FILE isn't read here")
-            for file in files:
-                host = copied_requirements(file, "-r", uv)
-                # Read as load_inputs will read it: with the line's -c files, and through every include, so a
-                # requirement in an included file (or in a -r inside a constraints file) counts, and a requirement
-                # that only a constraint pins with == counts as pinned.
-                unpinned = (
-                    [p for p in parse_requirements(host, constraint_paths).packages if not p.version]
-                    if (prefer_binary or uv) and not dependencies
-                    else []
-                )
-                if uv and unpinned:
-                    where = host.name
-                    if unpinned[0].origin != host.name:
-                        where = f"{unpinned[0].origin} (read with {host.name})"
-                    # wheelgap picks a release for a range as pip does, and pip skips releases whose Requires-Python
-                    # upper bound leaves the image's Python out, which uv takes: only a pin gives both the same one.
-                    raise DockerfileError(
-                        f"line {number}: uv pip install: {unpinned[0].name} in {where} isn't pinned with ==, and uv "
-                        "and pip can pick different versions for a range: pin it (in the file, or in a constraints "
-                        "file)"
-                    )
-                if prefer_binary and (dependencies or unpinned):
-                    where = host.name
-                    if unpinned and unpinned[0].origin != host.name:
-                        where = f"{unpinned[0].origin} (read with {host.name})"
-                    # With it pip takes an older release that has a wheel over a newer one that has none, and
-                    # wheelgap checks the newest release a requirement allows: only a pin gives both the same one.
-                    raise DockerfileError(
-                        f"line {number}: pip install --prefer-binary makes pip pick an older release that has a "
-                        f"wheel, so it's only read when every requirement in {where} is pinned with == "
-                        "and --deps isn't used"
-                    )
-                if host in found and used_constraints[host] != constraint_paths:
-                    raise DockerfileError(
-                        f"line {number}: {host.name} is installed again with other -c files than on line "
-                        f"{found[host]}, which --dockerfile-inputs doesn't read"
-                    )
-                if host in found and installed_by_uv[host] != uv:
-                    raise DockerfileError(
-                        f"line {number}: {host.name} is installed by pip on one line and by uv on another (line "
-                        f"{found[host]}), which --dockerfile-inputs doesn't read"
-                    )
-                if uv:
-                    if uv_installs is None:  # never check a file uv installs by pip's rules
-                        raise DockerfileError(f"line {number}: uv pip install -r FILE isn't read here")
-                    uv_installs.add((number, host))
-                installed_by_uv[host] = uv
-                used_constraints[host] = constraint_paths
-                found.setdefault(host, number)
-            # An unread COPY or ADD before the one that copies FILE may still put a pip config file in the image.
-            if unread := next((copy for copy in copies if copy.error), None):
-                raise DockerfileError(f"line {unread.line}: {unread.error}")
+        elif keyword in ("ENV", "ARG"):
+            pairs = _env_pairs(keyword, args, build_args or {}, global_defaults)
+            if pairs is None:
+                # Not split into names with certainty: any name may have changed, and a setting may be among them.
+                env.clear()
+                if re.search(r"(?<![A-Za-z0-9_])(?:PIP|UV)_", args):
+                    run_error = f"line {number}: an {keyword} setting PIP_ or UV_ variables changes what pip installs"
+                continue
+            for name, value, unset in pairs:
+                if unset:
+                    # An ARG with no default and no --build-arg isn't in the RUN's environment (dispatchArg).
+                    if _installer_setting(name):
+                        report.notes.append(
+                            (
+                                number,
+                                "arg-unset",
+                                f"ARG {name} has no default, so the build is read as run without --build-arg "
+                                f"{name}: a build that passes it may install other files",
+                            )
+                        )
+                    continue
+                if value is None:
+                    env.pop(name, None)
+                else:
+                    env[name] = value
+                if _installer_setting(name):
+                    # The value is left out: an index URL may hold credentials.
+                    run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
+                elif name == "UV_SYSTEM_PYTHON":
+                    uv_system = value is not None and value.lower() in ("1", "true")
+        elif keyword == "RUN":
+            for install in reader.read(number, instruction, args, env, workdir, workdir_error, uv_system):
+                read_install(install)
     if not found:
-        raise DockerfileError(f"the final stage (line {final_line}) has no `RUN pip install -r FILE`")
+        unseen = ""
+        if report.warnings:
+            where = ", ".join(str(line) for line, _ in report.warnings)
+            unseen = f" (it has commands wheelgap can't see into, which may install some: line {where})"
+        raise DockerfileError(
+            f"the final stage (line {final_line}) has no `RUN pip install -r FILE` that --dockerfile-inputs can read"
+            + unseen
+        )
     if constraints is not None:
         constraints.update(used_constraints)
     return [(number, host) for host, number in found.items()]

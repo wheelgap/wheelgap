@@ -42,7 +42,15 @@ from .check import (
 from .codequality import write_codequality
 from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
-from .dockerfile import DockerfileError, ImageTarget, UnknownImageError, dockerfile_requirements, read_dockerfile
+from .dockerfile import (
+    PASSED_OVER,
+    DockerfileError,
+    ImageTarget,
+    InputsReport,
+    UnknownImageError,
+    dockerfile_requirements,
+    read_dockerfile,
+)
 from .github import github_annotations
 from .install_log import failed_builds, log_source, read_log
 from .junit import write_junit
@@ -1001,7 +1009,8 @@ def report_json(
     gap_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
     dockerfile_inputs: list[dict[str, str | int]] | None = None,
-    dockerfile_notes: list[dict[str, str | int | None]] | None = None,
+    dockerfile_notes: list[dict[str, object]] | None = None,
+    dockerfile_warnings: list[dict[str, object]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -1115,7 +1124,83 @@ def report_json(
         report["dockerfile_inputs"] = dockerfile_inputs
     if dockerfile_notes:
         report["dockerfile_notes"] = dockerfile_notes
+    if dockerfile_warnings is not None:  # with --dockerfile-inputs, always: an empty list says nothing was unseen
+        report["dockerfile_warnings"] = dockerfile_warnings
     return json.dumps(report, indent=2)
+
+
+def _line_list(lines: list[int]) -> str:
+    return f"line{'s' if len(lines) != 1 else ''} {', '.join(str(line) for line in sorted(lines))}"
+
+
+def dockerfile_report_notes(
+    dockerfile: str, report: InputsReport
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
+    """(--json's dockerfile_notes entries, its dockerfile_warnings entries, the line that closes the text report)
+    for what --dockerfile-inputs didn't read. The notes are what it passed over because it can't install Python
+    packages with pip or uv, one per class; the warnings are the lines it can't see into, which may."""
+    notes: list[dict[str, object]] = []
+    for kind, what in PASSED_OVER.items():
+        if lines := report.passed_over.get(kind):
+            if kind == "programs":
+                what += f" ({', '.join(report.programs)})"
+            notes.append(
+                {
+                    "dockerfile": dockerfile,
+                    "line": None,
+                    "kind": f"passed-over:{kind}",
+                    "message": f"not read, since they install no Python packages with pip or uv: {what}, "
+                    f"{_line_list(lines)}",
+                    "lines": sorted(lines),
+                }
+            )
+    if lines := report.passed_over.get("installer-tools"):
+        notes.append(
+            {
+                "dockerfile": dockerfile,
+                "line": None,
+                "kind": "passed-over:installer-tools",
+                "message": f"{_line_list(lines)} install or upgrade installer tools ({', '.join(report.tools)}): "
+                "these and what they depend on aren't checked, and the pip version the later lines run isn't known "
+                "(wheelgap answers for a current pip)",
+                "lines": sorted(lines),
+            }
+        )
+    if report.system_python:
+        lines = sorted({line for line, _ in report.system_python})
+        names = list(dict.fromkeys(name for _, name in report.system_python))
+        listed = ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
+        notes.append(
+            {
+                "dockerfile": dockerfile,
+                "line": None,
+                "kind": "system-python-packages",
+                "message": f"{_line_list(lines)} install{'s' if len(lines) == 1 else ''} Python packages with the "
+                f"system package manager ({listed}): pip keeps one of those when it satisfies a requirement, and "
+                "wheelgap checks every requirement as a fresh install, so it may report a gap the build doesn't have",
+                "lines": lines,
+            }
+        )
+    for line, kind, message in report.notes:
+        notes.append({"dockerfile": dockerfile, "line": line, "kind": kind, "message": message})
+    warnings: list[dict[str, object]] = [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-install",
+            "message": f"this line runs {what}. If it installs Python packages, or another Python, "
+            "that is not in this answer",
+        }
+        for line, what in report.warnings
+    ]
+    unseen = ""
+    if report.warnings:
+        lines = sorted({line for line, _ in report.warnings})
+        unseen = (
+            f"{dockerfile} {_line_list(lines)} run{'s' if len(lines) == 1 else ''} commands wheelgap can't see "
+            "into: any Python packages they install are not in this answer."
+        )
+    return notes, warnings, unseen
 
 
 def libc_versions(args: argparse.Namespace, config: dict) -> tuple[str, str]:
@@ -1927,7 +2012,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     image: ImageTarget | None = None
     unknown_image: UnknownImageError | None = None
     # What the Dockerfile answer leaves out, for --json's dockerfile_notes: {"dockerfile", "line", "kind", "message"}.
-    dockerfile_notes: list[dict[str, str | int | None]] = []
+    dockerfile_notes: list[dict[str, object]] = []
+    inputs_report = InputsReport()
+    dockerfile_warnings: list[dict[str, object]] = []
+    unseen_line = ""  # the stdout line for commands that may install packages wheelgap can't see
 
     def read_image() -> None:
         """The image of --dockerfile. One wheelgap can't read is an error, unless -p and -t say what to check."""
@@ -1952,6 +2040,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 constraints=docker_constraints,
                 dependencies=args.deps,
                 uv_installs=uv_installs,
+                report=inputs_report,
             )
             args.inputs = [str(requirements) for _, requirements in installs]
         if args.clear_cache:
@@ -2001,6 +2090,15 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         "message": message,
                     }
                 )
+            if args.dockerfile_inputs:
+                notes, dockerfile_warnings, unseen_line = dockerfile_report_notes(args.dockerfile, inputs_report)
+                # A warning is part of the answer, so --quiet keeps it; the notes say what was passed over.
+                for entry in dockerfile_warnings:
+                    print(f"wheelgap: warning: {args.dockerfile}:{entry['line']}: {entry['message']}", file=sys.stderr)
+                for entry in notes if not quiet else ():
+                    at = args.dockerfile if entry["line"] is None else f"{args.dockerfile}:{entry['line']}"
+                    print(f"wheelgap: note: {at}: {entry['message']}", file=sys.stderr)
+                dockerfile_notes += notes
             if not quiet:
                 for install_line, requirements in installs:
                     # Every file read: the requirements file and what it includes, then each -c file of the line
@@ -2758,6 +2856,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 if args.dockerfile_inputs
                 else None,
                 dockerfile_notes=dockerfile_notes,
+                dockerfile_warnings=dockerfile_warnings if args.dockerfile_inputs else None,
             )
         )
         return code
@@ -2788,6 +2887,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         fix_hint=fix_hint,
                     ),
                     *gapwheels.markdown_lines(fills or [], multi_py),
+                    *(["", f"> **Warning:** {unseen_line}"] if unseen_line else []),
                 ]
             )
         )
@@ -2822,6 +2922,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
         for ln in fix_lines:  # asked for with --fix, so -q keeps it
             print(ln)
+        if unseen_line:
+            print(style.yellow(f"! {unseen_line}"))
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
@@ -2892,6 +2994,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         what = "The 1 package has" if total_pkgs == 1 else f"All {total_pkgs} packages have"
         every = f"{'every one of ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}{apart_from_ignored(rows)}"
         print(style.green(f"✓ {what} a wheel for {every}."))
+        if unseen_line:
+            print(style.yellow(f"! {unseen_line}"))
         return code
 
     for line in target_lines(gaps, targets, style, advisory):
@@ -2912,6 +3016,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
     for ln in fix_lines:  # a gap wheel fills only a gap, so the runs that return early above have none
         print(ln)
+    if unseen_line:
+        print(style.yellow(f"! {unseen_line}"))
     return code
 
 

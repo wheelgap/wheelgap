@@ -45,14 +45,33 @@
                     "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
                     "line": {
                         "type": ["integer", "null"],
-                        "minimum": 1,
                         "description": "The Dockerfile line the note is about, from 1, or null."
                     },
                     "kind": {
                         "type": "string",
-                        "description": "What was left out. image-not-read: -p and -t stood in for the image."
+                        "description": "What was left out: image-not-read, passed-over:CLASS or arg-unset."
                     },
-                    "message": {"type": "string", "description": "The note as printed on stderr."}
+                    "message": {"type": "string", "description": "The note as printed on stderr."},
+                    "lines": {
+                        "type": "array",
+                        "description": "For passed-over:CLASS and system-python-packages, the RUN lines concerned.",
+                        "items": {"type": "integer", "minimum": 1}
+                    }
+                }
+            }
+        },
+        "dockerfile_warnings": {
+            "type": "array",
+            "description": "With --dockerfile-inputs, RUN lines that may install Python packages wheelgap can't see.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dockerfile", "line", "kind", "message"],
+                "properties": {
+                    "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
+                    "line": {"type": "integer", "minimum": 1, "description": "The line the RUN starts on, from 1."},
+                    "kind": {"type": "string", "description": "may-install."},
+                    "message": {"type": "string", "description": "The warning as printed on stderr."}
                 }
             }
         },
