@@ -84,6 +84,9 @@ wheelgap --dist dist -p 3.13 -t win-arm64,linux-aarch64
 # (a global `ARG PYTHON_VERSION=3.13` before the first FROM works too)
 wheelgap --dockerfile Dockerfile
 
+# FROM ubuntu, nvidia/cuda or any other image: say what to check with -p and -t
+wheelgap --dockerfile Dockerfile -p 3.13 -t linux-x86_64 --glibc 2.39
+
 # ...and check what it installs with RUN pip install -r requirements.txt
 wheelgap --dockerfile Dockerfile --dockerfile-inputs
 

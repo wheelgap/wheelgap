@@ -9,6 +9,7 @@ from wheelgap.cli import main
 from wheelgap.dockerfile import (
     DockerfileError,
     ImageTarget,
+    UnknownImageError,
     _heredocs,
     _syntax_directive,
     dockerfile_requirements,
@@ -2624,3 +2625,104 @@ def test_cli_dockerfile_inputs_refuses_before_any_lookup(tmp_path, capsys, fake_
     assert main(["--dockerfile", str(path), "--dockerfile-inputs"]) == 2
     assert f"{path}:4: only `RUN pip install -r FILE`" in capsys.readouterr().err
     assert fake_pypi == []
+
+
+_OTHER_IMAGES = [
+    "FROM ubuntu:24.04\n",
+    "FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04\n",
+    "FROM node:22-slim AS web\nFROM ubuntu\n",  # a bare name with stages before it
+    "FROM python:slim\n",  # no Python in the tag
+    "ARG BASE\nFROM ${BASE}\n",  # a build argument with no default
+    "ARG BASE=python:3.13\nFROM ${BASE:-debian}\n",  # a modifier wheelgap doesn't expand
+    "FROM --platform=$BUILDPLATFORM python:3.13\n",
+]
+
+
+@pytest.mark.parametrize("head", _OTHER_IMAGES)
+def test_cli_dockerfile_inputs_reads_any_image_when_p_and_t_are_given(tmp_path, capsys, fake_pypi, head):
+    path = _context(tmp_path, f"{head}WORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n")
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\nnowheels==0.9\n", encoding="utf-8")
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs", "--json"]
+    code = main([*argv, "-p", "3.13", "-t", "linux-aarch64", "--quiet"])
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert code == 1  # nowheels has no wheel
+    assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "linux-aarch64")]
+    assert sorted(p["name"] for p in data["packages"]) == ["nowheels", "purewheel"]
+    # What isn't known is said even under --quiet, and in --json.
+    line = head.count("\n")
+    assert f"wheelgap: note: {path}:{line}: the final image isn't read (" in captured.err
+    assert "which Python the image's pip installs for" in captured.err
+    assert "pass --glibc or --musl" in captured.err
+    [note] = data["dockerfile_notes"]
+    assert (note["dockerfile"], note["line"], note["kind"]) == (str(path), line, "image-not-read")
+    assert "the packages the image already has" in note["message"]
+    # Without both -p and -t the image is still an error, and no package is looked up.
+    for flags in ([], ["-p", "3.13"], ["-t", "linux-aarch64"]):
+        fake_pypi.clear()
+        assert main([*argv, *flags]) == 2
+        captured = capsys.readouterr()
+        assert f"wheelgap: error: {path}: " in captured.err
+        assert "isn't read" not in captured.err
+        assert fake_pypi == []
+
+
+def test_cli_dockerfile_reads_any_image_when_p_and_t_are_given(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, "FROM ubuntu:24.04\nRUN anything at all\n")
+    assert main(["purewheel", "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--glibc", "2.39"]) == 0
+    captured = capsys.readouterr()
+    assert f"{path}:1: the final image isn't read (ubuntu:24.04: only the official python images" in captured.err
+    assert "pass --glibc or --musl" not in captured.err  # it was passed
+    assert main(["purewheel", "--dockerfile", str(path)]) == 2
+    assert "ubuntu:24.04: only the official python images" in capsys.readouterr().err
+
+
+def test_cli_dockerfile_p_and_t_leave_a_read_image_without_a_note(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, "FROM python:3.12-alpine\n")
+    main(["purewheel", "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--json"])
+    captured = capsys.readouterr()
+    assert "dockerfile_notes" not in json.loads(captured.out)
+    assert "isn't read" not in captured.err
+
+
+def test_cli_dockerfile_inputs_names_an_unread_image_before_an_unread_run(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, "FROM ubuntu:24.04\nWORKDIR /app\nCOPY . .\nRUN poetry install\n")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs"]) == 2
+    error = capsys.readouterr().err
+    assert "ubuntu:24.04: only the official python images" in error
+    assert f"{path}:4" not in error
+    # With -p/-t the image is passed, and the RUN is the error.
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    assert f"{path}:4: " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "error"),
+    [
+        # A build argument wheelgap can't expand may name the earlier stage, whose instructions would then count.
+        ("FROM python:3.13 AS base\nARG BASE\nFROM ${BASE}\n", ":3: FROM ${BASE} uses a build argument"),
+        ("FROM python:3.13 AS base\nFROM $BASE\n", "may name an earlier stage (base)"),
+        # The final stage builds on a stage whose own image isn't read: still a stage.
+        ("FROM ubuntu AS base\nFROM base\n", ":2: the final stage builds on an earlier stage"),
+        # What Docker itself rejects stays an error.
+        ("FROM Ubuntu:24.04\n", "repository name must be lowercase"),
+        ("FROM ubuntu:24.04 AS\n", "expected 'IMAGE' or 'IMAGE AS NAME'"),
+        ("FROM --flag ubuntu\n", "unknown flag"),
+    ],
+)
+def test_cli_dockerfile_inputs_p_and_t_dont_stand_in_for_these(tmp_path, capsys, fake_pypi, dockerfile, error):
+    path = _context(
+        tmp_path, f"{dockerfile}WORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    assert error in capsys.readouterr().err
+    assert fake_pypi == []
+
+
+def test_unknown_image_error_is_a_dockerfile_error_with_the_from_line(tmp_path):
+    path = _context(tmp_path, "# a comment\nFROM debian:trixie\n")
+    with pytest.raises(DockerfileError) as excinfo:
+        read_dockerfile(path)
+    assert isinstance(excinfo.value, UnknownImageError)
+    assert excinfo.value.line == 2

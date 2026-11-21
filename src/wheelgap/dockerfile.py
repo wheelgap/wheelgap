@@ -98,6 +98,15 @@ class DockerfileError(ValueError):
     pass
 
 
+class UnknownImageError(DockerfileError):
+    """The Dockerfile is one Docker reads, but its final image isn't one wheelgap knows the Python and platform of:
+    not an official python or Astral uv image, a tag that names no Python, or a FROM using a build argument wheelgap
+    can't expand. `-p` and `-t` on the command line can stand in for it; an error Docker itself would raise can't be
+    stood in for, and stays a plain DockerfileError. `line` is the FROM instruction's line, where it is known."""
+
+    line: int | None = None
+
+
 @dataclass(frozen=True)
 class ImageTarget:
     python: str
@@ -603,18 +612,18 @@ def _expand_build_args(args: str, globals_: _GlobalArgs) -> tuple[str, list[str]
     def expand(m: re.Match[str]) -> str:
         name = m.group(1) or m.group(2)
         if globals_.unreadable:  # it may declare this name too, after the default read here
-            raise DockerfileError(globals_.unreadable[0])
+            raise UnknownImageError(globals_.unreadable[0])
         if name in globals_.problems:
-            raise DockerfileError(globals_.problems[name])
+            raise UnknownImageError(globals_.problems[name])
         if name not in globals_.defaults:
-            raise DockerfileError(unsupported)
+            raise UnknownImageError(unsupported)
         used.append(name)
         return globals_.defaults[name]
 
     unsupported = f"{args}: build arguments are not supported, pass -p/-t instead"
     expanded = _VAR_REF_RE.sub(expand, args)
     if "$" in expanded:  # ${NAME:-default}, $BUILDPLATFORM and anything else wheelgap can't know
-        raise DockerfileError(globals_.unreadable[0] if globals_.unreadable else unsupported)
+        raise UnknownImageError(globals_.unreadable[0] if globals_.unreadable else unsupported)
     return expanded, used
 
 
@@ -797,6 +806,15 @@ def _split_from(args: str) -> tuple[str, str | None, str | None]:
     raise DockerfileError(f"FROM {args}: expected 'IMAGE' or 'IMAGE AS NAME'")
 
 
+def _split_from_as_written(args: str) -> str | None:
+    """The stage name of a FROM whose build arguments aren't expanded, or None if it has none. A FROM that
+    _split_from rejects only for its unexpanded `$` text has no name wheelgap can use, and is None too."""
+    try:
+        return _split_from(args)[2]
+    except DockerfileError:
+        return None
+
+
 def parse_from(args: str) -> ImageTarget:
     """Parse `[--platform=P] image[:tag][@digest] [AS name]`."""
     image, platform, _ = _split_from(args)
@@ -830,12 +848,12 @@ def _final_from(
     lines, global_args = _parse_froms(text, build_args)
     if not lines:
         raise DockerfileError("no FROM line found")
-    errors: dict[int, DockerfileError] = {}
+    errors: dict[int, UnknownImageError] = {}
 
     def split(number: int, args: str) -> tuple[str, str | None, str | None, dict[str, str]]:
         try:
             args, names = _expand_build_args(args, global_args)
-        except DockerfileError as e:
+        except UnknownImageError as e:
             errors[number] = e  # the arguments stay as written; parse_image rejects their `$` anyway
             names = []
         image, platform, stage = _split_from(args)
@@ -855,17 +873,20 @@ def _final_from(
         used = base_used | used  # an ARG naming the stage changes the image too
     elif stages and not any(c in image for c in ":/@$") and image.lower() not in (*IMAGE_NAMES, "scratch"):
         known = ", ".join(stages)
-        raise DockerfileError(
+        error = UnknownImageError(
             f"FROM {image}: not an earlier stage ({known}) or an official python image, pass -p/-t instead"
         )
+        error.line = number
+        raise error
     if number in errors:
+        errors[number].line = number
         raise errors[number]
     return image, platform, number, used, global_args
 
 
 def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     if "$" in image or (platform and "$" in platform):
-        raise DockerfileError(f"{image}: build arguments are not supported, pass -p/-t instead")
+        raise UnknownImageError(f"{image}: build arguments are not supported, pass -p/-t instead")
     image = image.split("@", 1)[0]
     name, _, tag = image.rpartition(":") if ":" in image.rsplit("/", 1)[-1] else (image, "", "")
     # Docker requires a lowercase repository path. A registry host (the first part, if it has a dot or colon,
@@ -878,7 +899,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     if tag and not _DOCKER_TAG_RE.fullmatch(tag):
         raise DockerfileError(f"{image}: invalid tag {tag!r} (Docker allows only ASCII letters, digits, '_', '.', '-')")
     if name not in IMAGE_NAMES and name != UV_IMAGE:
-        raise DockerfileError(
+        raise UnknownImageError(
             f"{image}: only the official python images and Python-tagged Astral uv images are supported, "
             "pass -p/-t instead"
         )
@@ -888,8 +909,8 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     m = _TAG_RE.match(tag)
     if not m:
         if name == UV_IMAGE:
-            raise DockerfileError(f"{image}: the tag must specify a Python version like python3.13-alpine")
-        raise DockerfileError(f"{image}: the tag must start with a Python version like 3.13")
+            raise UnknownImageError(f"{image}: the tag must specify a Python version like python3.13-alpine")
+        raise UnknownImageError(f"{image}: the tag must start with a Python version like 3.13")
     python = f"{m.group(1)}.{m.group(2)}"
     # An X.Y-rc tag stops being rebuilt once X.Y is released, so like a patch tag it can be on an older Debian than
     # its X.Y tag (see _MINOR_TAG_RE).
@@ -911,7 +932,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
         family, musl = "linux", None
         unknown = [part for part in variant if part not in DEBIAN_GLIBC and part != "slim"]
         if unknown:
-            raise DockerfileError(f"{image}: unknown image variant '{'-'.join(unknown)}'")
+            raise UnknownImageError(f"{image}: unknown image variant '{'-'.join(unknown)}'")
         release = next((part for part in variant if part in DEBIAN_GLIBC), None)
         if release is None and name in IMAGE_NAMES and minor_tag:
             release = UNTAGGED_DEBIAN.get(python)
@@ -919,7 +940,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
             if python in RC_DEBIAN:
                 release, rc_release = RC_DEBIAN[python], True
             elif (int(m.group(1)), int(m.group(2))) < (3, 10):
-                raise DockerfileError(
+                raise UnknownImageError(
                     f"{image} is on a Debian release older than bullseye: pass -t and --glibc instead"
                 )
         glibc = DEBIAN_GLIBC.get(release) if release else None
@@ -927,7 +948,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     arch = "x86_64"
     if platform:
         if platform.lower() not in ARCHES:
-            raise DockerfileError(f"--platform={platform}: only {', '.join(ARCHES)} are supported")
+            raise UnknownImageError(f"--platform={platform}: only {', '.join(ARCHES)} are supported")
         arch = ARCHES[platform.lower()]
         if name == UV_IMAGE and arch not in UV_ARCHES:
             raise DockerfileError(f"{image}: Astral's uv images are only published for linux/amd64 and linux/arm64")
@@ -958,9 +979,14 @@ def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> 
     except UnicodeDecodeError as e:
         byte = f"0x{e.object[e.start]:02x}"
         raise DockerfileError(f"{path}: not UTF-8 (byte {byte} at offset {e.start}), pass -p/-t instead") from None
+    number = None
     try:
-        image, platform, _, used, global_args = _final_from(text, build_args)
+        image, platform, number, used, global_args = _final_from(text, build_args)
         target = parse_image(image, platform)
+    except UnknownImageError as e:
+        error = UnknownImageError(f"{path}: {e}")
+        error.line = e.line if e.line is not None else number
+        raise error from None
     except DockerfileError as e:
         raise DockerfileError(f"{path}: {e}") from None
     given = frozenset(name for name in used if name in (build_args or {}))
@@ -1519,7 +1545,21 @@ def _dockerfile_requirements(
         raise DockerfileError("no FROM line found")
     final_line = froms[-1][0]
     # The FROM that names the final image: an earlier one if the final stage builds on a stage (`FROM ${BASE}` too).
-    if _final_from(text, build_args)[2] != final_line:
+    try:
+        base_line = _final_from(text, build_args)[2]
+    except UnknownImageError as e:
+        # The caller has -p/-t for an image wheelgap can't read (it raised this error itself otherwise). The stage's
+        # instructions are read all the same, once it is certain the FROM names an image and not an earlier stage:
+        # a build argument wheelgap can't expand may name either.
+        base_line = e.line if e.line is not None else final_line
+        image = _split_from(froms[-1][1])[0]
+        stages = [stage for _, args in froms[:-1] if (stage := _split_from_as_written(args)) is not None]
+        if base_line == final_line and "$" in image and stages:
+            raise DockerfileError(
+                f"line {final_line}: FROM {image} uses a build argument wheelgap can't expand, and it may name an "
+                f"earlier stage ({', '.join(stages)}): pass its value with --build-arg"
+            ) from None
+    if base_line != final_line:
         raise DockerfileError(
             f"line {final_line}: the final stage builds on an earlier stage; --dockerfile-inputs only reads a final "
             "stage built FROM an image"

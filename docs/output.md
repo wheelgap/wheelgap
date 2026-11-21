@@ -462,6 +462,11 @@ starts on (counted from 1; the first `RUN` that installs the file, if several do
 the build context, with `/` on every OS (`reqs/base.txt`), as the Dockerfile's `COPY` names it; `sources` gives its
 name only. The key is absent without the flag.
 
+`dockerfile_notes` (after 0.13.0) lists what a `--dockerfile` answer leaves out, one object each: the `dockerfile`
+path as given, the `line` it is about (or `null`), a `kind` to match on and the `message` the note on stderr has.
+The one kind so far is `image-not-read`: `-p` and `-t` stood in for an
+[image wheelgap can't read](cli.md#dockerfile). The key is absent when there is nothing to say.
+
 `results`, `rejected` and `via` are all keyed by target label: just the platform (`"linux-x86_64"`) when one Python is
 checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's
 `label`, `python` and `platform`, so a script can look the key up instead of building it:

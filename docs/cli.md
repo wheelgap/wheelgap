@@ -66,6 +66,16 @@ unless `--dockerfile`, `[tool.wheelgap] targets` or uv's `required-environments`
 final stage, such as `FROM python:3.13-alpine`. `-p`, `-t`, `--glibc` and `--musl` still win. See
 [From a Dockerfile](targets.md#from-a-dockerfile).
 
+**After 0.13.0**, `-p` and `-t` together also stand in for an image wheelgap can't read: `FROM ubuntu:24.04`,
+`nvidia/cuda`, `node`, a python tag that names no version, or a `FROM` whose build argument has no value. In 0.13.0
+that is an error even with both flags. Nothing is taken from such an image, and a note that `--quiet` doesn't hide
+(also in `--json`, as [`dockerfile_notes`](output.md#json)) says what the Dockerfile then leaves unknown: which
+Python the image's `pip` installs for, the image's glibc or musl version (pass `--glibc` or `--musl`; otherwise
+wheelgap's default is checked), and the packages the image already has. Without both flags the image is still an
+error, and with `--dockerfile-inputs` it is the first error reported. A `FROM` that Docker itself rejects stays an
+error, and so does, with `--dockerfile-inputs`, a `FROM ${NAME}` wheelgap can't expand in a Dockerfile with named
+stages before it, since it may name one of them: pass its value with [`--build-arg`](#build-arg).
+
 ### `--dockerfile-inputs` {#dockerfile-inputs}
 
 `--dockerfile-inputs` (with `--dockerfile`, and no `INPUT`): check the requirements files the Dockerfile's final stage

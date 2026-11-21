@@ -169,7 +169,9 @@ targets are not inferred.
 `--dockerfile PATH` takes the Python, the platform and the glibc or musl version from the image of the Dockerfile's
 final stage, such as `python:3.13-alpine` or `ghcr.io/astral-sh/uv:0.13.7-python3.13-trixie-slim`, following named
 stages like `FROM base AS runtime` back to the image they start from. `-p`, `-t`, `--glibc` and `--musl` on the
-command line still win, and the image wins over `[tool.wheelgap]`.
+command line still win, and the image wins over `[tool.wheelgap]`. After 0.13.0, `-p` and `-t` together are also
+enough for an image wheelgap can't read (`FROM ubuntu:24.04`, `nvidia/cuda`, a build argument with no value): the
+run checks the targets given, with a note on [what that leaves unknown](cli.md#dockerfile).
 
 A python X.Y tag without a Debian release (`python:3.13-slim`) is read as the release Docker Hub currently builds it
 on (trixie, glibc 2.41, for 3.9 and later); patch tags like `3.12.7-slim` keep the `--glibc` default. A pre-release

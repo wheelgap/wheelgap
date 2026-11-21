@@ -34,6 +34,28 @@
                 }
             }
         },
+        "dockerfile_notes": {
+            "type": "array",
+            "description": "With --dockerfile, what the answer leaves out: absent when there is nothing to say.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dockerfile", "line", "kind", "message"],
+                "properties": {
+                    "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
+                    "line": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "description": "The Dockerfile line the note is about, from 1, or null."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "What was left out. image-not-read: -p and -t stood in for the image."
+                    },
+                    "message": {"type": "string", "description": "The note as printed on stderr."}
+                }
+            }
+        },
         "targets": {
             "type": "array",
             "description": "The platforms and Pythons that were checked. Each package's results, rejected and via keys are these labels.",
