@@ -5,6 +5,7 @@
     uv run --with pip python scripts/check_against_pip.py -t win-arm64 -t "3.14t linux-x86_64"
 
     uv run python scripts/check_against_pip.py --installer uv numpy    # use uv as the referee
+    uv run --with pip python scripts/check_against_pip.py --json accuracy.json   # also write the results as JSON
 
 For each package, wheelgap finds the latest release and checks it pinned (NAME==VERSION, so yanked files count as
 they do for pip, PEP 592) on each target. Then pip is asked what it would install for the same pin, with
@@ -41,6 +42,11 @@ release's wheels out for a Requires-Python with an upper bound, the check is lis
 reason, and doesn't fail the run: it is uv answering as uv, not a wheelgap error, and the pip check is the referee
 for that pin. Every other difference from uv is listed as a disagreement, to be checked against the pip run.
 
+--json FILE writes the run's results as one JSON object (results()): the installer and its version, wheelgap's
+version, the UTC time, the packages and targets, the totals with the mismatch rate (disagreements / checks compared,
+null when nothing was compared), the same totals per target, and every disagreement and every check that couldn't be
+compared. It's written whenever the text report is, from the same counts (totals()).
+
 It needs the network, so the tests never run it; .github/workflows/accuracy.yml runs it every week. pip runs
 isolated from pip.conf and PIP_* variables, without a cache, and writes only its small report to a temporary folder
 that is deleted after each run.
@@ -49,6 +55,7 @@ that is deleted after each run.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -64,7 +71,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from wheelgap import Result, check_packages, make_targets
+from wheelgap import Result, __version__, check_packages, make_targets
 from wheelgap.check import Status
 from wheelgap.targets import DEFAULT_GLIBC, PLATFORMS, Target
 
@@ -448,16 +455,96 @@ def _table(rows: list[list[str]]) -> list[str]:
     return ["  ".join(cell.ljust(w) for cell, w in zip(row, widths, strict=True)).rstrip() for row in rows]
 
 
+def totals(checks: Sequence[Check]) -> dict[str, int]:
+    """The counts behind the text report and the --json file, made once so the two can't disagree."""
+    compared = [c for c in checks if c.compared]
+    disagree = sum(1 for c in compared if not c.agrees)
+    return {
+        "checks": len(checks),
+        "compared": len(compared),
+        "agree": len(compared) - disagree,
+        "disagree": disagree,
+        "not_compared": len(checks) - len(compared),
+    }
+
+
+def mismatch_rate(counts: dict[str, int]) -> float | None:
+    """Disagreements as a fraction of the checks compared; None when nothing was compared."""
+    return counts["disagree"] / counts["compared"] if counts["compared"] else None
+
+
+def why_not_compared(check: Check, installer: str) -> str:
+    """The reason a check that wasn't compared gets in the report."""
+    if check.only_binary_yanked:
+        return f"{installer} took a yanked wheel because --only-binary hides the sdist a normal install builds"
+    answer = check.answer
+    return (
+        check.skipped
+        or check.error
+        or (answer.error if answer and answer.error else f"wheelgap says {check.wheelgap.value}")
+    )
+
+
+def results(
+    checks: Sequence[Check],
+    *,
+    installer: str,
+    installer_version: str,
+    packages: Sequence[str],
+    targets: Sequence[Target],
+) -> dict:
+    """--json's object. `installer_version`: the installer's own version line (`pip --version`, `uv --version`).
+    A disagreement's answer from the installer is under `installer_result`, next to `wheelgap`."""
+    counts = totals(checks)
+    return {
+        "schema": 1,
+        "installer": installer,
+        "installer_version": installer_version,
+        "wheelgap_version": __version__,
+        "time": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "packages": list(packages),
+        "targets": [label(t) for t in targets],
+        "totals": counts,
+        "mismatch_rate": mismatch_rate(counts),
+        "by_target": {label(t): totals([c for c in checks if c.target == t]) for t in targets},
+        "disagreements": [
+            {
+                "name": c.name,
+                "version": c.version,
+                "target": label(c.target),
+                "wheelgap": c.wheelgap.value,
+                "installer_result": c.answer.text if c.answer else "",
+                "command": c.command(installer),
+            }
+            for c in checks
+            if c.compared and not c.agrees
+        ],
+        "not_compared": [
+            {"name": c.name, "version": c.version, "target": label(c.target), "why": why_not_compared(c, installer)}
+            for c in checks
+            if not c.compared
+        ],
+    }
+
+
 def report(checks: list[Check], out=sys.stdout, *, installer: str = "pip") -> int:
     """Print the disagreements and the checks that couldn't be made. 1 if any disagree, else 2 if any couldn't be
     made (apart from unsupported targets and uv's known difference from pip), else 0."""
     compared = [c for c in checks if c.compared]
     wrong = [c for c in compared if not c.agrees]
     failed = [c for c in checks if not c.compared]
+    counts = totals(checks)
     wheels = sum(1 for c in compared if c.agrees and c.wheelgap is Status.WHEEL)
+    rate = mismatch_rate(counts)
+    said = (
+        "n/a (nothing compared)"
+        if rate is None
+        else f"{rate:.1%} ({counts['disagree']} of {counts['compared']} compared)"
+    )
     print(
-        f"{len(checks)} checks: {len(compared) - len(wrong)} agree with {installer} ({wheels} wheel, "
-        f"{len(compared) - len(wrong) - wheels} no wheel), {len(wrong)} disagree, {len(failed)} couldn't be compared.",
+        f"{counts['checks']} checks: {counts['agree']} agree with {installer} ({wheels} wheel, "
+        f"{counts['agree'] - wheels} no wheel), {counts['disagree']} disagree, "
+        f"{counts['not_compared']} couldn't be compared. Mismatch rate {said}.",
         file=out,
     )
     if installer == "uv":
@@ -485,15 +572,7 @@ def report(checks: list[Check], out=sys.stdout, *, installer: str = "pip") -> in
     if failed:
         print("\nCouldn't compare:\n", file=out)
         rows = [["package", "version", "target", "why"]]
-        for c in failed:
-            why = (
-                c.skipped
-                or c.error
-                or (c.answer.error if c.answer and c.answer.error else f"wheelgap says {c.wheelgap.value}")
-            )
-            if c.only_binary_yanked:
-                why = f"{installer} took a yanked wheel because --only-binary hides the sdist a normal install builds"
-            rows.append([c.name, c.version or "-", label(c.target), why or ""])
+        rows += [[c.name, c.version or "-", label(c.target), why_not_compared(c, installer)] for c in failed]
         print("\n".join(_table(rows)), file=out)
     return 1 if wrong else 2 if not compared or any(c.skipped is None for c in failed) else 0
 
@@ -506,6 +585,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--installer", choices=("pip", "uv"), default="pip", help="installer to compare against")
     parser.add_argument("--workers", type=int, default=4, help="packages checked at once (default 4)")
+    parser.add_argument(
+        "--json", metavar="FILE", help="also write the results to FILE as JSON: totals, mismatch rate, each difference"
+    )
     args = parser.parse_args(argv)
     targets = default_targets()
     if args.target:
@@ -532,6 +614,16 @@ def main(argv: list[str] | None = None) -> int:
     names = ", ".join(map(label, targets))
     print(f"Checking {len(packages)} packages on {len(targets)} targets: {names}", file=sys.stderr)
     checks = compare(packages, targets, workers=args.workers, installer=args.installer)
+    if args.json:
+        data = results(
+            checks,
+            installer=args.installer,
+            # pip's line names the folder it runs from: leave that out of a file meant to be shared.
+            installer_version=re.sub(r" from .* \(python", " (python", version.stdout.strip()),
+            packages=packages,
+            targets=targets,
+        )
+        Path(args.json).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return report(checks, installer=args.installer)
 
 

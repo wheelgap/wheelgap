@@ -80,7 +80,7 @@ The uv check uses `uv pip compile` to resolve the wheel without installing it. T
 
 Both checks ask wheelgap about a pin (`NAME==VERSION`), which wheelgap answers as pip installs it; a `uv.lock` it answers as uv does. pip and uv differ on one thing here: uv ignores an upper bound in `Requires-Python`, so it takes a wheel pip leaves out. The uv report lists such a check as not compared, with the reason, and it isn't a wheelgap error. Before filing any other disagreement with uv, check the same pin in the pip run.
 
-Both modes print every disagreement with a command to reproduce it. The script exits 1 if any comparison disagrees and 2 if a check failed (for example, PyPI was unreachable) or there were no comparable targets. The [Accuracy](.github/workflows/accuracy.yml) workflow runs both modes every Monday.
+Both modes print the mismatch rate (disagreements out of the checks compared) and every disagreement with a command to reproduce it; `--json FILE` also writes the totals, the rate, per-target counts and each difference to a file. The script exits 1 if any comparison disagrees and 2 if a check failed (for example, PyPI was unreachable) or there were no comparable targets. The [Accuracy](.github/workflows/accuracy.yml) workflow runs both modes every Monday, puts each rate in the run's summary and keeps the two results files as an artifact.
 
 ## Questions
 

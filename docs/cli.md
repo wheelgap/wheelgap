@@ -507,6 +507,12 @@ it has a gap, and its message says `(via …)`. When more than one does, or a
 line isn't certain, the annotation names the file without a line, and the
 message names them all.
 
+With [`--fix`](#fix) too (**after 0.13.0**), the annotation of a package that a gap wheel fills gets one more
+sentence: the targets the wheel fills, that it's unofficial (built by wheelgap from the PyPI sdist), and the
+`pip install --extra-index-url` command for inputs pip installs from as they are, or a pointer to the log's gap wheel
+section for a lockfile or a script. The level, title, line and exit code stay the same; see
+[CI](ci.md#fix).
+
 ### `--color` {#color}
 
 `--color {auto,always,never}`: color the table. `auto` (the default) colors a terminal, and respects the `NO_COLOR` and

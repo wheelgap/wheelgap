@@ -355,6 +355,112 @@ def test_main_exit_codes(monkeypatch, capsys, pip_installed, checks, code):
     assert seen["workers"] == 3
 
 
+# --json FILE: the same counts as the text report.
+
+
+def _main_json(monkeypatch, tmp_path, checks, *argv):
+    monkeypatch.setattr(script, "compare", lambda packages, targets, workers, installer: checks)
+    file = tmp_path / "accuracy.json"
+    code = script.main([*argv, "--json", str(file)])
+    out = io.StringIO()  # the text report main() printed: report() again, on the same checks
+    assert script.report(checks, out=out, installer="uv" if "uv" in argv else "pip") == code
+    return code, json.loads(file.read_text(encoding="utf-8")), out.getvalue()
+
+
+def test_json_file_matches_the_text_report(monkeypatch, capsys, pip_installed, tmp_path):
+    arm, amd = _target("win-arm64"), _target("win-amd64")
+    wheel, none = script.InstallerAnswer(wheel="x-1.whl"), script.InstallerAnswer()
+    checks = [
+        script.Check("agrees", "1", arm, Status.WHEEL, wheel),
+        script.Check("agrees", "1", amd, Status.SOURCE, none),
+        script.Check("differs", "2", arm, Status.SOURCE, wheel),
+        script.Check("differs", "2", amd, Status.MISSING, none),
+        script.Check("broken", "3", arm, Status.SOURCE, script.InstallerAnswer(error="pip: boom")),
+        script.Check("broken", None, amd, Status.UNKNOWN, None, "not on index"),
+    ]
+    code, data, text = _main_json(
+        monkeypatch, tmp_path, checks, "agrees", "differs", "broken", "-t", "win-arm64", "-t", "win-amd64"
+    )
+    assert code == 1  # a disagreement, as without --json
+    assert text.startswith(
+        "6 checks: 3 agree with pip (1 wheel, 2 no wheel), 1 disagree, 2 couldn't be compared. "
+        "Mismatch rate 25.0% (1 of 4 compared).\n"
+    )
+    assert data["totals"] == {"checks": 6, "compared": 4, "agree": 3, "disagree": 1, "not_compared": 2}
+    assert data["mismatch_rate"] == 0.25
+    assert data["by_target"] == {
+        "3.14 win-amd64": {"checks": 3, "compared": 2, "agree": 2, "disagree": 0, "not_compared": 1},
+        "3.14 win-arm64": {"checks": 3, "compared": 2, "agree": 1, "disagree": 1, "not_compared": 1},
+    }
+    assert {key: sum(t[key] for t in data["by_target"].values()) for key in data["totals"]} == data["totals"]
+    command = (
+        "pip install --dry-run --ignore-installed --no-deps --only-binary=:all: --index-url https://pypi.org/simple "
+        "--platform win_arm64 --python-version 3.14 --implementation cp --abi cp314 differs==2"
+    )
+    assert data["disagreements"] == [
+        {
+            "name": "differs",
+            "version": "2",
+            "target": "3.14 win-arm64",
+            "wheelgap": "source",
+            "installer_result": "x-1.whl",
+            "command": command,
+        }
+    ]
+    assert command in text
+    assert data["not_compared"] == [
+        {"name": "broken", "version": "3", "target": "3.14 win-arm64", "why": "pip: boom"},
+        {"name": "broken", "version": None, "target": "3.14 win-amd64", "why": "not on index"},
+    ]
+    for entry in data["not_compared"]:
+        assert entry["why"] in text
+    assert data["schema"] == 1 and data["installer"] == "pip" and data["installer_version"] == "pip 26.3 from x"
+    assert data["wheelgap_version"] == script.__version__
+    assert data["time"].endswith("+00:00")
+    assert data["packages"] == ["agrees", "differs", "broken"]
+    assert data["targets"] == ["3.14 win-amd64", "3.14 win-arm64"]
+
+
+def test_json_file_rate_is_null_when_nothing_was_compared(monkeypatch, capsys, pip_installed, tmp_path):
+    check = script.Check("x", "1", _target("win-arm64"), Status.SOURCE, script.InstallerAnswer(error="pip: boom"))
+    code, data, text = _main_json(monkeypatch, tmp_path, [check], "x", "-t", "win-arm64")
+    assert code == 2
+    assert data["mismatch_rate"] is None
+    assert data["totals"] == {"checks": 1, "compared": 0, "agree": 0, "disagree": 0, "not_compared": 1}
+    assert data["disagreements"] == []
+    assert "0 disagree, 1 couldn't be compared. Mismatch rate n/a (nothing compared).\n" in text
+
+
+def test_json_file_for_uv_names_uv(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        script.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "uv 0.13.1\n", "")
+    )
+    monkeypatch.setattr(script, "default_cpython", lambda: True)
+    arm = _target("win-arm64")
+    checks = [
+        script.Check("differs", "2", arm, Status.SOURCE, script.InstallerAnswer(wheel="wheel")),
+        script.Check("agrees", "1", arm, Status.WHEEL, script.InstallerAnswer(wheel="wheel")),
+    ]
+    code, data, text = _main_json(
+        monkeypatch, tmp_path, checks, "differs", "agrees", "-t", "win-arm64", "--installer", "uv"
+    )
+    assert code == 1
+    assert data["installer"] == "uv" and data["installer_version"] == "uv 0.13.1"
+    assert data["mismatch_rate"] == 0.5
+    (entry,) = data["disagreements"]
+    assert entry["installer_result"] == "wheel"
+    assert entry["command"].startswith("printf '%s\\n' differs==2 | uv pip compile")
+    assert "Mismatch rate 50.0% (1 of 2 compared)." in text
+
+
+def test_no_json_file_without_the_flag(monkeypatch, capsys, pip_installed, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    check = script.Check("x", "1", _target("win-arm64"), Status.SOURCE, script.InstallerAnswer())
+    monkeypatch.setattr(script, "compare", lambda packages, targets, workers, installer: [check])
+    assert script.main(["x", "-t", "win-arm64"]) == 0
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_main_needs_pip(monkeypatch, capsys):
     monkeypatch.setattr(script.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "no pip"))
     with pytest.raises(SystemExit) as e:

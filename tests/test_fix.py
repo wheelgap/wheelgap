@@ -793,3 +793,78 @@ def test_print_gap_wheel_snippet_refused_combinations(capsys, gap_wheels, fixtur
     err = capsys.readouterr().err
     assert "--print-gap-wheel-snippet" in err and flag in err
     assert gap_wheels.calls == 0
+
+
+# --github-annotations --fix
+
+
+def _annotations(text):
+    return [line for line in text.splitlines() if line.startswith("::")]
+
+
+def test_github_annotation_says_a_gap_wheel_fills_the_gap_with_the_pip_command(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\nfastlib==2.0.0\n", encoding="utf-8")
+    args = [str(tmp_path / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64,win-amd64", "--github-annotations"]
+    code_plain, out_plain, _ = run(capsys, *args)
+    plain = _annotations(out_plain)
+    assert plain == [
+        "::error file=requirements.txt,line=2,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on win-arm64, win-amd64.",
+        "::error file=requirements.txt,line=1,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on win-arm64, win-amd64.",
+    ]
+    assert gap_wheels.calls == 0
+    code, out, _ = run(capsys, *args, "--fix")
+    assert code == code_plain == 1
+    assert (
+        _annotations(out)
+        == [
+            plain[0],  # no fitting gap wheel: today's message
+            # The level, title and line are the same; only win-arm64 has a gap wheel.
+            plain[1] + " A gap wheel on wheelgap's gap wheel index fills win-arm64 (unofficial, built by wheelgap from "
+            f"the PyPI sdist): pip install --extra-index-url {INDEX} nowheels==0.9.",
+        ]
+    )
+
+
+def test_github_annotation_for_a_uv_lock_points_to_the_logs_gap_wheel_section(
+    capsys, fake_pypi, fixtures, gap_wheels, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    gap_wheels.add("puresdist", "1.0", "puresdist-1.0-cp314-cp314t-win_arm64.whl")
+    args = [str(fixtures / "uvproj" / "uv.lock"), "-p", "3.14t", "-t", "win-arm64", "--github-annotations"]
+    code_plain, out_plain, _ = run(capsys, *args)
+    code, out, _ = run(capsys, *args, "--fix")
+    assert code == code_plain == 1
+    plain, fixed = _annotations(out_plain), _annotations(out)
+    (was,) = [line for line in plain if "::puresdist 1.0 " in line]
+    assert was.startswith("::error file=uvproj/uv.lock,line=43,title=puresdist 1.0%3A builds from source::")
+    assert fixed == [
+        line
+        if line != was
+        else was
+        + " A gap wheel on wheelgap's gap wheel index fills win-arm64 (unofficial, built by wheelgap from the PyPI "
+        "sdist); see the gap wheel section of the log for how to use it."
+        for line in plain
+    ]
+    assert len(fixed) > 1 and "pip install" not in "".join(fixed) and "--extra-index-url" not in "".join(fixed)
+    assert "To install them with uv, add this to pyproject.toml" in out  # the section the sentence points to
+
+
+def test_github_annotation_warning_keeps_its_level_with_a_gap_wheel(capsys, fake_pypi, gap_wheels):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    args = [*NOWHEELS, "--fail-on", "missing", "--github-annotations"]
+    code_plain, out_plain, _ = run(capsys, *args)
+    code, out, _ = run(capsys, *args, "--fix")
+    assert code == code_plain == 0
+    (was,) = _annotations(out_plain)
+    (now,) = _annotations(out)
+    assert was.startswith("::warning title=nowheels 0.9%3A builds from source::")
+    assert now == was + (
+        " A gap wheel on wheelgap's gap wheel index fills win-arm64 (unofficial, built by wheelgap from the PyPI "
+        f"sdist): pip install --extra-index-url {INDEX} nowheels==0.9."
+    )

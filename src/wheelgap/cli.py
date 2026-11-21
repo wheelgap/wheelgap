@@ -2611,7 +2611,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
         # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
-        for command in github_annotations(rows, targets, sources, failing, advisory):
+        for command in github_annotations(rows, targets, sources, failing, advisory, fills):
             write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:

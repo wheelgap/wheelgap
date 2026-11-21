@@ -3,7 +3,8 @@ name: Accuracy
 # Weekly: compare wheelgap's answers with pip and uv on about 50 real PyPI packages and the targets in
 # scripts/check_against_pip.py (#226). It needs the network, so it's kept out of CI's test job, which stays
 # offline. It fails when wheelgap and an installer disagree, or when a check couldn't be made; the run's summary page
-# lists them, with a command for each disagreement.
+# gives each installer's mismatch rate and lists them, with a command for each disagreement. Each run's results
+# (totals, mismatch rate, per-target counts, every difference) are also kept as JSON in the accuracy-results artifact.
 #
 # Read-only and no secrets: it only reads the repo and PyPI.
 
@@ -33,7 +34,7 @@ jobs:
         # pinned pip out of the environment, so --with pip resolves the newest release.
         run: |
           set -o pipefail
-          uv run --python 3.14 --no-dev --with pip python scripts/check_against_pip.py | tee accuracy-pip.log
+          uv run --python 3.14 --no-dev --with pip python scripts/check_against_pip.py --json accuracy-pip.json | tee accuracy-pip.log
       - name: Compare wheelgap with uv
         # The uv that setup-uv installs, the latest release, on purpose, as for pip. The script reads uv's
         # diagnostics by their exact wording: if a release changes it, those checks fail as "couldn't compare"
@@ -41,7 +42,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          uv run --python 3.14 --no-dev python scripts/check_against_pip.py --installer uv | tee accuracy-uv.log
+          uv run --python 3.14 --no-dev python scripts/check_against_pip.py --installer uv --json accuracy-uv.json | tee accuracy-uv.log
+      - name: Upload the results files
+        # One JSON file per installer; a run that failed before the script reported has none.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: accuracy-results
+          path: |
+            accuracy-pip.json
+            accuracy-uv.json
+          if-no-files-found: warn
       - name: Summarise
         if: always()
         run: |
@@ -51,6 +62,12 @@ jobs:
             {
               echo "### wheelgap against $installer"
               echo
+              # The rate, from the report's first line (fixed wording and numbers only), before the full log.
+              rate=$(sed -n '1s/^[0-9][0-9]* checks: .* \(Mismatch rate [0-9a-z.%/() ]*\)\.$/\1/p' "$log")
+              if [ -n "$rate" ]; then
+                echo "$rate"
+                echo
+              fi
               echo '~~~~~~~~~~text'
               head -c 60000 "$log" | sed 's/^~~~~/ ~~~~/'  # the log can't close the fence
               echo
