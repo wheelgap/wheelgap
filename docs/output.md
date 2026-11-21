@@ -471,6 +471,11 @@ because it installs no Python packages with pip or uv (`system-packages`, `shell
 `ARG PIP_...` with no default, read as unset); and `system-python-packages` (system package commands on `lines`
 install Python packages, which pip may keep instead of fetching a requirement). The key is absent when there is nothing to say.
 
+`dockerfile_packages` (after 0.13.0) has one entry per `RUN` line whose `pip install` names requirements on the
+line itself: `dockerfile`, `line`, the `installer` (`pip` or `uv pip`) and the `requirements` as written, variables
+replaced. The line is also a source of its own in `sources` (`Dockerfile:5`). `kind` `arg-value` in
+`dockerfile_notes` says an install used an `ARG`'s default or a `--build-arg` value.
+
 `dockerfile_warnings` (after 0.13.0, always there with `--dockerfile-inputs`) lists the `RUN` lines wheelgap
 couldn't see into, which may install Python packages the answer doesn't have: `dockerfile`, `line`, `kind`
 (`may-install`) and `message`. An empty list means every line was read or can't install any; a script should treat a

@@ -84,6 +84,7 @@ from .sources import (
     parse_dist,
     pyproject_group_names,
     pythons_outside_lock,
+    requirement_to_package,
     restore_uv_python_files,
     select_pyproject_extras,
     select_pyproject_groups,
@@ -1011,6 +1012,7 @@ def report_json(
     dockerfile_inputs: list[dict[str, str | int]] | None = None,
     dockerfile_notes: list[dict[str, object]] | None = None,
     dockerfile_warnings: list[dict[str, object]] | None = None,
+    dockerfile_packages: list[dict[str, object]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -1124,6 +1126,8 @@ def report_json(
         report["dockerfile_inputs"] = dockerfile_inputs
     if dockerfile_notes:
         report["dockerfile_notes"] = dockerfile_notes
+    if dockerfile_packages:
+        report["dockerfile_packages"] = dockerfile_packages
     if dockerfile_warnings is not None:  # with --dockerfile-inputs, always: an empty list says nothing was unseen
         report["dockerfile_warnings"] = dockerfile_warnings
     return json.dumps(report, indent=2)
@@ -2016,6 +2020,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     inputs_report = InputsReport()
     dockerfile_warnings: list[dict[str, object]] = []
     unseen_line = ""  # the stdout line for commands that may install packages wheelgap can't see
+    uv_named: set[int] = set()  # the id()s of the sources `uv pip install NAME` lines give
 
     def read_image() -> None:
         """The image of --dockerfile. One wheelgap can't read is an error, unless -p and -t say what to check."""
@@ -2209,11 +2214,38 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
             sources = [log_source(failures)]
         else:
-            sources = (
-                [parse_dist(Path(args.dist))]
-                if args.dist
-                else load_inputs(args.inputs or ["."], args.environment, requirements_constraints=docker_constraints)
-            )
+            if args.dist:
+                sources = [parse_dist(Path(args.dist))]
+            elif args.dockerfile_inputs:
+                # The requirements files the install lines read, then the requirements they name: one source per
+                # RUN line, labelled with it, checked as names on wheelgap's own command line are.
+                sources = (
+                    load_inputs(args.inputs, args.environment, requirements_constraints=docker_constraints)
+                    if args.inputs
+                    else []
+                )
+                for named_line, named_texts, by_uv in inputs_report.named:
+                    named = Source(f"{args.dockerfile}:{named_line}", pypi_only=True)
+                    for text in named_texts:
+                        named.packages.append(requirement_to_package(text, named.label))
+                        named.specs.append(text)
+                    sources.append(named)
+                    if by_uv:
+                        uv_named.add(id(named))
+                    loose = unpinned_requirement_names(named)
+                    if loose and not quiet:
+                        noun = "package" if len(loose) == 1 else "packages"
+                        listed = ", ".join(loose[:2]) + (", …" if len(loose) > 2 else "")
+                        print(
+                            f"wheelgap: note: {named.label}: RUN pip install names {len(loose)} unpinned {noun} "
+                            f"({listed}), so the newest matching release was checked; pin them to check what "
+                            "you install",
+                            file=sys.stderr,
+                        )
+            else:
+                sources = load_inputs(
+                    args.inputs or ["."], args.environment, requirements_constraints=docker_constraints
+                )
         if args.print_gap_wheel_snippet and (
             len(sources) != 1
             or sources[0].kind not in gapwheels.SNIPPET_KINDS
@@ -2547,7 +2579,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     # 3.13; pip finds no matching distribution). Every requirement in such a file is pinned (dockerfile_requirements).
     uv_files = {requirements for line, requirements in installs if (line, requirements) in uv_installs}
     for source, needed in zip(sources, needed_by_source, strict=True):
-        if source.path in uv_files:
+        if source.path in uv_files or id(source) in uv_named:
             restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
@@ -2857,6 +2889,15 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 else None,
                 dockerfile_notes=dockerfile_notes,
                 dockerfile_warnings=dockerfile_warnings if args.dockerfile_inputs else None,
+                dockerfile_packages=[
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": line,
+                        "installer": "uv pip" if by_uv else "pip",
+                        "requirements": requirements,
+                    }
+                    for line, requirements, by_uv in inputs_report.named
+                ],
             )
         )
         return code

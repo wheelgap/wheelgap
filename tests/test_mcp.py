@@ -1183,12 +1183,12 @@ def test_check_dockerfile_inputs_reads_the_build_context(fake_pypi, tmp_path):
 
 def test_check_dockerfile_inputs_refused_line_is_a_tool_error_with_its_line(fake_pypi, tmp_path):
     dockerfile = tmp_path / "Dockerfile"
-    dockerfile.write_text("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install .\n", encoding="utf-8")
+    dockerfile.write_text("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install --pre six\n", encoding="utf-8")
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), inputs=True))
     assert reply["result"]["isError"] is True
     text = reply["result"]["content"][0]["text"]
     # -r FILE and --no-cache-dir are pip's own options, in the Dockerfile's words: they stay.
-    assert f"{dockerfile}:4: pip install .: the inputs argument only reads -r FILE" in text
+    assert f"{dockerfile}:4: pip install --pre: the inputs argument only reads -r FILE" in text
     assert "--dockerfile-inputs" not in text  # the CLI's flag isn't an argument here
     assert not fake_pypi
 

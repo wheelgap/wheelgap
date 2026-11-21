@@ -49,13 +49,32 @@
                     },
                     "kind": {
                         "type": "string",
-                        "description": "What was left out: image-not-read, passed-over:CLASS or arg-unset."
+                        "description": "What was left out or assumed: image-not-read, passed-over:CLASS, arg-unset, arg-value."
                     },
                     "message": {"type": "string", "description": "The note as printed on stderr."},
                     "lines": {
                         "type": "array",
                         "description": "For passed-over:CLASS and system-python-packages, the RUN lines concerned.",
                         "items": {"type": "integer", "minimum": 1}
+                    }
+                }
+            }
+        },
+        "dockerfile_packages": {
+            "type": "array",
+            "description": "With --dockerfile-inputs, the RUN lines whose pip install names requirements itself.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dockerfile", "line", "installer", "requirements"],
+                "properties": {
+                    "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
+                    "line": {"type": "integer", "minimum": 1, "description": "The line the RUN starts on, from 1."},
+                    "installer": {"enum": ["pip", "uv pip"]},
+                    "requirements": {
+                        "type": "array",
+                        "description": "The requirements as written on the line, variables replaced.",
+                        "items": {"type": "string"}
                     }
                 }
             }

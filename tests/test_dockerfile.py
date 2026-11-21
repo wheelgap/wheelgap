@@ -1080,8 +1080,8 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
 @pytest.mark.parametrize(
     ("dockerfile", "message"),
     [
-        ("FROM python:3.13\nRUN apt-get update\n", "the final stage \\(line 1\\) has no `RUN pip install -r FILE`"),
-        ("FROM python:3.13\nRUN echo hi\n", "the final stage \\(line 1\\) has no `RUN pip install -r FILE`"),
+        ("FROM python:3.13\nRUN apt-get update\n", "the final stage \\(line 1\\) has no `RUN pip install` that"),
+        ("FROM python:3.13\nRUN echo hi\n", "the final stage \\(line 1\\) has no `RUN pip install` that"),
         # A RUN that edits, replaces or removes the file between the COPY and the install.
         (
             "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\nRUN echo uwsgi >> requirements.txt\n"
@@ -1098,7 +1098,10 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
             "RUN pip install -r requirements.txt\n",
             ":5: requirements.txt may have been changed by line 4, which names requirements.txt",
         ),
-        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN python3 -mpip install uwsgi\n", ":4: pip install uwsgi"),
+        (
+            "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN python3 -mpip install uwsgi/\n",
+            ":4: pip install uwsgi/: a project",
+        ),
         (
             "FROM python:3.13\nARG PIP_INDEX_URL=https://user:secret@example.test/simple\nWORKDIR /app\nCOPY . .\n"
             "RUN pip install -r requirements.txt\n",
@@ -1113,7 +1116,7 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
             "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt && pip download six\n",
             ":4: `pip download six`: only `install` is read of pip's commands",
         ),
-        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install .\n", ":4: pip install \\.: --dockerfile-inputs"),
+        ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install .\n", ":4: pip install \\.: a project folder"),
         ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN uv pip install -r requirements.txt\n", ":4: .*needs --system"),
         ("FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install -r $REQS\n", ":4: .*\\$REQS isn't a value"),
         (
@@ -1123,7 +1126,7 @@ def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
         ),
         (
             "FROM python:3.13\nRUN <<EOF\npip install numpy\nEOF\n",
-            "has no `RUN pip install -r FILE` that --dockerfile-inputs can read \\(it has commands wheelgap can't see "
+            "has no `RUN pip install` that --dockerfile-inputs can read \\(it has commands wheelgap can't see "
             "into, which may install some: line 2\\)",
         ),
         ("FROM python:3.13\nCOPY . .\nRUN pip install -r /requirements.txt\n", ":2: COPY to \\.: a relative"),
@@ -2920,7 +2923,7 @@ _INSTALL = "RUN pip install -r requirements.txt\n"
         # Installer set-up is passed over, and named.
         ("RUN pip install --no-cache-dir --upgrade pip setuptools wheel\n" + _INSTALL, {"installer-tools": [4]}),
         (
-            "RUN python -m pip install -U 'pip>=24' uv==0.9.1 && python -m ensurepip\n" + _INSTALL,
+            "RUN python -m pip install -U 'pip>=24' wheel && python -m ensurepip\n" + _INSTALL,
             {"installer-tools": [4]},
         ),
     ],
@@ -2991,9 +2994,8 @@ def test_dockerfile_requirements_warns_about_runs_it_cant_see_into(tmp_path, run
             ":5: .*which Python /opt/conda/bin/pip belongs to",
         ),
         (_INSTALL + "RUN /venv/bin/python -m pip install -r requirements.txt\n", ":5: .*which Python /venv/bin/python"),
-        (_INSTALL + "RUN apt-get update && pip install numpy\n", ":5: pip install numpy"),
+        (_INSTALL + "RUN apt-get update && pip install --pre numpy\n", ":5: pip install --pre: --dockerfile-inputs"),
         (_INSTALL + "RUN pip install .\n", ":5: pip install \\."),
-        (_INSTALL + "RUN pip install -r requirements.txt pip\n", ":5: pip install pip"),
         # An install that may not run, or may fail without failing the build.
         (
             "RUN pip install -r requirements.txt || true\n",
@@ -3278,6 +3280,192 @@ def test_cli_dockerfile_inputs_json_has_no_warnings_when_every_run_is_read(tmp_p
     # Without --dockerfile-inputs nothing is read from the RUN lines, so there is no key.
     assert main(["purewheel", "--dockerfile", str(path), "--json"]) == 0
     assert "dockerfile_warnings" not in json.loads(capsys.readouterr().out)
+
+
+def _named(tmp_path, body, build_args=None, head="FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"):
+    path = _context(tmp_path, head + body)
+    report = InputsReport()
+    files = dockerfile_requirements(path, build_args, report=report, uv_installs=set(), constraints={})
+    return [line for line, _ in files], report
+
+
+@pytest.mark.parametrize(
+    ("run", "names"),
+    [
+        ("pip install six", ["six"]),
+        (
+            "pip3 install --no-cache-dir \"six>=1.0\" 'numpy<3' purewheel==3.1",
+            ["six>=1.0", "numpy<3", "purewheel==3.1"],
+        ),
+        ("apt-get update && python3 -m pip install -U six==1.16.0 && rm -rf /root/.cache", ["six==1.16.0"]),
+        (
+            "pip install \"six ; python_version < '3.9'\" six[extra]~=1.16",
+            ["six ; python_version < '3.9'", "six[extra]~=1.16"],
+        ),
+        # Unquoted extras: a glob to the shell, which stays as written unless a file of that shape exists.
+        ("pip install uvicorn[standard] fastapi[all]==0.115.0", ["uvicorn[standard]", "fastapi[all]==0.115.0"]),
+        # Only pip, setuptools and wheel are passed over; any other tool is a package like the rest.
+        ("pip install uv", ["uv"]),
+        ("pip install --upgrade pip poetry==1.8.3", ["pip", "poetry==1.8.3"]),
+        # A bare name is a requirement to pip even when a folder of that name exists.
+        ("pip install app", ["app"]),
+    ],
+)
+def test_dockerfile_requirements_reads_requirements_named_on_the_install_line(tmp_path, run, names):
+    files, report = _named(tmp_path, f"RUN {run}\n")
+    assert files == []
+    assert report.named == [(4, names, False)]
+    assert report.warnings == []
+
+
+def test_dockerfile_requirements_reads_names_beside_files_and_under_uv(tmp_path):
+    body = "RUN pip install -r requirements.txt six\nRUN pip install purewheel\n"
+    files, report = _named(tmp_path, body + "RUN uv pip install --system --no-cache six==1.16.0 'purewheel==3.1'\n")
+    assert files == [4]
+    assert report.named == [
+        (4, ["six"], False),
+        (5, ["purewheel"], False),
+        (6, ["six==1.16.0", "purewheel==3.1"], True),
+    ]
+
+
+def test_dockerfile_requirements_gathers_the_names_of_one_run_line(tmp_path):
+    body = (
+        "RUN pip install six && pip install purewheel==3.1 && uv pip install --system fastlib==2.0.0 && pip install six"
+    )
+    _, report = _named(tmp_path, f"COPY --from=ghcr.io/astral-sh/uv:0.9.1 /uv /bin/\n{body}\n")
+    assert report.named == [(5, ["six", "purewheel==3.1"], False), (5, ["fastlib==2.0.0"], True), (5, ["six"], False)]
+
+
+def test_dockerfile_requirements_reads_a_name_from_an_arg_default_and_says_so(tmp_path):
+    body = "ARG TORCH=2.1.0\nENV NAME=torch\nRUN pip install ${NAME}==$TORCH six==${SIX:-1}\n"
+    with pytest.raises(DockerfileError, match=":6: .*six==\\$\\{SIX:-1\\} isn't a value"):
+        _named(tmp_path, body)
+    body = body.replace(" six==${SIX:-1}", "")
+    _, report = _named(tmp_path, body)
+    assert report.named == [(6, ["torch==2.1.0"], False)]
+    note = "this install uses the default of ARG TORCH=2.1.0; pass --build-arg if the build sets one"
+    assert report.notes == [(6, "arg-value", note)]
+    _, report = _named(tmp_path, body, {"TORCH": "2.4.1"})
+    assert report.named == [(6, ["torch==2.4.1"], False)]
+    assert report.notes == [(6, "arg-value", "this install uses --build-arg TORCH=2.4.1")]
+    # An ARG with no default and no --build-arg has no value to read.
+    with pytest.raises(DockerfileError, match=":6: .*torch==\\$TORCH isn't a value --dockerfile-inputs can read"):
+        _named(tmp_path, body.replace("ARG TORCH=2.1.0", "ARG TORCH"))
+
+
+_ANOTHER_INDEX = (
+    "this line installs from another index or a folder of files, where the files can differ from PyPI's, and "
+    "--dockerfile-inputs only checks PyPI$"
+)
+
+
+@pytest.mark.parametrize(
+    ("run", "error"),
+    [
+        # The project itself, a path, a file: named precisely, for a later version to read.
+        ("pip install .", ":4: pip install \\.: a project folder or a file is installed here"),
+        ("pip install ./pkg", ":4: pip install \\./pkg: a project folder or a file"),
+        ("pip install '.[mcp]'", ":4: pip install \\.\\[mcp\\]: a project folder or a file"),
+        ("pip install /src[qdrant,local]", ":4: .*/src\\[qdrant,local\\] isn't a value"),
+        ("pip install dist/app-1.0-py3-none-any.whl", ":4: pip install dist/app-1.0-py3-none-any.whl: a project"),
+        ("pip install app-1.0-py3-none-any.whl", ":4: pip install app-1.0-py3-none-any.whl: a project folder or"),
+        ("pip install app-1.0.tar.gz six", ":4: pip install app-1.0.tar.gz: a project folder or a file"),
+        ("pip install -e .", ":4: pip install -e: an editable install of a project folder"),
+        ("pip install --editable=. six", ":4: pip install --editable: an editable install"),
+        ("uv pip install --system -e .", ":4: uv pip install -e: an editable install"),
+        # A URL: never echoed.
+        (
+            "pip install git+https://user:secret@example.test/r.git",
+            ":4: pip install: a URL or something that isn't a requirement is installed here, which "
+            "--dockerfile-inputs doesn't read \\(the text is left out",
+        ),
+        ("pip install https://example.test/app-1.0-py3-none-any.whl", ":4: pip install: a URL or something"),
+        ("pip install 'six @ https://example.test/six.whl'", ":4: pip install: a URL or something"),
+        ("pip install six==", ":4: pip install: a URL or something that isn't a requirement"),
+        # Another index or a folder of files: requirements files ignore such a line (#632), and that isn't copied.
+        ("pip install -i https://example.test/simple six", ":4: pip install -i: this line installs from another"),
+        ("pip install --index-url=https://user:secret@example.test/simple six", ":4: pip install --index-url: "),
+        ("pip install six --extra-index-url https://download.pytorch.org/whl/cpu", ":4: pip install --extra-index-url"),
+        ("pip install -f /wheels six", ":4: pip install -f: this line installs from another index or a folder"),
+        ("pip install --find-links=/wheels --no-index six", ":4: pip install --find-links: this line"),
+        ("pip install --no-index six", ":4: pip install --no-index: this line"),
+        ("pip install --trusted-host example.test six", ":4: pip install --trusted-host: this line"),
+        ("pip install -ihttps://user:secret@example.test/simple six", ":4: pip install -i: " + _ANOTHER_INDEX),
+        ("pip install -r requirements.txt --extra-index-url https://example.test/simple", ":4: .*--extra-index-url"),
+        ("uv pip install --system --index https://example.test/simple six==1.16.0", ":4: uv pip install --index: "),
+        ("uv pip install --system --default-index=https://example.test/simple six==1.16.0", ":4: .*--default-index"),
+        # Values that aren't known, and flags that change what is picked.
+        ("pip install six==$VERSION", ":4: .*six==\\$VERSION isn't a value --dockerfile-inputs can read"),
+        ("pip install $PACKAGES", ":4: .*\\$PACKAGES isn't a value"),
+        ("pip install $(cat names)", ":4: .* isn't a value"),
+        ("pip install six*", ":4: .*six\\* isn't a value"),
+        ("pip install {six,numpy}", ":4: .*\\{six,numpy\\} isn't a value"),
+        ("pip install --pre six", ":4: pip install --pre: --dockerfile-inputs only reads"),
+        ("pip install --no-deps six", ":4: pip install --no-deps: --dockerfile-inputs only reads"),
+        ("pip install --only-binary=:all: six", ":4: pip install --only-binary=:all:: --dockerfile-inputs only"),
+        ("pip install -c requirements.txt six", ":4: pip install -c FILE with requirements on the command line"),
+        ("pip install --prefer-binary six", ":4: pip install --prefer-binary makes .* on the line is pinned"),
+        ("pip install --no-cache-dir", ":4: pip install names nothing to install"),
+        ("pip install six || true", ":4: `pip install six` is in a list with \\|\\|"),
+        # uv picks its own version for a range, so under uv a name must be pinned.
+        ("uv pip install --system six", ":4: uv pip install: six isn't pinned with ==, and uv and pip can pick"),
+        ("uv pip install --system 'six>=1.16'", ":4: uv pip install: six>=1.16 isn't pinned"),
+        ("uv pip install six==1.16.0", ":4: uv pip install needs --system"),
+        ("uv pip install --system --prerelease=allow six==1.16.0", ":4: uv pip install --prerelease=allow: .* for uv"),
+    ],
+)
+def test_dockerfile_requirements_stops_on_install_lines_it_cant_read_as_names(tmp_path, run, error):
+    with pytest.raises(DockerfileError, match=error) as excinfo:
+        _named(tmp_path, f"RUN {run}\n")
+    assert "secret" not in str(excinfo.value)
+
+
+def test_cli_dockerfile_inputs_checks_the_names_an_install_line_names(tmp_path, capsys, fake_pypi):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nRUN pip install --upgrade pip\nRUN pip install --no-cache-dir nowheels==0.9 purewheel\n"
+        "WORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\n"
+        "COPY --from=ghcr.io/astral-sh/uv:0.9.1 /uv /bin/\nRUN uv pip install --system fastlib==2.0.0\n",
+    )
+    (tmp_path / "requirements.txt").write_text("unpinned\n", encoding="utf-8")
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs"]
+    assert main([*argv, "--json"]) == 1  # nowheels has no wheel
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert sorted((p["name"], p["version"]) for p in data["packages"]) == [
+        ("fastlib", "2.0.0"),
+        ("nowheels", "0.9"),
+        ("purewheel", "3.1"),
+        ("unpinned", "4.2"),
+    ]
+    assert data["sources"] == ["requirements.txt", f"{path}:3", f"{path}:8"]
+    assert data["dockerfile_inputs"] == [{"dockerfile": str(path), "line": 6, "file": "requirements.txt"}]
+    assert data["dockerfile_packages"] == [
+        {"dockerfile": str(path), "line": 3, "installer": "pip", "requirements": ["nowheels==0.9", "purewheel"]},
+        {"dockerfile": str(path), "line": 8, "installer": "uv pip", "requirements": ["fastlib==2.0.0"]},
+    ]
+    assert data["dockerfile_warnings"] == []
+    # The same note requirements files get for what isn't pinned, naming the line.
+    assert (
+        f"wheelgap: note: {path}:3: RUN pip install names 1 unpinned package (purewheel), so the newest matching "
+        "release was checked; pin them to check what you install\n"
+    ) in captured.err
+    assert "requirements.txt has 1 unpinned package (unpinned)" in captured.err
+    assert main(argv) == 1
+    assert f"requirements.txt ({path}:6) + {path}:3 + {path}:8 · 4 packages" in capsys.readouterr().out
+
+
+def test_cli_dockerfile_inputs_reads_a_dockerfile_that_only_names_packages(tmp_path, capsys, fake_pypi):
+    # With no requirements file among the inputs, nothing else in the folder is read: not the lockfile beside it.
+    path = _context(tmp_path, "FROM python:3.13-alpine\nRUN pip install purewheel==3.1\n", files=())
+    (tmp_path / "uv.lock").write_text("not a lock\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [(p["name"], p["version"]) for p in data["packages"]] == [("purewheel", "3.1")]
+    assert data["sources"] == [f"{path}:2"]
+    assert data["dockerfile_inputs"] == []
+    assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "musl-x86_64")]
 
 
 def test_cli_dockerfile_inputs_says_when_the_system_package_manager_installs_python_packages(
