@@ -17,7 +17,8 @@ notifications/progress as its index lookups finish; a cancelled call sends no mo
 Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_INDEX_URL):
 - check_package: one package (latest release or a given version) on each target.
 - check_lockfile: what `wheelgap PATH --json` reports, so project config, notes and skipped packages match the CLI.
-- check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read.
+- check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read; with inputs,
+  what `wheelgap --dockerfile DOCKERFILE --dockerfile-inputs --json` reports for the files the Dockerfile installs.
 - check_dist: what `wheelgap --dist DIR --json` reports for the release about to be uploaded, plus the targets
   the previous release on PyPI had a wheel for that this one drops.
 - diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
@@ -56,7 +57,7 @@ from typing import Any, BinaryIO
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from . import __version__, origin, pypi
+from . import __version__, gapwheels, origin, pypi
 from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
@@ -185,6 +186,21 @@ _PYODIDE_LOCK_PROP = {
         "directory."
     ),
 }
+_FIX_HELP = (
+    "With fix: true, as --fix does, also says which gaps a wheel on wheelgap's gap wheel index fills: 'gap_wheels' "
+    "has one entry per filled gap cell (name, version, target, wheel, url, sha256; [] when none fits), "
+    "'gap_wheel_index' is the index to install from and 'gap_wheel_about' the page on how the wheels are built. "
+    "It costs one request to wheelgap.github.io that names no package. The wheels are unofficial: built by wheelgap "
+    "from the PyPI sdist, not by the package's maintainers, so tell the user that and ask before adding the index "
+    "to project files. It's off with another index (index-url or WHEELGAP_INDEX_URL: a note says so), and packages "
+    "wheelgap can't tell are PyPI's are never looked for. "
+)
+_FIX_PROP = {
+    "type": "boolean",
+    "description": "Also return gap_wheels: the gaps a wheel on wheelgap's gap wheel index fills, as --fix does "
+    "(one request to wheelgap.github.io that names no package; the wheels are unofficial builds by wheelgap, so "
+    "ask the user before adding the index). Default: false.",
+}
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 
 TOOLS: list[dict[str, Any]] = [
@@ -269,7 +285,7 @@ TOOLS: list[dict[str, Any]] = [
             "source builds. "
             "With two Pythons checked, one newer (e.g. python '3.14,next'), "
             "'blocking_newer_python' names the packages with a gap on the newer one only; it leaves out packages "
-            "that couldn't be checked. " + _STATUS_HELP
+            "that couldn't be checked. " + _FIX_HELP + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -332,6 +348,7 @@ TOOLS: list[dict[str, Any]] = [
                     "environment.yml, pyproject.toml and a script's # /// script block, "
                     "as --deps does. Default: false. Refused for lockfiles, offline and another index.",
                 },
+                "fix": _FIX_PROP | {"description": _FIX_PROP["description"] + " Refused with offline."},
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -349,7 +366,11 @@ TOOLS: list[dict[str, Any]] = [
             "check_lockfile returns, plus 'image': the python, platform, glibc, musl and build_args wheelgap read "
             "from the Dockerfile (build_args maps the global ARGs used by FROM to their values). A Dockerfile "
             "wheelgap can't read the way Docker does is a tool error saying what to pass "
-            "instead. " + _STATUS_HELP
+            "instead. With inputs: true, as --dockerfile-inputs does, it checks the requirements files the "
+            "Dockerfile's final stage installs with RUN pip install -r FILE instead of a lockfile (so: will this "
+            "image build without compiling anything?); 'path' is then the build context, and notes name each file "
+            "read and its line. Only a strict subset of Dockerfiles is read that way: a line that may install "
+            "anything else is a tool error naming the line, never a guess. " + _FIX_HELP + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -362,7 +383,18 @@ TOOLS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Absolute path or file:// URI of the lockfile or project directory. Default: the "
-                    "Dockerfile's folder.",
+                    "Dockerfile's folder. Not with inputs: true.",
+                },
+                "inputs": {
+                    "type": "boolean",
+                    "description": "Check the requirements files the Dockerfile's final stage installs with RUN pip "
+                    "install -r FILE, instead of a lockfile, as --dockerfile-inputs does. Default: false.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "With inputs: true, absolute path or file:// URI of the folder the build context "
+                    "starts from, as --dockerfile-context DIR (for `docker build -f docker/Dockerfile .`, the folder "
+                    "that `.` is). Default: the Dockerfile's folder.",
                 },
                 "build_args": {
                     "type": "object",
@@ -375,6 +407,7 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Platforms to check instead of the image's, e.g. ['linux/arm64'] (with an Alpine "
                     "image, Docker platforms mean musl). Default: the image's platform."
                 },
+                "fix": _FIX_PROP,
             },
             "required": ["dockerfile"],
             "additionalProperties": False,
@@ -748,10 +781,13 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     """Run the command line itself with --json, so config, notes and skipped packages are exactly the CLI's."""
     _check_keys("check_lockfile", args)
     dependencies = _flag(args, "dependencies")
+    fix = _flag(args, "fix")
     raw = _string(args, "path", required=True) or ""
     offline = args.get("offline")
     if offline is not None and not isinstance(offline, bool):
         raise ToolError("'offline' must be true or false")
+    if fix and offline:  # as --offline --fix on the command line, before anything is read
+        raise ToolError("'fix' reads the gap wheel list from wheelgap.github.io, so it can't be used with 'offline'")
     environment = _string(args, "environment")
     path = _existing(raw)
     # --name=value forms, and -- before the path, so no value can be read as another option.
@@ -775,16 +811,32 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
         # tracker's notes (they'd send the tree's names to wheelgap.github.io); the tool needs the paths only, and
         # _run_cli drops --explain's other keys.
         argv += ["--deps", "--explain", "--no-suggest", "--no-notes", "--no-build-info"]
+    if fix:
+        argv.append("--fix")
     return _run_cli(argv, path)
 
 
 def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     """check_lockfile with --dockerfile, plus the image the CLI reads from the Dockerfile."""
     _check_keys("check_dockerfile", args)
+    inputs = _flag(args, "inputs")
+    fix = _flag(args, "fix")
+    raw = (_string(args, "path") or "").strip()
+    raw_context = _string(args, "context")
+    # As on the command line: --dockerfile-inputs takes no INPUT, and --dockerfile-context is only read with it.
+    if inputs and raw:
+        raise ToolError("'inputs' takes the packages from the Dockerfile, so it can't be used with 'path'")
+    if raw_context is not None and not inputs:
+        raise ToolError("'context' is only used with 'inputs': pass inputs: true too")
+    # An empty context must not quietly fall back to the Dockerfile's folder, where another requirements.txt may sit.
+    if raw_context is not None and not raw_context.strip():
+        raise ToolError("'context' is empty: pass the build context's folder")
     dockerfile = _existing(_string(args, "dockerfile", required=True) or "")
     if dockerfile.is_dir():
         raise ToolError(f"{args['dockerfile']}: is a directory (pass the Dockerfile itself)")
-    raw = (_string(args, "path") or "").strip()
+    context = _existing(raw_context.strip()) if raw_context is not None else None
+    if context is not None and not context.is_dir():
+        raise ToolError(f"{raw_context}: is not a folder (pass the folder the build context starts from)")
     path = _existing(raw) if raw else dockerfile.parent
     build_args = args.get("build_args") or {}
     if not isinstance(build_args, dict) or not all(isinstance(v, str) for v in build_args.values()):
@@ -802,12 +854,25 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     argv = ["--json", f"--dockerfile={dockerfile}"]
     argv += [f"--build-arg={name}={value}" for name, value in build_args.items()]
     argv += [f"--target={p}" for p in _platforms(args)]
-    try:
-        out = _run_cli(argv, path)
-    except ToolError as e:
-        if raw or "no lockfile found" not in str(e):
-            raise
-        raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
+    if fix:
+        argv.append("--fix")
+    if inputs:
+        argv.append("--dockerfile-inputs")
+        if context is not None:
+            argv.append(f"--dockerfile-context={context}")
+        try:
+            # No input: the CLI takes the requirements files from the Dockerfile. 'path' is the build context.
+            out = _run_cli(argv, context if context is not None else dockerfile.parent, positional=False)
+        except ToolError as e:  # a line --dockerfile-inputs refuses, as PATH:LINE: why; its CLI words translated
+            message = str(e).replace("pass -p/-t instead", "use check_lockfile with python and targets instead")
+            raise ToolError(message.replace("--dockerfile-inputs", "the inputs argument")) from e
+    else:
+        try:
+            out = _run_cli(argv, path)
+        except ToolError as e:
+            if raw or "no lockfile found" not in str(e):
+                raise
+            raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
     out["image"] = {
         "python": image.python,
         "platform": image.platform,
@@ -962,6 +1027,7 @@ _EXPLAIN_ONLY = frozenset(
         "piwheels",
         "suggest",
         "last_with_wheel",
+        "gap_wheel",
     }
 )
 
@@ -1048,6 +1114,11 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
     # --dist: targets the previous release had a wheel for that this one drops, labelled like results.
     if "dropped" in data:
         result["dropped"] = {label[k]: v for k, v in data["dropped"].items()}
+    # --fix: the gap cells a wheel on the gap wheel index fills, labelled like results, and where to install from.
+    if "gap_wheels" in data:
+        result["gap_wheels"] = [wheel | {"target": label[wheel["target"]]} for wheel in data["gap_wheels"]]
+        result["gap_wheel_index"] = gapwheels.INDEX
+        result["gap_wheel_about"] = gapwheels.ABOUT
     return result
 
 
@@ -1558,7 +1629,7 @@ def _complete(result: dict[str, Any], result_type: str = "complete") -> dict[str
 _PATH_ARGUMENTS = {
     "check_package": ("pyodide_lock",),
     "check_lockfile": ("path", "pyodide_lock"),
-    "check_dockerfile": ("dockerfile", "path"),
+    "check_dockerfile": ("dockerfile", "path", "context"),
     "check_dist": ("path",),
     "diff_lockfiles": ("old", "new"),
     "suggest_targets": ("path",),

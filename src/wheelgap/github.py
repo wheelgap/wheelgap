@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import tomllib
 from bisect import bisect_right
 from pathlib import Path
@@ -21,7 +22,7 @@ from packaging.utils import canonicalize_name
 
 from . import gapwheels
 from .check import Row, Status
-from .sources import _COMMENT_RE, _INCLUDE_RE, _NAMED_URL_RE, Package, Source, SourceError, requirement_to_package
+from .sources import _COMMENT_RE, _NAMED_URL_RE, Package, Source, SourceError, _line_include, requirement_to_package
 from .targets import Target
 
 # GitHub shows at most 10 error and 10 warning annotations per step; the rest are dropped.
@@ -198,12 +199,17 @@ def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[P
         line = _COMMENT_RE.split(raw, 1)[0].strip()
         if not line or line.startswith("#"):
             continue
-        if m := _INCLUDE_RE.match(line):
-            included = requirement_lines(path.parent / m.group(1).strip(), seen)
-            if included is None:
-                return None
-            out.extend(included)
-            continue
+        if line.startswith("-"):
+            try:  # the -r the parser follows, wherever it sits on the line (`--pre -r base.txt`)
+                include = _line_include(shlex.split(line), path.name)
+            except (ValueError, SourceError):
+                return None  # the parser refused this file, so there's nothing to map
+            if include and not include[0]:
+                included = requirement_lines(path.parent / include[1], seen)
+                if included is None:
+                    return None
+                out.extend(included)
+            continue  # other options, constraints and editables: never a package with a gap
         if line.startswith(("-", ".", "/")):
             continue  # options, constraints, editables and paths: never a package with a gap
         tokens = line.split()

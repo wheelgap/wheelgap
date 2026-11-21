@@ -272,6 +272,130 @@ def test_requirements_url_and_env_var_constraints_are_skipped(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "line,target",
+    [
+        ("--pre -r base.txt", "base.txt"),
+        ("--pre --requirement=base.txt", "base.txt"),
+        ("--pre --requirement base.txt", "base.txt"),
+        ("--pre -rbase.txt", "base.txt"),
+        ('-r "dir with space/base.txt"', "dir with space/base.txt"),
+        ("-r 'dir with space/base.txt'", "dir with space/base.txt"),
+    ],
+)
+def test_requirements_include_after_other_options(tmp_path, line, target):
+    # pip shlex-splits a line of options and reads every option on it, not only the first
+    (tmp_path / target).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / target).write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    packages = parse_requirements(path).packages
+    assert [(p.name, p.version, p.origin) for p in packages] == [
+        ("purewheel", "3.1", "base.txt"),
+        ("fastlib", "2.0.0", "requirements.txt"),
+    ]
+
+
+@pytest.mark.parametrize("line", ["--pre -c pins.txt", "--pre --constraint=pins.txt", "--pre -cpins.txt"])
+def test_requirements_constraint_after_other_options(tmp_path, line):
+    (tmp_path / "pins.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"ranged\n{line}\n", encoding="utf-8")
+    assert [(p.name, p.version) for p in parse_requirements(path).packages] == [("ranged", "1.9")]
+
+
+@pytest.mark.parametrize(
+    "line,names",
+    [
+        # optparse collects every -r and -c, and pip follows only the first -r, or the first -c if there's no -r
+        ("-r a.txt -r b.txt", ["purewheel"]),
+        ("-c pins.txt -r a.txt", ["purewheel"]),
+    ],
+)
+def test_requirements_line_with_several_includes_reads_what_pip_reads(tmp_path, line, names):
+    (tmp_path / "a.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    (tmp_path / "pins.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\n", encoding="utf-8")
+    assert [p.name for p in parse_requirements(path).packages] == names
+
+
+def test_requirements_line_with_two_constraints_reads_only_the_first(tmp_path):
+    (tmp_path / "pins.txt").write_text("ranged>=1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c pins.txt -c b.txt\n", encoding="utf-8")
+    (ranged,) = parse_requirements(path).packages
+    assert (ranged.version, ranged.spec) == (None, ">=1")
+
+
+def test_requirements_editable_line_follows_no_include(tmp_path):
+    # pip reads `-e PATH -r f` as an editable requirement, and an -r on a requirement line isn't followed
+    (tmp_path / "a.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-e ./localpkg -r a.txt\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.skip == "editable"
+
+
+def test_requirements_format_option_before_include_still_applies(tmp_path):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("--no-binary :all: -r base.txt\n", encoding="utf-8")
+    (purewheel,) = parse_requirements(path).packages
+    assert (purewheel.no_binary, purewheel.only_binary) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "line,names",
+    [
+        # optparse takes the token after an option with a value as that value, even one starting with -
+        ("--no-binary -r base.txt", ["fastlib"]),
+        ("--extra -r base.txt", ["fastlib"]),  # an abbreviation of --extra-index-url
+        ("-C -r base.txt", ["fastlib"]),  # -C is short for --config-settings
+        ("-i -cpins.txt -r base.txt", ["purewheel", "fastlib"]),
+        ("--pre -r base.txt", ["purewheel", "fastlib"]),  # --pre is an option of its own, not short for --prefer-binary
+    ],
+)
+def test_requirements_option_values_are_not_read_as_options(tmp_path, line, names):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    assert [p.name for p in parse_requirements(path).packages] == names
+
+
+def test_requirements_format_option_after_include_still_applies(tmp_path):
+    # optparse applies every option on the line before pip reads the include
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r base.txt --no-binary :all:\n", encoding="utf-8")
+    (purewheel,) = parse_requirements(path).packages
+    assert (purewheel.no_binary, purewheel.only_binary) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "line,message",
+    [
+        ("-r 'unclosed", "pip can't split this line"),
+        ("--pre -r", "-r needs a file name"),
+        ("--constraint=", "--constraint needs a file name"),
+        # pip's answer would depend on an option wheelgap doesn't read, so it's refused rather than guessed
+        ("-r a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
+        ("-c a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
+        ("-r a.txt -e ./localpkg", "on a line with an editable"),
+        # the token after an abbreviated include is its value, so the -C here doesn't hide the -r that pip follows
+        ("--cons -C -r a.txt", "on a line with an abbreviated -r or -c"),
+    ],
+)
+def test_requirements_unreadable_option_line_is_an_error(tmp_path, line, message):
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
+    with pytest.raises(SourceError, match="requirements.txt: ") as raised:
+        parse_requirements(path)
+    assert message in str(raised.value)
+
+
+@pytest.mark.parametrize(
     "lines,version,error",
     [
         ("ranged==1.9\nranged==1.9.0\n", "1.9", None),  # the same version, written two ways

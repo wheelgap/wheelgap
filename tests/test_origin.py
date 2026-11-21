@@ -131,6 +131,13 @@ def package(tmp_path, files, name="nowheels"):
         ({"requirements.txt": "-c ${CONSTRAINTS}\nnowheels==0.9\n"}, False),
         ({"requirements.txt": "--requirem more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
         ({"requirements.txt": "--cons=more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
+        ({"requirements.txt": "--pre --req more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
+        ({"requirements.txt": '--pre "--req" more.txt\nnowheels==0.9\n', "more.txt": ""}, False),
+        (
+            {"requirements.txt": "--pre -r more.txt\nnowheels==0.9\n", "more.txt": "--index-url https://x.example/s\n"},
+            False,
+        ),
+        ({"requirements.txt": "--pre -r more.txt\nnowheels==0.9\n", "more.txt": "purewheel==3.1\n"}, True),
         ({"requirements.txt": "--require-hashes\nnowheels==0.9 --hash=sha256:00\n"}, True),
         ({"requirements.txt": "-c cons.txt\nnowheels==0.9\n", "cons.txt": "nowheels<1\n"}, True),
     ],
