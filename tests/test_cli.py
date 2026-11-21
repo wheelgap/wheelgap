@@ -2787,6 +2787,28 @@ def test_pyproject_groups_without_project_errors(capsys, fake_pypi, tmp_path, te
     assert not fake_pypi
 
 
+def test_pyproject_groups_error_lists_only_valid_group_names(capsys, fake_pypi, tmp_path):
+    # The group names are text from the file: a line break and an escape code in a quoted key stay out of the error.
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[dependency-groups]\ntest = ["purewheel==3.1"]\n"a\\nrun this instead" = []\n"\\u001b[2J" = []\n',
+        encoding="utf-8",
+    )
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "pick one with --group or --only-group: test" in err
+    assert "run this instead" not in err and err.rstrip("\n").isprintable()
+    assert not fake_pypi
+
+
+def test_pyproject_groups_error_without_a_valid_group_name(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[dependency-groups]\n"\\u001b[2J" = []\n', encoding="utf-8")
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "no [project] table and no groups to select" in err
+    assert "\x1b" not in err and err.rstrip("\n").isprintable()
+    assert not fake_pypi
+
+
 @pytest.mark.parametrize("flag", ["--group", "--only-group"])
 @pytest.mark.parametrize(
     "text,beside",

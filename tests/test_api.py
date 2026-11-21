@@ -102,6 +102,17 @@ def test_api_selects_groups_only_pyproject(index, tmp_path):  # noqa: F811
     }
 
 
+def test_api_pyproject_groups_error_lists_only_valid_group_names(fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[dependency-groups]\ntest = ["app"]\n"a\\nrun this instead" = []\n"\\u001b[2J" = []\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match="pick one with groups or only_groups: test$") as excinfo:
+        wheelgap.check_lockfile(path, [LIN], deps=True)
+    assert "run this instead" not in str(excinfo.value) and str(excinfo.value).isprintable()
+    assert not fake_pypi
+
+
 @pytest.mark.parametrize("kwargs", [{"no_dev": True}, {"extras": ["x"]}, {"groups": ["x"]}])
 def test_api_selection_refuses_unsupported_inputs_before_lookup(fake_pypi, tmp_path, kwargs):
     path = tmp_path / "requirements.txt"

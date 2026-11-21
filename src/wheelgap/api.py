@@ -40,6 +40,7 @@ from .sources import (
     file_kind,
     find_lockfile,
     load_file,
+    pyproject_group_names,
     pythons_outside_lock,
     restore_uv_python_files,
     select_pyproject_extras,
@@ -531,10 +532,11 @@ def _check_lockfile(
             if extra_names or all_extras:
                 raise SourceError(f"{source.label}: no [project] optional-dependencies to select from")
             if not (group_names or only_groups):
-                if source.pyproject_groups:
-                    names = ", ".join(sorted(source.pyproject_groups))
+                group_names_listed = pyproject_group_names(source.pyproject_groups)
+                if group_names_listed:
                     raise SourceError(
-                        f"{source.label}: no [project] table; pick one with groups or only_groups: {names}"
+                        f"{source.label}: no [project] table; pick one with groups or only_groups: "
+                        f"{', '.join(group_names_listed)}"
                     )
                 raise SourceError(f"{source.label}: no [project] table and no groups to select")
         if only_groups and (extra_names or all_extras):

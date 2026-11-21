@@ -73,6 +73,7 @@ from .sources import (
     check_report_targets,
     load_inputs,
     parse_dist,
+    pyproject_group_names,
     pythons_outside_lock,
     restore_uv_python_files,
     select_pyproject_extras,
@@ -2076,10 +2077,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     if args.extra or args.all_extras:
                         raise SourceError(f"{source.label}: no [project] optional-dependencies to select from")
                     if not (args.group or args.only_group):
-                        if source.pyproject_groups:
-                            names = ", ".join(sorted(source.pyproject_groups))
+                        group_names = pyproject_group_names(source.pyproject_groups)
+                        if group_names:
                             raise SourceError(
-                                f"{source.label}: no [project] table; pick one with --group or --only-group: {names}"
+                                f"{source.label}: no [project] table; pick one with --group or --only-group: "
+                                f"{', '.join(group_names)}"
                             )
                         raise SourceError(f"{source.label}: no [project] table and no groups to select")
                 if args.only_group and (args.extra or args.all_extras):

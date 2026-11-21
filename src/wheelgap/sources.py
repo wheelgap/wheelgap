@@ -2868,6 +2868,12 @@ def find_lockfile(directory: Path, pixi: bool = False) -> Path:
 _GROUP_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 
 
+def pyproject_group_names(names: Iterable[str]) -> list[str]:
+    """The dependency group names a message may repeat, normalized and sorted: only those PEP 735 allows. The names
+    are text from the file, and these messages go to a terminal, a CI log or an MCP client."""
+    return sorted({canonicalize_name(name) for name in names if _GROUP_NAME.fullmatch(name)})
+
+
 def _pyproject_hint(pyproject: Path) -> str | None:
     """For the "no lockfile" error only: the command that checks the folder's pyproject.toml instead, when there is
     one that would work. A missing or unreadable file just means no hint."""
@@ -2887,9 +2893,7 @@ def _pyproject_hint(pyproject: Path) -> str | None:
     keys = [canonicalize_name(name) for name in groups]
     if len(set(keys)) != len(keys):
         return None  # two groups that are the same once normalized: refused whichever group is asked for
-    # The names are text from the file, and this message goes to a terminal, a CI log or an MCP client: only names
-    # PEP 735 allows are repeated, normalized as the `--group` error lists them.
-    names = sorted({canonicalize_name(name) for name in groups if _GROUP_NAME.fullmatch(name)})
+    names = pyproject_group_names(groups)
     if not names:
         return None
     return (
