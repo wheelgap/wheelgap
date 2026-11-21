@@ -89,7 +89,7 @@
                 "properties": {
                     "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
                     "line": {"type": "integer", "minimum": 1, "description": "The line the RUN starts on, from 1."},
-                    "kind": {"type": "string", "description": "may-install."},
+                    "kind": {"type": "string", "description": "may-install or may-bring."},
                     "message": {"type": "string", "description": "The warning as printed on stderr."}
                 }
             }

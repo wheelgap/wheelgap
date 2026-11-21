@@ -819,6 +819,37 @@ def _split_from_as_written(args: str) -> str | None:
         return None
 
 
+def _stage_chain(froms: list[tuple[int, str]], global_args: _GlobalArgs) -> list[int]:
+    """The FROM lines of the stages the final image is made of, the base stage first: the final stage, the stage it
+    is built FROM, and so on back to the stage built FROM an image. A stage is found by its name as _final_from
+    finds it (the latest earlier `AS name`). A FROM in the chain with a build argument wheelgap can't expand is a
+    DockerfileError when a named stage comes before it, since it may name that stage."""
+    names: dict[str, int] = {}  # stage name -> index in froms
+    parents: list[int | None] = []
+    for index, (_, args) in enumerate(froms):
+        try:
+            expanded, unexpanded = _expand_build_args(args, global_args)[0], False
+        except UnknownImageError:
+            expanded, unexpanded = args, True
+        image, _, stage = _split_from(expanded)
+        parents.append(-1 if unexpanded and "$" in image and names else names.get(image))
+        if stage:
+            names[stage] = index
+    chain: list[int] = []
+    at: int | None = len(froms) - 1
+    while at is not None:
+        if parents[at] == -1:  # it may be any of the stages named before it
+            line, args = froms[at]
+            known = ", ".join(name for name, index in names.items() if index < at)
+            raise DockerfileError(
+                f"line {line}: FROM {_split_from(args)[0]} uses a build argument wheelgap can't expand, and it may "
+                f"name an earlier stage ({known}): pass its value with --build-arg"
+            )
+        chain.append(froms[at][0])
+        at = parents[at]
+    return chain[::-1]
+
+
 def parse_from(args: str) -> ImageTarget:
     """Parse `[--platform=P] image[:tag][@digest] [AS name]`."""
     image, platform, _ = _split_from(args)
@@ -1019,6 +1050,10 @@ class _Copy:
     into: bool  # the sources land inside dest: a / at its end, several sources, a folder, or dest a known folder
     error: str | None = None  # why wheelgap can't tell what this instruction puts in the image
     uv_binaries: tuple[str, ...] = ()
+    # COPY --from=STAGE-OR-IMAGE: what it names, and the paths it copies from there. wheelgap doesn't follow these:
+    # nothing under `dest` is read afterwards, and what the files are is only said in a note or a warning.
+    foreign: str | None = None
+    foreign_paths: tuple[str, ...] = ()
 
 
 def _add_dir(dirs: set[str], folder: str) -> None:
@@ -1051,16 +1086,27 @@ def _read_copy(
             target = posixpath.normpath(posixpath.join(workdir or "/", dest))
             _add_dir(dirs, target)
             return _Copy(number, (), target, True, uv_binaries=tuple(name[1:] for name in names))
-        return unread(f"COPY {source} isn't read by --dockerfile-inputs except when copying /uv and optional /uvx")
     if args.lstrip().startswith("[") or not _PLAIN_ARGS_RE.fullmatch(args):
         return unread(f"only a plain `COPY SRC... DEST` is read by --dockerfile-inputs ({_PLAIN}, no JSON form)")
     words = args.split()
+    foreign = None
     while words and words[0].startswith("--"):
-        if not _COPY_FLAG_RE.fullmatch(flag := words.pop(0)):
-            return unread(f"COPY {flag} isn't read by --dockerfile-inputs (only --chown, --chmod and --link are)")
+        flag = words.pop(0)
+        if flag.startswith("--from=") and foreign is None and len(flag) > len("--from="):
+            foreign = flag.removeprefix("--from=")
+        elif not _COPY_FLAG_RE.fullmatch(flag):
+            return unread(
+                f"COPY {flag} isn't read by --dockerfile-inputs (only --from, --chown, --chmod and --link are)"
+            )
     if len(words) < 2:
         return unread("COPY needs a source and a destination")
     *names, dest = words
+    if foreign is not None:
+        # The files of another stage or image. Where they land is known; what they are isn't.
+        if not dest.startswith("/") and workdir is None:
+            return unread(f"COPY to {dest}: a relative destination needs a WORKDIR with an absolute path before it")
+        target = posixpath.normpath(posixpath.join(workdir or "/", dest))
+        return _Copy(number, (), target, True, foreign=foreign, foreign_paths=tuple(names))
     sources = []
     root = context.resolve()
     for name in names:
@@ -1134,8 +1180,37 @@ def _copied_file(copy: _Copy, target: str, context: Path, ignore_rules: tuple[do
     return None
 
 
+# Where a folder copied from another stage or image could carry a pip config file with it: the folders pip reads
+# one from, and every folder above them (a home folder can be anywhere under /home).
+_CONFIG_PARENTS = ("/", "/etc", "/etc/xdg", "/etc/xdg/pip", "/root", "/root/.config", "/root/.config/pip", "/root/.pip")
+# Words in a path that say Python packages may be in what a COPY --from brings: the answer then gets a warning.
+_PACKAGE_PATH_WORDS = ("site-packages", "dist-packages", "venv", "virtualenv", "conda", "python", ".local", "wheel")
+_PACKAGE_PATH_ROOTS = ("/", "/usr", "/usr/local", "/usr/lib", "/opt", "/root", "/home", "/install", "/app", "/srv")
+
+
+def _may_hold_packages(copy: _Copy) -> bool:
+    """Whether a COPY --from may bring installed Python packages (an environment built in another stage)."""
+    paths = [posixpath.normpath(path) for path in (*copy.foreign_paths, copy.dest)]
+    return any(
+        path in _PACKAGE_PATH_ROOTS
+        or not path.startswith("/")
+        or any(word in path.lower() for word in _PACKAGE_PATH_WORDS)
+        for path in paths
+    )
+
+
 def _copies_config(copy: _Copy, names: tuple[str, ...]) -> bool:
     """Whether COPY can put an installer configuration file anywhere in the image."""
+    if copy.foreign is not None:
+        if names == _UV_CONFIG_NAMES:
+            return True  # a folder from elsewhere may hold a uv.toml or a pyproject.toml
+        paths = (*copy.foreign_paths, copy.dest)
+        return (
+            any(_names_config(path) or posixpath.basename(path).lower() in names for path in paths)
+            or copy.dest in _CONFIG_PARENTS
+            or copy.dest.startswith("/home")
+            or "/.config" in copy.dest
+        )
     for rel, host, is_dir in copy.sources:
         if is_dir:
             for _, dirnames, filenames in os.walk(host):
@@ -1200,6 +1275,11 @@ def _find_copied_file(
     for copy in reversed(copies):
         if copy.error:
             raise DockerfileError(f"line {copy.line}: {copy.error}")
+        if copy.foreign is not None and not copy.uv_binaries and (target + "/").startswith(copy.dest.rstrip("/") + "/"):
+            raise DockerfileError(
+                f"line {number}: {target} may come from the COPY --from={copy.foreign} on line {copy.line}, and "
+                "--dockerfile-inputs doesn't follow files copied from another stage or image"
+            )
         if (host := _copied_file(copy, target, context, ignore_rules)) is not None:
             return host
     raise DockerfileError(f"line {number}: {target} isn't copied from the build context by a COPY before this line")
@@ -1681,6 +1761,7 @@ PASSED_OVER = {
     "programs": "other programs",
     "venv": "virtual environment set-up",
     "cache-mounts": "cache mounts",
+    "copy-from": "files copied from another stage or image",
 }
 
 # Environment variables that don't change which files pip picks, by pip's rule that PIP_<OPTION> sets the option
@@ -1730,6 +1811,9 @@ class InputsReport:
     notes: list[tuple[int, str, str]] = field(default_factory=list)  # (line, kind, message)
     # (line, the requirements a `pip install NAME...` on it names, whether uv installs them), in order.
     named: list[tuple[int, list[str], bool]] = field(default_factory=list)
+    # (line, the instruction) for each COPY --from that may bring Python packages built in another stage or image:
+    # warnings like `warnings`, since the answer doesn't cover them.
+    copied: list[tuple[int, str]] = field(default_factory=list)
     # (line, name) for each Python package a system package command installs (apk add py3-yaml, apt-get install
     # python3-numpy): pip keeps one that satisfies a requirement, where wheelgap checks a fresh install.
     system_python: list[tuple[int, str]] = field(default_factory=list)
@@ -2428,27 +2512,20 @@ def _dockerfile_requirements(
     if not froms:
         raise DockerfileError("no FROM line found")
     final_line = froms[-1][0]
-    # The FROM that names the final image: an earlier one if the final stage builds on a stage (`FROM ${BASE}` too).
     try:
-        base_line = _final_from(text, build_args)[2]
-    except UnknownImageError as e:
-        # The caller has -p/-t for an image wheelgap can't read (it raised this error itself otherwise). The stage's
-        # instructions are read all the same, once it is certain the FROM names an image and not an earlier stage:
-        # a build argument wheelgap can't expand may name either.
-        base_line = e.line if e.line is not None else final_line
-        image = _split_from(froms[-1][1])[0]
-        stages = [stage for _, args in froms[:-1] if (stage := _split_from_as_written(args)) is not None]
-        if base_line == final_line and "$" in image and stages:
-            raise DockerfileError(
-                f"line {final_line}: FROM {image} uses a build argument wheelgap can't expand, and it may name an "
-                f"earlier stage ({', '.join(stages)}): pass its value with --build-arg"
-            ) from None
-    if base_line != final_line:
-        raise DockerfileError(
-            f"line {final_line}: the final stage builds on an earlier stage; --dockerfile-inputs only reads a final "
-            "stage built FROM an image"
-        )
-    start = max(i for i, (number, _) in enumerate(instructions) if number == final_line)
+        _final_from(text, build_args)  # the errors plain --dockerfile gives for the FROM lines come first
+    except UnknownImageError:
+        pass  # the caller has -p/-t for an image wheelgap can't read (it raised this error itself otherwise)
+    chain = _stage_chain(froms, global_args)
+    from_lines = {number for number, _ in froms}
+    starts = {number: index for index, (number, _) in enumerate(instructions) if number in from_lines}
+    ends = sorted(starts.values())
+    # The instructions of each stage of the chain, the base stage first, with a None where a stage starts.
+    stream: list[tuple[int, str] | None] = []
+    for from_line in chain:
+        start = starts[from_line]
+        end = next((index for index in ends if index > start), len(instructions))
+        stream += [None, *instructions[start + 1 : end]]
     workdir: str | None = None
     workdir_error: str | None = None
     run_error: str | None = None  # an instruction that changes how a later RUN installs
@@ -2503,6 +2580,12 @@ def _dockerfile_requirements(
             raise DockerfileError(reader.config_error)
         uv = install.uv
         if uv and (config := next((copy for copy in copies if _copies_config(copy, _UV_CONFIG_NAMES)), None)):
+            if config.foreign is not None:
+                raise DockerfileError(
+                    f"line {config.line}: COPY --from={config.foreign} may bring a uv.toml or pyproject.toml, which "
+                    "uv reads settings from, and --dockerfile-inputs doesn't follow files copied from another "
+                    "stage or image: run uv pip install before this COPY"
+                )
             raise DockerfileError(
                 f"line {config.line}: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads "
                 "settings from them: copy the requirements file alone and run uv pip install before this COPY"
@@ -2589,9 +2672,25 @@ def _dockerfile_requirements(
         if unread := next((copy for copy in copies if copy.error), None):
             raise DockerfileError(f"line {unread.line}: {unread.error}")
 
-    for number, instruction in instructions[start + 1 :]:
+    number = final_line
+    for item in stream:
+        if item is None:
+            # A new stage of the chain, built FROM the one just read. Its files, WORKDIR, ENV and SHELL are the
+            # parent's. Whether the parent's ARGs are still set depends on the BuildKit version (newer ones carry
+            # them over: `ds.buildArgs = append(ds.buildArgs, ds.base.buildArgs...)` in dockerfile2llb/convert.go),
+            # so their values are forgotten: an install that needs one is an error, not a guess.
+            for name in arg_values:
+                env.pop(name, None)
+            arg_values.clear()
+            continue
+        number, instruction = item
         parts = re.split(r"[ \t\v\f\r]+", instruction, maxsplit=1)
         keyword, args = parts[0].upper(), (parts[1].strip() if len(parts) > 1 else "")
+        if keyword == "ONBUILD" and number < final_line:
+            # A trigger of a stage the final stage builds on runs in the stage built FROM it.
+            raise DockerfileError(
+                f"line {number}: ONBUILD in a stage the final stage builds on isn't read by --dockerfile-inputs"
+            )
         if keyword == "WORKDIR":
             if not re.fullmatch(r"[A-Za-z0-9_./-]+", args, re.ASCII):
                 workdir, workdir_error = None, f"line {number}: WORKDIR {args}: only a literal path is read ({_PLAIN})"
@@ -2605,6 +2704,10 @@ def _dockerfile_requirements(
             copies.append(copy := _read_copy(number, args, workdir, dirs, context, context_label, ignore_rules))
             if _copies_config(copy, _PIP_CONFIG_NAMES):
                 run_error = f"line {number}: a pip config file may change what pip installs"
+            elif copy.foreign is not None and _may_hold_packages(copy):
+                report.copied.append((number, f"COPY --from={copy.foreign} {' '.join(copy.foreign_paths)} {copy.dest}"))
+            elif copy.foreign is not None:
+                report.passed("copy-from", number)
         elif keyword == "ADD":
             copies.append(_Copy(number, (), "", False, "ADD isn't read by --dockerfile-inputs, use COPY"))
         elif keyword == "SHELL":
@@ -2656,8 +2759,13 @@ def _dockerfile_requirements(
         if report.warnings:
             where = ", ".join(str(line) for line, _ in report.warnings)
             unseen = f" (it has commands wheelgap can't see into, which may install some: line {where})"
+        elif report.copied:
+            where = ", ".join(str(line) for line, _ in report.copied)
+            unseen = f" (it copies files from another stage or image, which may hold some: line {where})"
+        stages = "" if len(chain) == 1 else f", like the {len(chain) - 1} it builds on,"
         raise DockerfileError(
-            f"the final stage (line {final_line}) has no `RUN pip install` that --dockerfile-inputs can read" + unseen
+            f"the final stage (line {final_line}){stages} has no `RUN pip install` that --dockerfile-inputs can read"
+            + unseen
         )
     if constraints is not None:
         constraints.update(used_constraints)

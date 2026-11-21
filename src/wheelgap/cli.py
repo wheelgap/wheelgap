@@ -1197,13 +1197,25 @@ def dockerfile_report_notes(
         }
         for line, what in report.warnings
     ]
+    warnings += [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-bring",
+            "message": f"{what} copies files from another stage or image, which wheelgap doesn't follow. If they "
+            "hold Python packages, or another Python, that is not in this answer",
+        }
+        for line, what in report.copied
+    ]
+    order = sorted({line for line, _ in (*report.warnings, *report.copied)})
+    warnings.sort(key=lambda entry: order.index(entry["line"]))  # type: ignore[arg-type]
     unseen = ""
-    if report.warnings:
-        lines = sorted({line for line, _ in report.warnings})
-        unseen = (
-            f"{dockerfile} {_line_list(lines)} run{'s' if len(lines) == 1 else ''} commands wheelgap can't see "
-            "into: any Python packages they install are not in this answer."
-        )
+    if order:
+        does = "run commands wheelgap can't see into" if report.warnings else ""
+        if report.copied:
+            does += (", or " if does else "") + "copy files from another stage or image"
+        brought = "bring" if report.copied else "install"
+        unseen = f"{dockerfile} {_line_list(order)} {does}: any Python packages they {brought} are not in this answer."
     return notes, warnings, unseen
 
 
