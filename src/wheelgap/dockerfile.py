@@ -94,7 +94,10 @@ OLD_DEBIAN_TAGS = {
 # X.Y, X.Y.Z or a pre-release (3.15.0a1, 3.13rc1), then the variant; or the official images' floating X.Y-rc tags
 # (python:3.16-rc, 3.16-rc-slim-trixie), which follow the newest pre-release of X.Y. Astral's uv images have had
 # them too (uv:python3.14-rc-alpine, python3.14-rc-bookworm-slim).
-_TAG_RE = re.compile(r"^(\d+)\.(\d+)(?:(-rc)(?=-|$)|(?:\.\d+)?(?:(?:a|b|rc)\d+)?)(?:-(.+))?$", re.ASCII)
+_TAG_RE = re.compile(
+    r"^(\d+)\.(\d+)(?:(-rc)(?=-|$)|(?P<patch>\.\d+(?:(?:a|b|rc)\d+)?)?(?:(?:a|b|rc)\d+)?)(?:-(?P<variant>.+))?$",
+    re.ASCII,
+)
 _UV_TAG_PREFIX_RE = re.compile(r"^(?:\d+\.\d+(?:\.\d+)?-)?python", re.ASCII)
 _DOCKER_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")  # distribution/reference's tag grammar
 
@@ -126,6 +129,11 @@ class ImageTarget:
     given_args: frozenset[str] = field(default=frozenset(), compare=False)
     # --build-arg names no global ARG declares: Docker doesn't use them in FROM.
     undeclared_args: tuple[str, ...] = field(default=(), compare=False)
+    # The patch release the image tag pins, as written (3.9.1 for python:3.9.1-slim, 3.15.0a1), or None for a tag
+    # that follows X.Y (python:3.9, 3.13-slim, 3.15-rc). The check itself is for `python` at its newest patch release.
+    python_patch: str | None = field(default=None, compare=False)
+    # The image as the FROM names it, without a digest (python:3.9.1-slim), for notes that quote it.
+    image: str | None = field(default=None, compare=False)
 
 
 _DIRECTIVE_RE = re.compile(r"^#\s*([A-Za-z]+)\s*=\s*(.+?)\s*$")
@@ -970,7 +978,9 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     rc = bool(m.group(3))
     minor_tag = bool(_MINOR_TAG_RE.match(tag)) and not rc
     rc_release = False  # the Debian release came from RC_DEBIAN, whose images kept every arch they were built for
-    variant = m.group(4).split("-") if m.group(4) else []  # Docker Hub tags are case-sensitive: -SLIM doesn't exist
+    # The patch release a tag names (3.9.1-slim, 3.15.0a1), kept as written; X.Y, X.Y-rc and X.YrcN name none.
+    patch = f"{python}{m.group('patch')}" if m.group("patch") else None
+    variant = m.group("variant").split("-") if m.group("variant") else []  # case-sensitive: -SLIM doesn't exist
 
     release = None
     if alpine := next((part for part in variant if part.startswith("alpine")), None):
@@ -980,7 +990,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     elif any(part in WINDOWS_VARIANTS for part in variant):
         if platform:
             raise DockerfileError(f"{image}: --platform is not supported for Windows images")
-        return ImageTarget(python, "win-amd64")
+        return ImageTarget(python, "win-amd64", python_patch=patch, image=image)
     else:
         family, musl = "linux", None
         unknown = [part for part in variant if part not in DEBIAN_GLIBC and part != "slim"]
@@ -1020,7 +1030,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
                         f"{image} may not be published for {platform}: older -rc builds have it, newer ones don't{hint}"
                     )
                 raise DockerfileError(f"{image} isn't published for {platform}{hint}")
-    return ImageTarget(python, f"{family}-{arch}", glibc, musl)
+    return ImageTarget(python, f"{family}-{arch}", glibc, musl, python_patch=patch, image=image)
 
 
 def read_dockerfile(path: Path, build_args: Mapping[str, str] | None = None) -> ImageTarget:

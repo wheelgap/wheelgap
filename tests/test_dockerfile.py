@@ -19,6 +19,7 @@ from wheelgap.dockerfile import (
     dockerfile_requirements,
     last_from,
     parse_from,
+    parse_image,
     read_dockerfile,
 )
 from wheelgap.sources import SourceError, load_inputs
@@ -182,6 +183,62 @@ def test_read_dockerfile_expands_a_global_arg_default(tmp_path, capsys):
     assert image == ImageTarget("3.12", "linux-x86_64", glibc="2.41")
     assert image.build_args == (("PYTHON_VERSION", "3.12"),)
     assert capsys.readouterr().err == ""  # the CLI notes it, once, naming the file
+
+
+@pytest.mark.parametrize(
+    ("image", "python", "patch"),
+    [
+        ("python:3.9.1-slim", "3.9", "3.9.1"),
+        ("python:3.12.7", "3.12", "3.12.7"),
+        ("python:3.12.7-alpine3.20", "3.12", "3.12.7"),
+        ("python:3.15.0a1-slim", "3.15", "3.15.0a1"),
+        ("python:3.9.1-windowsservercore", "3.9", "3.9.1"),
+        ("ghcr.io/astral-sh/uv:0.13.7-python3.12.7-alpine", "3.12", "3.12.7"),
+        ("python:3.9.1-slim@sha256:" + "0" * 64, "3.9", "3.9.1"),
+        # No patch release in the tag: it follows X.Y, or is an X.Y pre-release.
+        ("python:3.9", "3.9", None),
+        ("python:3.13-slim", "3.13", None),
+        ("python:3.15-rc", "3.15", None),
+        ("python:3.15-rc-slim", "3.15", None),
+        ("python:3.13rc1-slim", "3.13", None),
+        ("ghcr.io/astral-sh/uv:python3.13-alpine", "3.13", None),
+    ],
+)
+def test_parse_image_keeps_the_patch_release_a_tag_pins(image, python, patch):
+    target = parse_image(image)
+    assert target.python == python  # the check is still for X.Y: the patch is only kept for the note
+    assert target.python_patch == patch
+    assert target.image == image.split("@")[0]
+
+
+@pytest.mark.parametrize("quiet", [False, True])
+def test_cli_notes_a_patch_pinned_image(tmp_path, capsys, fake_pypi, quiet):
+    path = tmp_path / "Dockerfile"
+    path.write_text("FROM python:3.9.1-slim\n", encoding="utf-8")
+    main(["purewheel", "--dockerfile", str(path), "--json", *(["--quiet"] if quiet else [])])
+    captured = capsys.readouterr()
+    note = (
+        f"wheelgap: note: {path}: python:3.9.1-slim pins Python 3.9.1; wheelgap checks 3.9 at its newest patch "
+        "release, so a package that needs a later 3.9 patch isn't flagged"
+    )
+    assert (note in captured.err) is not quiet
+    targets = json.loads(captured.out)["targets"]
+    assert [(t["python"], t["platform"]) for t in targets] == [("3.9", "linux-x86_64")]  # the check is unchanged
+
+
+@pytest.mark.parametrize(
+    ("image", "argv"),
+    [
+        ("python:3.9-slim", []),  # follows 3.9
+        ("python:3.15-rc", []),
+        ("python:3.9.1-slim", ["-p", "3.12"]),  # -p wins, so the image's Python isn't the one checked
+    ],
+)
+def test_cli_has_no_patch_note_without_a_patch_pinned_image(tmp_path, capsys, fake_pypi, image, argv):
+    path = tmp_path / "Dockerfile"
+    path.write_text(f"FROM {image}\n", encoding="utf-8")
+    main(["purewheel", "--dockerfile", str(path), "--json", *argv])
+    assert "pins Python" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("quiet", [False, True])

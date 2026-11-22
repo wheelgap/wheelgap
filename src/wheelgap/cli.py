@@ -2329,6 +2329,15 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         f"--build-arg {name} doesn't change the image (Docker ignores it there too)",
                         file=sys.stderr,
                     )
+                if image is not None and image.python_patch and not args.python:
+                    # The check is for X.Y at its newest patch release (see docs/how-it-works.md), which an image
+                    # pinned to an earlier one isn't. -p on the command line means the image's Python isn't used.
+                    print(
+                        f"wheelgap: note: {args.dockerfile}: {image.image} pins Python {image.python_patch}; "
+                        f"wheelgap checks {image.python} at its newest patch release, so a package that needs a "
+                        f"later {image.python} patch isn't flagged",
+                        file=sys.stderr,
+                    )
             if image is not None:
                 docker_musl = image.platform.startswith("musl-")
                 if docker_musl and args.target:
