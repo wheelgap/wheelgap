@@ -375,7 +375,7 @@ def test_check_package_explain_includes_issues_url(fake_pypi):
 
 
 def test_check_package_explain_issues_url_null_for_other_index(fake_pypi, monkeypatch):
-    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/simple")
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://other.example.com/pypi")
     (_, reply) = run(
         init(),
         call(
@@ -2780,6 +2780,19 @@ def test_diff_lockfiles_looks_requirements_up(fake_pypi, tmp_path):
     assert fake_pypi
 
 
+def test_diff_lockfiles_rejects_simple_index_before_comparing_requirements(fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://x.test/simple")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("ranged==1.5\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=str(requirements), new=str(requirements)))
+    result = reply["result"]
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "WHEELGAP_INDEX_URL points at a simple index" in message and "JSON API" in message
+    assert "[tool.wheelgap]" not in message and "--index-url" not in message
+    assert fake_pypi == []
+
+
 def test_diff_lockfiles_malformed_lockfile_is_a_tool_error(fake_pypi, tmp_path):
     old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
     Path(new).write_text("[[package\n", encoding="utf-8")
@@ -3005,7 +3018,30 @@ def test_explain_install_failure_never_echoes_the_logs_index(fake_pypi, name, be
     assert SENTINEL not in message
     assert message == mcp._LOG_ERRORS[kind or mcp.OTHER_INDEX]
     assert "WHEELGAP_INDEX_URL" in message and "check_package" in message
-    assert "--index-url" not in message
+    assert "JSON API" in message and "/pypi" in message
+    assert "wheelgap --from-log FILE --index-url URL -p PYTHON -t PLATFORM" in message
+    assert "shell" in message
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("check_package", {"name": "laggard", "version": "1.0"}),
+        (
+            "explain_install_failure",
+            {"log": "Looking in indexes: https://x.test/simple\n" + install_log("pip23-laggard.log")},
+        ),
+    ],
+)
+def test_package_lookup_rejects_simple_index_without_fetching(fake_pypi, monkeypatch, tool, arguments):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://x.test/simple/")
+    (_, reply) = run(init(), call(tool, python="3.13", targets=["win-amd64"], **arguments))
+    result = reply["result"]
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "WHEELGAP_INDEX_URL points at a simple index" in message and "JSON API" in message
+    assert "[tool.wheelgap]" not in message and "from a shell" in message
     assert fake_pypi == []
 
 

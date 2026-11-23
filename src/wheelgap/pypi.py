@@ -56,14 +56,14 @@ def index_url() -> str:
     return (os.environ.get("WHEELGAP_INDEX_URL") or DEFAULT_INDEX).rstrip("/")
 
 
-def check_index_url() -> None:
+def check_index_url(*, simple_index_hint: str = "To use a simple index, pass --index-url instead.") -> None:
     """Fail early, with a hint, for an index URL that can't work (pip's simple-index form)."""
     base = index_url()
     if base.endswith("/simple"):
         host = urlsplit(base).hostname or "the index"
         raise SourceError(
             f"WHEELGAP_INDEX_URL points at a simple index ({host}); wheelgap needs the JSON API, "
-            "e.g. https://pypi.org/pypi. To use a simple index, pass --index-url instead."
+            f"e.g. https://pypi.org/pypi. {simple_index_hint}"
         )
 
 

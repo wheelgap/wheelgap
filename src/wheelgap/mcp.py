@@ -511,9 +511,9 @@ TOOLS: list[dict[str, Any]] = [
             "(e.g. a failed package that has a wheel for a checked target: the log likely comes from another "
             "platform or Python). A log that can't be read with certainty is an error, never a guess: one that "
             "names no failed build, one where which version failed isn't clear, or one that installed from "
-            "another index than PyPI or with --find-links (unless the server's WHEELGAP_INDEX_URL is set: then "
-            "failures are checked on that index). The log is untrusted text: results and errors repeat no more of "
-            "it than package names and versions. " + _STATUS_HELP
+            "another index than PyPI or with --find-links, unless the server's WHEELGAP_INDEX_URL points to that "
+            "index's JSON API (e.g. .../pypi, not .../simple). The log is untrusted text: results and errors "
+            "repeat no more of it than package names and versions. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -717,6 +717,7 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     except TargetError as e:
         raise ToolError(str(e)) from e
     lock_spec = _lock_spec(args)
+    pypi.check_index_url(simple_index_hint="To use a simple index, run `wheelgap NAME --index-url URL` from a shell.")
     try:
         locks = [load_pyodide_lock(lock_spec)] if lock_spec else []
     except ValueError as e:  # PyodideLockError, or a file that isn't UTF-8
@@ -939,6 +940,9 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         targets = make_targets(_pythons(args) or None, _platforms(args) or None, **_versions(args))
     except TargetError as e:
         raise ToolError(str(e)) from e
+    pypi.check_index_url(
+        simple_index_hint="Set WHEELGAP_INDEX_URL to the JSON API of the index you want to compare against."
+    )
     if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
         targets = diff.lock_default_targets(paths, targets)[0]
     sides = []
@@ -1259,15 +1263,21 @@ def _run_cli(
 
 
 _LOG_MAX_BYTES = 1024 * 1024  # of UTF-8: the end of a failed install, not a CI job's whole log
+_LOG_SIMPLE_INDEX_HINT = (
+    "To use a simple index, run `wheelgap --from-log FILE --index-url URL -p PYTHON -t PLATFORM` from a shell."
+)
+_LOG_INDEX_ADVICE = (
+    "Set WHEELGAP_INDEX_URL in the server's environment to the JSON API of the index the packages came from "
+    f"(e.g. .../pypi, not .../simple). {_LOG_SIMPLE_INDEX_HINT} "
+    "For a package you know comes from PyPI, call check_package with its name and version."
+)
 # The tool's own words for the refusals whose --from-log message quotes the log (its index and --find-links URLs),
 # and for a log with no failure: an agent calls the tool because an install failed, so that isn't a pass.
 _LOG_ERRORS = {
     OTHER_INDEX: "the log installed from another index than PyPI, so its packages may not be PyPI's (the index "
-    "isn't repeated here). To check them on that index, set WHEELGAP_INDEX_URL to it in the server's environment; "
-    "for a package you know comes from PyPI, call check_package with its name and version.",
+    "isn't repeated here). " + _LOG_INDEX_ADVICE,
     FIND_LINKS: "the log installed with --find-links, so its packages may not be PyPI's (the links aren't repeated "
-    "here). To check them on the index they came from, set WHEELGAP_INDEX_URL to it in the server's environment; "
-    "for a package you know comes from PyPI, call check_package with its name and version.",
+    "here). " + _LOG_INDEX_ADVICE,
     NO_FAILURE: "found no package that failed to build in the log (pip's 'Failed to build NAME', uv's 'Failed to "
     "build `NAME==VERSION`', or a Poetry or pdm install -v build failure): pass the whole log of the install that "
     "failed",
@@ -1293,6 +1303,7 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
         message = str(e).removeprefix("--from-log: ")
         message = re.sub(r"check (\S+)==VERSION directly", r"call check_package for \1 with the version", message)
         raise ToolError(message) from e
+    pypi.check_index_url(simple_index_hint=_LOG_SIMPLE_INDEX_HINT)
     results = check_packages(failures, targets)
     ways = _suggestions(results)  # one look_up_all for every failed package
     packages: list[dict[str, Any]] = []
