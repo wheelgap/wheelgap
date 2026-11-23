@@ -152,7 +152,10 @@ a variable, say) isn't noticed.
 
 Flags read on the `pip install` line, **after 0.13.0** unless noted: `--no-cache-dir` (also in 0.13.0), `--upgrade` /
 `-U`, `--disable-pip-version-check`, `--root-user-action ignore` or `=ignore` (or `warn`), `--no-input`, `-q` /
-`--quiet`, and:
+`--quiet`, `--no-compile`, `--compile`, `--progress-bar auto` / `on` / `off` / `raw` (or `=off`),
+`--no-warn-script-location`, `--no-color`, `--break-system-packages`, `--retries N`, `--timeout SECONDS` and
+`--default-timeout SECONDS` (or `=N`), `--no-deps` (with `--deps` it is an error, since the line installs no
+dependencies), and:
 
 - `-c FILE` / `--constraint FILE`: the constraints file is followed back through `WORKDIR` and `COPY` like `-r FILE`,
   with the same refusals, and applied to the line's requirements files as a `-c FILE` line at the top of each would
@@ -160,8 +163,9 @@ Flags read on the `pip install` line, **after 0.13.0** unless noted: `--no-cache
 - `--prefer-binary`, only when every requirement the line installs is pinned with `==` (in `FILE`, in the files it
   includes, and in a `-r` inside a `-c` file; a requirement that a constraint pins with `==` counts) and `--deps`
   isn't used: otherwise pip may take an older release that has a wheel over a newer one that has none, while wheelgap
-  checks the newest. Any other `pip install` flag (`--no-deps`, `--pre`, `--index-url`, `--only-binary`, `--user`,
-  `--target`, `-e`, combined short flags such as `-Uq`, `--requirement=FILE`) is still an error.
+  checks the newest. Any other `pip install` flag (`--require-hashes`, `--pre`, `--index-url`, `--only-binary`,
+  `--user`, `--target`, `--ignore-installed`, `-e`, combined short flags such as `-Uq`, `--requirement=FILE`), or a
+  value pip doesn't take (`--progress-bar pretty`), is still an error.
 
 `ENV` and `ARG` settings (**after 0.13.0**; 0.13.0 refuses any `ENV` or `ARG` with `PIP_` or `UV_` in it). These
 don't change which files are picked, and are fine: `PIP_NO_CACHE_DIR`, `PIP_CACHE_DIR`,
@@ -232,9 +236,13 @@ anywhere in the chain is still an error naming the `RUN` line.
 `RUN uv pip install --system -r FILE` is read too (**after 0.13.0**; 0.13.0 refuses it), with the
 `COPY --from=ghcr.io/astral-sh/uv[:TAG] /uv /uvx DEST/` that puts uv in the image (`/uvx` is optional). `FILE` is
 found, and its includes are verified, as for pip. `--system` (or an earlier `ENV UV_SYSTEM_PYTHON=1`) is required,
-since without it uv installs into a virtual environment; `-c FILE` (or `--constraints FILE`), `--no-cache`, `--no-cache-dir`, `--upgrade` / `-U` and `-q` /
-`--quiet` are read, and any other flag is an error, pip's own among them (`--no-input`, `--disable-pip-version-check`,
-`--root-user-action`, `--prefer-binary`). The answer follows uv, not pip: uv checks only the lower bound of a
+since without it uv installs into a virtual environment; `-c FILE` (or `--constraints FILE`), `--no-cache`,
+`--no-cache-dir`, `--upgrade` / `-U`, `-q` / `--quiet`, `--compile-bytecode` (and its alias `--compile`),
+`--no-progress`, `--link-mode clone` / `copy` / `hardlink` / `symlink` (or `=copy`), `--break-system-packages`,
+`--strict` (it only warns after the install), `--no-python-downloads` and `--no-deps` are read, and any other flag is
+an error, pip's own among them (`--no-input`, `--disable-pip-version-check`, `--root-user-action`, `--prefer-binary`,
+`--no-compile`, `--progress-bar`, `--no-warn-script-location`, `--no-color`, `--retries`, `--timeout`). The answer
+follows uv, not pip: uv checks only the lower bound of a
 release's `Requires-Python`, so a pin that pip refuses for an upper bound is checked as uv installs it, and the report
 says which packages that changes (`pip_refuses` in `--json`). For a range the two can pick different versions, and
 wheelgap picks as pip does, so under uv every requirement must be pinned with `==` (in `FILE`, in a file it includes,

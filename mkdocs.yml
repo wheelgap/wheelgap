@@ -73,6 +73,7 @@ nav:
       - CI: ci.md
       - Comparing two lockfiles: diff.md
       - Recipes: recipes.md
+      - Where wheelgap differs from pip and uv: differences.md
   - Case studies:
       - Overview: case-studies/index.md
       - mitmproxy: case-studies/mitmproxy.md

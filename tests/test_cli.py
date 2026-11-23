@@ -410,6 +410,48 @@ def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, t
     assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
 
 
+def test_requirements_hashes_filter_files_by_sha256(capsys, fake_pypi, tmp_path):
+    # 1. only the sdist's hash -> reports source
+    req1 = tmp_path / "req1.txt"
+    req1.write_text("hashpkg==1.0 --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333\n")
+    code, out, _ = run(capsys, str(req1), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "source"
+
+    # 2. the wheel's and the sdist's -> reports wheel (as today)
+    req2 = tmp_path / "req2.txt"
+    req2.write_text(
+        "hashpkg==1.0 \\\n"
+        "    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111 \\\n"
+        "    --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333\n"
+    )
+    code, out, _ = run(capsys, str(req2), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 0 and pkg["results"]["linux-x86_64"] == "wheel"
+
+    # 3. only a Windows wheel's hash, checked on Linux -> reports missing
+    req3 = tmp_path / "req3.txt"
+    req3.write_text("hashpkg==1.0 --hash=sha256:2222222222222222222222222222222222222222222222222222222222222222\n")
+    code, out, _ = run(capsys, str(req3), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "missing"
+
+    # 4. no listed hash matches -> reports unknown with the message
+    req4 = tmp_path / "req4.txt"
+    req4.write_text("hashpkg==1.0 --hash=sha256:9999999999999999999999999999999999999999999999999999999999999999\n")
+    code, out, _ = run(capsys, str(req4), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 1 and pkg["results"]["linux-x86_64"] == "unknown"
+    assert "none of the hashes in req4.txt matches a file of hashpkg 1.0" in pkg["error"]
+
+    # 5. no hashes at all -> reports wheel (unchanged)
+    req5 = tmp_path / "req5.txt"
+    req5.write_text("hashpkg==1.0\n")
+    code, out, _ = run(capsys, str(req5), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    pkg = json.loads(out)["packages"][0]
+    assert code == 0 and pkg["results"]["linux-x86_64"] == "wheel"
+
+
 def test_requirement_line_option_pip_ignores_is_a_note(capsys, fake_pypi, tmp_path):
     # xai-org/grok-1's requirements.txt has `jax[cuda12-pip]==0.4.25 -f https://...`: pip 26.3 ignores the -f there
     # and installs the requirement from PyPI, so wheelgap checks it on PyPI and says it left the option out.
@@ -6011,3 +6053,15 @@ def test_uv_ignores_python_rejection_when_lower_bound_allows(requires, python, i
     from wheelgap.sources import uv_ignores_python_rejection
 
     assert uv_ignores_python_rejection(requires, python) is ignores
+
+
+def test_requirements_file_conflicting_with_constraint_fails_without_lookup(capsys, tmp_path, fake_pypi):
+    req = tmp_path / "requirements.txt"
+    req.write_text("-c cons.txt\nidna==3.6\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("idna==3.7\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 1
+    assert "unknown" in out
+    expected = "could not check idna: requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)"
+    assert expected in out
+    assert fake_pypi == []

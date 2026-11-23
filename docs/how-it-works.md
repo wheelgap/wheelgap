@@ -5,6 +5,8 @@ same question pip and uv ask: is there a wheel whose tags this target accepts? I
 with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set the target accepts, the
 same logic pip and uv use to pick a wheel. If there's no such wheel, an sdist means a source build (`source`), and no
 sdist means the install fails (`missing`). Where wheelgap can't be sure, it says `unknown` rather than guess.
+For the known cases where wheelgap's answer can differ from pip's and uv's, see
+[Where wheelgap differs from pip and uv](differences.md).
 
 ## Where the file lists come from
 

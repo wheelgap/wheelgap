@@ -890,6 +890,7 @@ def render_explain(
                 align=True,
                 no_binary=r.package.no_binary,
                 only_binary=r.package.only_binary,
+                hash_rejected=r.package.hash_rejected,
             )
             out += [f"  {line}" for line in lines]
             if ask:
@@ -1051,6 +1052,7 @@ def report_json(
                         r.package.requires_python_rejected,
                         no_binary=r.package.no_binary,
                         only_binary=r.package.only_binary,
+                        hash_rejected=r.package.hash_rejected,
                     )
                 ]
                 for t in gap_targets(r, targets)

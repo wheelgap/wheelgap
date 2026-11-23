@@ -925,9 +925,14 @@ def _supports_python(entry: dict, python: str | None, key: str = "requires_pytho
 
 
 def _newest_matching(
-    data: dict, spec: str, python: str | None = None, exclude_newer: datetime | None = None
+    data: dict,
+    spec: str,
+    python: str | None = None,
+    exclude_newer: datetime | None = None,
+    hashes: frozenset[str] = frozenset(),
 ) -> tuple[str, list[dict]] | None:
-    """The newest matching release with non-yanked files supporting `python`, when supplied."""
+    """The newest matching release with non-yanked files supporting `python`, when supplied. With a requirement's
+    `hashes`, the newest such release that has a file with a listed sha256, if any release has one."""
     releases = data.get("releases")
     if not isinstance(releases, dict):
         # A mirror without the (deprecated) release list: fall back to the latest, if it matches.
@@ -955,6 +960,11 @@ def _newest_matching(
         live = [e for e in before_cutoff(files, exclude_newer) if not e.get("yanked") and _supports_python(e, python)]
         if live:
             usable[version] = (text, live)
+    if hashes and any(_sha256(e) in hashes for _, live in usable.values() for e in live):
+        # pip filters the files of every release the range allows by --hash before it picks one, and ranks a file
+        # with a listed hash first (filter_unallowed_hashes and _sort_key in pip/_internal/index/package_finder.py):
+        # pip 26.3 installs demo 1.0 for `demo>=0.5 --hash=sha256:<1.0's wheel>` with demo 2.0 on the index.
+        usable = {v: (t, live) for v, (t, live) in usable.items() if any(_sha256(e) in hashes for e in live)}
     chosen = max(constraint.filter(usable), default=None)
     return usable[chosen] if chosen is not None else None
 
@@ -1038,6 +1048,8 @@ def fill(
     # Only a pinned release is cached: the latest release, or a range's pick, can change at any upload.
     key = (base, pkg.key, pkg.version) if pkg.version else None
     cached = cache.load_files(*key) if key and read_cache and pkg.exclude_newer is None else None
+    if pkg.hashes and cached and any(_sha256(f) is None for f in cached):
+        cached = None  # saved before file hashes were kept (or the index gives none): ask again
     if key and read_cache and cached is not None:
         pkg.project_urls, pkg.home_page = cache.load_project_urls(*key)
     try:
@@ -1095,6 +1107,37 @@ def previous_release(name: str, version: str) -> tuple[str, list[tuple[str, str 
     return text, live
 
 
+def _sha256(entry: dict) -> str | None:
+    """A JSON API file entry's sha256 (`digests.sha256`, lowercased), or None where the index gives none."""
+    digests = entry.get("digests")
+    sha256 = digests.get("sha256") if isinstance(digests, dict) else None
+    return sha256.lower() if isinstance(sha256, str) else None
+
+
+def _filter_hashes(pkg: Package, urls: list[dict]) -> list[dict] | None:
+    """The files a requirement's `--hash` options let pip install, as pip's filter_unallowed_hashes picks them: when
+    some file's sha256 is listed, those files and any the index gives no sha256 for (pip checks those after the
+    download). When none is listed and the index gave every file's sha256, pip downloads its pick and refuses its
+    hash: sets pkg.error and returns None. When none is listed but some file has no sha256, wheelgap can't tell which
+    one pip would accept, so it keeps them all, as without --hash."""
+    if not pkg.hashes:
+        return urls
+    origin = pkg.origin or "requirements.txt"
+    if not any(_sha256(u) in pkg.hashes for u in urls):
+        if urls and all(_sha256(u) is not None for u in urls):
+            pkg.error = f"none of the hashes in {origin} matches a file of {pkg.name} {pkg.version}"
+            return None
+        return urls
+    allowed = [u for u in urls if (sha256 := _sha256(u)) is None or sha256 in pkg.hashes]
+    kept = {id(u) for u in allowed}
+    pkg.hash_rejected = {
+        u["filename"]: f"its hash isn't listed in {origin}"
+        for u in urls
+        if id(u) not in kept and u["filename"].endswith(".whl")
+    }
+    return allowed
+
+
 def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> Package:
     pinned = bool(pkg.version)
     try:
@@ -1110,9 +1153,9 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                 pkg.project_urls = {"Homepage": info["home_page"]}
             if isinstance(info.get("home_page"), str):
                 pkg.home_page = info["home_page"]
-        if not pinned and (pkg.spec or pkg.exclude_newer):
+        if not pinned and (pkg.spec or pkg.exclude_newer or pkg.hashes):
             # A range (numpy>=1.26,<2): check the release an installer would pick, not the latest.
-            found = _newest_matching(data, pkg.spec or "", python, pkg.exclude_newer)
+            found = _newest_matching(data, pkg.spec or "", python, pkg.exclude_newer, pkg.hashes)
             if found is None:
                 pkg.error = (
                     (f"no release matches {pkg.spec}" if pkg.spec else "no release")
@@ -1122,6 +1165,11 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                 return pkg
             pkg.version, urls = found
             pkg.version_from_index = True
+            filtered = _filter_hashes(pkg, urls)
+            if filtered is None:
+                pkg.found_on_pypi = base == DEFAULT_INDEX
+                return pkg
+            urls = filtered
             names = [u["filename"] for u in urls if not u.get("yanked")]
             pkg.files = names
         elif pinned:
@@ -1133,6 +1181,11 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                     "so uv won't install it"
                 )
                 return pkg
+            filtered = _filter_hashes(pkg, urls)
+            if filtered is None:
+                pkg.found_on_pypi = base == DEFAULT_INDEX
+                return pkg
+            urls = filtered
             live = [u for u in urls if _supports_python(u, python)]
             rejected = [u for u in urls if not _supports_python(u, python)]
             pkg.files = [u["filename"] for u in live]
@@ -1144,6 +1197,11 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
             info = data.get("info")
             pkg.version = info.get("version") if isinstance(info, dict) else None
             pkg.version_from_index = True
+            filtered = _filter_hashes(pkg, urls)
+            if filtered is None:
+                pkg.found_on_pypi = base == DEFAULT_INDEX
+                return pkg
+            urls = filtered
             names = [u["filename"] for u in urls if not u.get("yanked")]
             pkg.files = names
         pkg.found_on_pypi = base == DEFAULT_INDEX

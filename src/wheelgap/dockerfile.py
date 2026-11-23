@@ -1570,7 +1570,9 @@ def _check_includes(
 
 
 # `pip install` flags that don't change which files pip picks: read and ignored. Spelled out in full only, since pip
-# also takes any unambiguous prefix of a long option and wheelgap doesn't guess at those.
+# also takes any unambiguous prefix of a long option and wheelgap doesn't guess at those. --no-deps is read apart
+# from these (_Install.no_deps), since with --deps it does change the answer.
+# https://pip.pypa.io/en/stable/cli/pip_install/ and https://pip.pypa.io/en/stable/cli/pip/ (pip 26.3).
 _PIP_HARMLESS_FLAGS = (
     "--no-cache-dir",
     "--upgrade",
@@ -1579,19 +1581,79 @@ _PIP_HARMLESS_FLAGS = (
     "--no-input",
     "-q",
     "--quiet",
+    "--no-compile",
+    "--compile",
+    "--no-warn-script-location",
+    "--no-color",
+    "--break-system-packages",
 )
+# The same, for flags that take a value: the values pip takes for each (pip exits on any other), as `--flag VALUE` or
+# `--flag=VALUE`. pip 26.3's cli/cmdoptions.py: --root-user-action and --progress-bar are choices, --retries an int,
+# --timeout (also spelled --default-timeout) a float. A value outside these is refused, never read as a requirement.
 _PIP_ROOT_USER_ACTIONS = ("warn", "ignore")  # pip's choices for --root-user-action; it exits on any other value
+_PIP_VALUE_FLAGS = {
+    "--root-user-action": "|".join(_PIP_ROOT_USER_ACTIONS),
+    "--progress-bar": "auto|on|off|raw",
+    "--retries": r"0|[1-9][0-9]*",
+    "--timeout": r"[0-9]+(?:\.[0-9]*)?",
+    "--default-timeout": r"[0-9]+(?:\.[0-9]*)?",
+}
+# Of those, the ones pip also takes before the subcommand (`pip --no-cache-dir install`): its general options. An
+# install option there (`pip -U install`, `pip --compile install`) makes pip exit with "no such option".
+_PIP_GLOBAL_FLAGS = ("--no-cache-dir", "--disable-pip-version-check", "--no-input", "-q", "--quiet", "--no-color")
 _PIP_FLAGS_READ = (
     "-r FILE, -c FILE, --no-cache-dir, --upgrade (-U), --disable-pip-version-check, --root-user-action, --no-input, "
-    "--quiet (-q) and, with pinned requirements, --prefer-binary"
+    "--quiet (-q), --no-compile, --compile, --progress-bar, --no-warn-script-location, --no-color, "
+    "--break-system-packages, --retries, --timeout, --default-timeout, --no-deps and, "
+    "with pinned requirements, --prefer-binary"
 )
 
 
-# `uv pip install` flags that are read. uv has its own flags: of pip's harmless ones above it takes --upgrade (-U) and
-# --quiet (-q) with the same meaning, it has no --no-input, --root-user-action or --prefer-binary, and it takes
-# --disable-pip-version-check only to warn that it does nothing (`uv pip install --help`, uv 0.13.1).
-_UV_HARMLESS_FLAGS = ("--no-cache", "--no-cache-dir", "--upgrade", "-U", "-q", "--quiet")
-_UV_FLAGS_READ = "--system, -r FILE, -c FILE, --no-cache, --no-cache-dir, --upgrade (-U) and --quiet (-q)"
+# `uv pip install` flags that are read. uv has its own flags: of pip's harmless ones above it takes --upgrade (-U),
+# --quiet (-q), --compile and --break-system-packages with the same meaning, it has no --no-input, --root-user-action
+# or --prefer-binary, and it takes --disable-pip-version-check only to warn that it does nothing (`uv pip install
+# --help`, uv 0.13.1; --compile is a hidden alias of --compile-bytecode). --strict only checks the environment after
+# the install and warns (exit 0), and --no-python-downloads doesn't change the Python --system finds.
+# https://docs.astral.sh/uv/reference/cli/#uv-pip-install
+_UV_HARMLESS_FLAGS = (
+    "--no-cache",
+    "--no-cache-dir",
+    "--upgrade",
+    "-U",
+    "-q",
+    "--quiet",
+    "--compile-bytecode",
+    "--compile",
+    "--no-progress",
+    "--break-system-packages",
+    "--strict",
+    "--no-python-downloads",
+)
+# uv's global options among them, which it also takes between `pip` and `install`; uv 0.13.1 exits on the others
+# there (`uv pip --compile-bytecode install`: "unexpected argument").
+_UV_GLOBAL_FLAGS = ("--no-cache", "--no-cache-dir", "-q", "--quiet", "--no-progress", "--no-python-downloads")
+_UV_VALUE_FLAGS = {"--link-mode": "clone|copy|hardlink|symlink"}  # uv's possible values; it exits on any other
+_UV_FLAGS_READ = (
+    "--system, -r FILE, -c FILE, --no-cache, --no-cache-dir, --upgrade (-U), --quiet (-q), "
+    "--compile-bytecode (--compile), --no-progress, --link-mode, --break-system-packages, --strict, "
+    "--no-python-downloads and --no-deps"
+)
+
+
+def _read_flag_words(rest: list[str], i: int, uv: bool) -> int:
+    """How many words from `rest[i]` on are a flag that is read and ignored, with its value: 0 when `rest[i]` isn't
+    one, or its value isn't one the installer takes (the installer exits then, and wheelgap refuses the line)."""
+    if rest[i] in (_UV_HARMLESS_FLAGS if uv else _PIP_HARMLESS_FLAGS):
+        return 1
+    values = _UV_VALUE_FLAGS if uv else _PIP_VALUE_FLAGS
+    option, equals, value = rest[i].partition("=")
+    if option not in values:
+        return 0
+    if equals:
+        return 1 if re.fullmatch(values[option], value) else 0
+    return 2 if i + 1 < len(rest) and re.fullmatch(values[option], rest[i + 1]) else 0
+
+
 _UV_REQUIREMENTS_SUFFIXES = (".txt", ".in")
 
 
@@ -2124,6 +2186,7 @@ class _Install:
     globs: tuple[str, ...] = ()  # unquoted `name[extra]` words, which the shell expands if a file in cwd matches
     module: bool = False  # `python -m pip`, which imports from the working folder first
     created: int = 0  # how many of the reader's `created` come before it
+    no_deps: bool = False
 
 
 def _requirement_name(text: str) -> str | None:
@@ -2722,7 +2785,7 @@ class _RunReader:
     def _pip(self, number, args, uv, uv_system, shown, stop):  # type: ignore[no-untyped-def]
         """`pip ARGS` or `uv pip ARGS`."""
         tool = "uv pip" if uv else "pip"
-        while args and args[0].text in (_UV_HARMLESS_FLAGS if uv else _PIP_HARMLESS_FLAGS):
+        while args and args[0].text in (_UV_GLOBAL_FLAGS if uv else _PIP_GLOBAL_FLAGS):
             args = args[1:]  # before the subcommand, as in `pip --no-cache-dir install`
         if not args:
             return "shell", ""
@@ -2756,17 +2819,28 @@ class _RunReader:
                 "the Dockerfile, a command substitution or a glob)"
             )
         rest = [word.text for word in args]
-        # Only installer tools, and no file: the installer's own set-up.
-        flags = _UV_HARMLESS_FLAGS + ("--system",) if uv else _PIP_HARMLESS_FLAGS + ("--prefer-binary",)
-        named = [text for text in rest[1:] if text not in flags and not text.startswith("--root-user-action")]
+        # Only installer tools, and no file: the installer's own set-up. A flag's value (`--progress-bar off`) isn't a
+        # name, and a value the installer doesn't take leaves the flag among the names, for _pip_install_files to
+        # refuse.
+        named: list[str] = []
+        i = 1
+        while i < len(rest):
+            if width := _read_flag_words(rest, i, uv):
+                i += width
+                continue
+            if rest[i] not in (("--system", "--no-deps") if uv else ("--prefer-binary", "--no-deps")):
+                named.append(rest[i])
+            i += 1
         tools = [_requirement_name(text) for text in named]
         if named and all(tool_name in _INSTALLER_TOOLS for tool_name in tools):
             if any(tool_name == "pip" and _not_newest(text) for tool_name, text in zip(tools, named, strict=True)):
                 # A pip other than the newest may pick other files (older pips don't know newer manylinux tags).
                 return "warning", f"`{shown}`, which installs a pip version wheelgap doesn't answer for"
             return "installer-tools", " ".join(dict.fromkeys(tools))
-        files, constraints, prefer_binary, names = _pip_install_files(number, rest, uv, uv_system)
-        return "install", _Install(uv, files, constraints, prefer_binary, names, None, None, globs=globs)
+        files, constraints, prefer_binary, names, no_deps = _pip_install_files(number, rest, uv, uv_system)
+        return "install", _Install(
+            uv, files, constraints, prefer_binary, names, None, None, globs=globs, no_deps=no_deps
+        )
 
 
 def _env_pairs(
@@ -2908,10 +2982,11 @@ def _command_line_requirement(number: int, tool: str, text: str) -> str:
 
 def _pip_install_files(
     number: int, rest: list[str], uv: bool, uv_system: bool
-) -> tuple[list[str], list[str], bool, list[str]]:
-    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given, the requirements named on the line) of the
-    words of a `pip install ...` or `uv pip install ...` command, from `install` on, with flags that don't change
-    what the installer picks. `uv_system` says UV_SYSTEM_PYTHON is set, which uv reads as --system."""
+) -> tuple[list[str], list[str], bool, list[str], bool]:
+    """(the -r FILEs, the -c FILEs, whether --prefer-binary is given, the requirements named on the line, whether
+    --no-deps is given) of the words of a `pip install ...` or `uv pip install ...` command, from `install` on,
+    with flags that don't change what the installer picks. `uv_system` says UV_SYSTEM_PYTHON is set, which uv
+    reads as --system."""
     tool = "uv pip" if uv else "pip"
     for word in rest[1:]:
         option = word.split("=", 1)[0]
@@ -2933,6 +3008,7 @@ def _pip_install_files(
     files: list[str] = []
     constraints: list[str] = []
     prefer_binary = False
+    no_deps = False
     system = uv_system
     i = 1
     while i < len(rest):
@@ -2949,8 +3025,11 @@ def _pip_install_files(
             elif rest[i] == "--system":
                 system = True
                 i += 1
-            elif rest[i] in _UV_HARMLESS_FLAGS:
+            elif rest[i] == "--no-deps":
+                no_deps = True
                 i += 1
+            elif width := _read_flag_words(rest, i, uv):
+                i += width
             else:
                 names.append(_command_line_requirement(number, tool, rest[i]))
                 i += 1
@@ -2960,12 +3039,11 @@ def _pip_install_files(
         elif rest[i] in ("-c", "--constraint") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
             constraints.append(rest[i + 1])
             i += 2
-        elif rest[i] in _PIP_HARMLESS_FLAGS:
+        elif rest[i] == "--no-deps":
+            no_deps = True
             i += 1
-        elif rest[i].startswith("--root-user-action=") and rest[i].partition("=")[2] in _PIP_ROOT_USER_ACTIONS:
-            i += 1
-        elif rest[i] == "--root-user-action" and rest[i + 1 : i + 2] and rest[i + 1] in _PIP_ROOT_USER_ACTIONS:
-            i += 2
+        elif width := _read_flag_words(rest, i, uv):
+            i += width
         elif rest[i] == "--prefer-binary":
             prefer_binary = True
             i += 1
@@ -2994,7 +3072,7 @@ def _pip_install_files(
                     f"line {number}: uv pip install {option} {other}: uv reads a file by its name (a lock, a script, "
                     "a project), and --dockerfile-inputs only reads requirements files named *.txt or *.in for uv"
                 )
-    return files, constraints, prefer_binary, names
+    return files, constraints, prefer_binary, names, no_deps
 
 
 def dockerfile_requirements(
@@ -3247,6 +3325,12 @@ def _dockerfile_requirements(
             raise DockerfileError(run_error)
         if reader.config_error:
             raise DockerfileError(reader.config_error)
+        if install.no_deps and dependencies:
+            tool = "uv pip" if install.uv else "pip"
+            raise DockerfileError(
+                f"line {number}: {tool} install --no-deps installs no dependencies, and --deps would check "
+                "them: drop --deps"
+            )
         if install.unseen:
             # A line wheelgap can't see into may change what this install fetches (a requirements file, a pip config
             # file, PIP_ settings) or the pip and Python it runs: no answer is given. One after the last install

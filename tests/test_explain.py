@@ -203,3 +203,29 @@ def test_yanked_wheel_counts_when_nothing_else_fits():
     wheel = "y-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"
     assert explain([wheel], target(), frozenset({wheel})) == []
     assert explain([wheel, "y-1.0.tar.gz"], target(), frozenset({wheel})) == [(wheel, "yanked")]
+
+
+def test_explain_names_hash_rejected_wheel():
+    wheel = "hashpkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"
+    reasons = explain(
+        ["hashpkg-1.0.tar.gz"],
+        target(plat="linux-x86_64"),
+        hash_rejected={wheel: "its hash isn't listed in requirements.txt"},
+    )
+    assert reasons == [(wheel, "its hash isn't listed in requirements.txt")]
+
+
+def test_cli_explain_names_hash_rejected_wheel(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    # hashpkg 1.0 has manylinux wheel and sdist; only the sdist's hash is listed
+    req.write_text("hashpkg==1.0 --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333\n")
+    main([str(req), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--exit-zero"])
+    out = capsys.readouterr().out
+    assert "hashpkg 1.0 on linux-x86_64: ● source" in out
+    assert "hashpkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl  its hash isn't listed in requirements.txt" in out
+    main([str(req), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--exit-zero", "--json"])
+    pkg = json.loads(capsys.readouterr().out)["packages"][0]
+    assert pkg["rejected"]["linux-x86_64"][0] == {
+        "file": "hashpkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+        "reason": "its hash isn't listed in requirements.txt",
+    }

@@ -23,7 +23,6 @@ from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
     canonicalize_name,
-    canonicalize_version,
     parse_sdist_filename,
     parse_wheel_filename,
 )
@@ -101,6 +100,11 @@ class Package:
     python_rejected_yanked: frozenset[str] = frozenset()
     # Files admitted by uv that pip would refuse for this Python.
     pip_refuses: dict[str, str] = field(default_factory=dict)
+    # sha256 hashes listed on the requirement line in a requirements file (--hash=sha256:... or --hash sha256:...).
+    # If not empty, only files whose sha256 matches one of these are accepted.
+    hashes: frozenset[str] = frozenset()
+    # Files of a pinned release whose sha256 hash was not listed in requirements, mapped to their --explain reason.
+    hash_rejected: dict[str, str] = field(default_factory=dict)
     # Distribution selection policy from requirements files or uv project configuration.
     no_binary: bool = False
     only_binary: bool = False
@@ -1918,17 +1922,17 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
         pkg.exclude_newer = source.cutoff_for(pkg.key)
 
 
-def requirement_to_package(text: str, origin: str) -> Package:
+def requirement_to_package(text: str, origin: str, hashes: frozenset[str] = frozenset()) -> Package:
     try:
         req = Requirement(text)
     except InvalidRequirement as e:
         raise SourceError(f"{origin}: can't parse requirement {text!r}: {e}") from None
     markers = [str(req.marker)] if req.marker else None
     if req.url:
-        return Package(req.name, None, skip="url", origin=origin, markers=markers)
+        return Package(req.name, None, skip="url", origin=origin, markers=markers, hashes=hashes)
     version = _pinned_version(req)
     spec = str(req.specifier) if req.specifier and version is None else None
-    return Package(req.name, version, origin=origin, markers=markers, spec=spec)
+    return Package(req.name, version, origin=origin, markers=markers, spec=spec, hashes=hashes)
 
 
 # "name @ url", "name@url" and "name[extra] @ url": PEP 508 direct references, which Requirement parses.
@@ -2167,18 +2171,66 @@ def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
     return True
 
 
-def _exact_pins(entries: list[Package]) -> dict[str, str]:
-    """The constraints' exact versions: 1.9 and 1.9.0 are one version, and reversed() keeps the first spelling."""
-    return {canonicalize_version(e.version): e.version for e in reversed(entries) if e.version}
+def _pin_specifier(version: str) -> str:
+    """The specifier of an exact pin: `==`, or `===` for a version PEP 440 can't read (which only `===` can pin)."""
+    try:
+        Version(version)
+    except InvalidVersion:
+        return f"==={version}"
+    return f"=={version}"
+
+
+def _specifier(entry: Package) -> str | None:
+    """What a requirement or constraint asks of the version, or None for a bare name, which asks nothing."""
+    return _pin_specifier(entry.version) if entry.version else entry.spec
+
+
+def _allows(version: str, specifiers: list[str]) -> bool:
+    """Whether pip takes `version` under all these specifiers at once, as it combines a requirement's with its
+    constraints': a pre-release counts (a pin names it), and `==1.0` takes `1.0+cpu`, as PEP 440's matching does."""
+    return all(SpecifierSet(specifier).contains(version, prereleases=True) for specifier in specifiers)
 
 
 def _constraint_error(entries: list[Package]) -> str | None:
     """Why these constraints on one package can't be applied as an index version or range, if they can't."""
     if any(entry.skip for entry in entries):
         return "constraint isn't an index version or range"
-    if len(_exact_pins(entries)) > 1:
+    # 1.9 and 1.9.0 are one version, and 1.0 with 1.0+cpu is 1.0+cpu (pip installs it): pins conflict only when no
+    # one of them matches them all.
+    pins = [entry.version for entry in entries if entry.version]
+    if pins and not any(_allows(pin, [_pin_specifier(other) for other in pins]) for pin in pins):
         return "constraints specify conflicting exact versions"
     return None
+
+
+def _constraint_conflict(pkg: Package, entries: list[Package]) -> str | None:
+    """Apply a requirement's unmarked constraints to it as pip does, or say why pip refuses them. A pin keeps its
+    version, or takes a constraint's local version that matches it (`==1.0` with `==1.0+cpu`); an exact constraint
+    becomes the version of an unpinned or ranged requirement; ranges are intersected, and a range that no release
+    matches is reported when the index is asked."""
+    specifiers = [specifier for entry in entries if (specifier := _specifier(entry))]
+    pins = [entry.version for entry in entries if entry.version]
+    own = _specifier(pkg)
+    if not pkg.version and not pins:
+        spec = SpecifierSet(pkg.spec or "")
+        for specifier in specifiers:
+            spec &= SpecifierSet(specifier)
+        pkg.spec = str(spec) or None
+        return None
+    candidates = ([pkg.version] if pkg.version else []) + pins
+    chosen = next((v for v in candidates if _allows(v, specifiers + ([own] if own else []))), None)
+    if chosen is not None:
+        pkg.version, pkg.spec = chosen, None
+        return None
+    # Name a constraint that the requirement's pin, or else the constraints' pin, falls outside.
+    shown = pkg.version or pins[0]
+    if own and not pkg.version and not _allows(shown, [own]):
+        blamed = next(entry for entry in entries if entry.version)
+        return f"requirement {pkg.name}{own} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
+    rejecting = [entry for entry in entries if (s := _specifier(entry)) and not _allows(shown, [s])]
+    blamed = next((entry for entry in rejecting if not entry.version), rejecting[0])
+    first = f"requirement {pkg.name}{own}" if pkg.version else f"the constraint {pkg.name}=={shown}"
+    return f"{first} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
 
 
 def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> Source:
@@ -2241,22 +2293,24 @@ def _finalize_requirements(
     marker_constraint_specs: dict[str, list[tuple[str, str]]] = {}
     constraint_errors: dict[str, str] = {}
     for pkg in pkgs:
-        if pkg.skip or pkg.version or not (entries := by_name.get(pkg.key)):
+        if pkg.skip or not (entries := by_name.get(pkg.key)):
             continue
         # --deps applies a marked constraint per target (resolve_deps), so only the unmarked ones can break it here.
-        if unmarked_error := _constraint_error([entry for entry in entries if not entry.markers]):
+        unmarked = [entry for entry in entries if not entry.markers]
+        if unmarked_error := _constraint_error(unmarked):
             constraint_errors[pkg.key] = unmarked_error
-        if any(entry.markers for entry in entries):
+        # A marked constraint that a pinned requirement already meets changes nothing, true or false; any other
+        # depends on the target.
+        if any(
+            entry.markers
+            and not (pkg.version and ((specifier := _specifier(entry)) is None or _allows(pkg.version, [specifier])))
+            for entry in entries
+        ):
             pkg.error = "constraint has an environment marker; target-dependent constraints aren't supported"
         elif unmarked_error:
             pkg.error = unmarked_error
-        elif pins := _exact_pins(entries):
-            pkg.version, pkg.spec = next(iter(pins.values())), None
-        else:
-            spec = SpecifierSet(pkg.spec or "")
-            for entry in entries:
-                spec &= SpecifierSet(entry.spec or "")
-            pkg.spec = str(spec) or None
+        elif conflict := _constraint_conflict(pkg, unmarked):
+            pkg.error = f"{conflict} (pip refuses this)"
     # A constraint on a package the file doesn't require only ever counts as a transitive dep's specifier,
     # which --deps sees; a constraint the file already called out as broken is left to constraint_errors.
     deps_blockers: list[str] = []
@@ -2361,13 +2415,15 @@ _LONG_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for nam
 _SHORT_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for name in entry[0] if len(name) == 2}
 
 
-def _requirement_options(text: str, where: str) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]]]:
+def _requirement_options(
+    text: str, where: str
+) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str]]:
     """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
     by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash, each --no-binary or
-    --only-binary as (long name, value) in order, for the install's format control, and what pip ignores there, for
+    --only-binary as (long name, value) in order, for the install's format control, what pip ignores there, for
     a note: each option as
     (the name it was written with, its long name), and words that aren't options, which optparse sets aside, as one
-    entry. SourceError where pip refuses
+    entry, and the frozenset of sha256 digests from --hash options. SourceError where pip refuses
     the line, or where it applies an option that wheelgap doesn't read."""
     try:
         tokens = shlex.split(text)
@@ -2377,6 +2433,7 @@ def _requirement_options(text: str, where: str) -> tuple[bool, list[tuple[str, s
     hashed = False
     formats: list[tuple[str, str]] = []
     ignored: list[tuple[str, str]] = []
+    sha256_hashes: set[str] = set()
     k = 0
     while k < len(tokens):
         token = tokens[k]
@@ -2418,12 +2475,17 @@ def _requirement_options(text: str, where: str) -> tuple[bool, list[tuple[str, s
         # The checks pip's parser callbacks make (the first is a CommandError, the others optparse errors).
         if kind == "format" and given_value.startswith("-"):
             raise SourceError(f"{refused} --no-binary / --only-binary option requires 1 argument.")
-        if kind == "hash" and ":" not in given_value:
-            raise SourceError(
-                f"{refused} Arguments to --hash must be a hash name followed by a value, like --hash=sha256:abcde..."
-            )
-        if kind == "hash" and given_value.split(":", 1)[0] not in ("sha256", "sha384", "sha512"):
-            raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
+        if kind == "hash":
+            if ":" not in given_value:
+                raise SourceError(
+                    f"{refused} Arguments to --hash must be a hash name followed by a value, "
+                    "like --hash=sha256:abcde..."
+                )
+            algo, _, digest = given_value.partition(":")
+            if algo not in ("sha256", "sha384", "sha512"):
+                raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
+            if algo == "sha256":
+                sha256_hashes.add(digest.lower())
         if kind == "requirement" and "=" not in given_value:
             raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
         if kind == "feature" and value not in _USE_FEATURE_CHOICES:
@@ -2443,7 +2505,7 @@ def _requirement_options(text: str, where: str) -> tuple[bool, list[tuple[str, s
         hashed = hashed or kind == "hash"
         if kind == "format" and given_value:
             formats.append((name, given_value))  # the value pip's callback reads, never a word after another option
-    return hashed, formats, ignored
+    return hashed, formats, ignored, frozenset(sha256_hashes)
 
 
 def _read_requirements(
@@ -2590,9 +2652,10 @@ def _read_requirements(
             first_option = next((k for k, word in enumerate(words) if word.startswith("-")), len(words))
             options = " ".join(word for word in words[first_option:] if word)
             hashed = False
+            req_hashes: frozenset[str] = frozenset()
             if options:
                 where = _shown(path, stack) + (f":{number}" if number is not None else "")
-                hashed, formats, ignored = _requirement_options(options, where)
+                hashed, formats, ignored, req_hashes = _requirement_options(options, where)
                 if ignored_options is not None:
                     for shown, option in ignored:
                         note = f"{where}: pip ignores {shown} after a requirement"
@@ -2609,16 +2672,16 @@ def _read_requirements(
                 compiler_signs.append("hash")
             line = " ".join(words[:first_option]).strip()
             if line.startswith((".", "/")):
-                append(Package(line, None, skip="path", origin=path.name))
+                append(Package(line, None, skip="path", origin=path.name, hashes=req_hashes))
                 continue
             if "://" in line and not _NAMED_URL_RE.match(line):
                 # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
                 # "name @ url" lines are left to Requirement, which knows the name and markers.
                 egg = _EGG_RE.search(line)
                 name = egg.group(1) if egg else line.split(";", 1)[0].strip()
-                append(Package(name, None, skip="url", origin=path.name))
+                append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
                 continue
-            append(requirement_to_package(line, path.name))
+            append(requirement_to_package(line, path.name, hashes=req_hashes))
             if req_lines is not None and not constraint:
                 req_lines.append(line)
     finally:

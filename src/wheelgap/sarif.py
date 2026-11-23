@@ -155,6 +155,7 @@ def sarif_log(
                 limit=REASON_LINES,
                 no_binary=pkg.no_binary,
                 only_binary=pkg.only_binary,
+                hash_rejected=pkg.hash_rejected,
             )
             hint = via_hint(row, target)
             text = f"{name}{hint} {WORDS[status]} {label}" + (" (advisory)" if target in advisory else "") + "."

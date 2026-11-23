@@ -1744,6 +1744,23 @@ def test_cli_dockerfile_inputs_includes_leave_out_a_constraints_files_own_includ
         "--quiet",
         "--prefer-binary",
         "-U -q --no-input --no-cache-dir --root-user-action=ignore",
+        "--no-compile",
+        "--compile",
+        "--progress-bar off",
+        "--progress-bar=off",
+        "--progress-bar raw",
+        "--no-warn-script-location",
+        "--no-color",
+        "--break-system-packages",
+        "--retries 5",
+        "--retries=5",
+        "--retries 0",
+        "--timeout 60",
+        "--timeout=60",
+        "--timeout 7.5",
+        "--default-timeout 100",
+        "--default-timeout=100",
+        "--no-deps",
     ],
 )
 def test_dockerfile_requirements_pip_install_flags(tmp_path, flags):
@@ -1756,7 +1773,6 @@ def test_dockerfile_requirements_pip_install_flags(tmp_path, flags):
 @pytest.mark.parametrize(
     "setting",
     [
-        "--no-deps",
         "--index-url https://example.org",
         "--only-binary :all:",
         "--prefer-binary",  # the file below isn't pinned
@@ -1778,6 +1794,42 @@ def test_dockerfile_requirements_pip_install_flags(tmp_path, flags):
         "--root-user-action=never",
         "--root-user-action never",
         "--root-user-action",
+        # Flags that change resolution or target, or need their own reading
+        "--require-hashes",
+        "--no-binary :all:",
+        "--prerelease allow",
+        "--resolution lowest",
+        "--prefix /opt",
+        "--python /usr/bin/python",
+        "--ignore-installed",
+        "--force-reinstall",
+        "--reinstall",
+        "--no-build-isolation",
+        "--platform manylinux_2_17_x86_64",
+        "--python-version 3.12",
+        # uv-only flags on a pip line
+        "--compile-bytecode",
+        "--no-progress",
+        "--link-mode copy",
+        "--strict",
+        "--no-python-downloads",
+        # Value-taking flags with missing or empty value
+        "--progress-bar",
+        "--progress-bar=",
+        "--retries",
+        "--retries=",
+        "--timeout",
+        "--timeout=",
+        "--default-timeout",
+        "--default-timeout=",
+        # A value pip doesn't take: pip exits (cli/cmdoptions.py, pip 26.3), and a requirement isn't taken for one.
+        "--progress-bar pretty",
+        "--progress-bar=ascii",
+        "--retries x",
+        "--retries=-1",
+        "--timeout six",
+        "--default-timeout=never",
+        "--root-user-action -U",
     ],
 )
 def test_dockerfile_requirements_refuses_install_flags_that_can_change_resolution(tmp_path, setting):
@@ -1793,12 +1845,12 @@ def test_dockerfile_requirements_refuses_install_flags_that_can_change_resolutio
 
 
 def test_dockerfile_requirements_refused_flag_message_lists_what_is_read(tmp_path):
-    path = _context(
-        tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install --no-deps -r requirements.txt\n"
-    )
+    path = _context(tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install --pre -r requirements.txt\n")
     message = (
-        ":4: pip install --no-deps: --dockerfile-inputs only reads -r FILE, -c FILE, --no-cache-dir, "
-        r"--upgrade \(-U\), --disable-pip-version-check, --root-user-action, --no-input, --quiet \(-q\) and, "
+        ":4: pip install --pre: --dockerfile-inputs only reads -r FILE, -c FILE, --no-cache-dir, "
+        r"--upgrade \(-U\), --disable-pip-version-check, --root-user-action, --no-input, --quiet \(-q\), "
+        r"--no-compile, --compile, --progress-bar, --no-warn-script-location, --no-color, "
+        r"--break-system-packages, --retries, --timeout, --default-timeout, --no-deps and, "
         "with pinned requirements, --prefer-binary"
     )
     with pytest.raises(DockerfileError, match=message):
@@ -2222,7 +2274,11 @@ def test_cli_dockerfile_inputs_reads_uv_pip_system_install(tmp_path, capsys, fak
 @pytest.mark.parametrize(
     ("copy", "run", "message"),
     [
-        ("COPY . ./", "uv pip install --system --no-deps -r requirements.txt", ":4: uv pip install --no-deps"),
+        (
+            "COPY . ./",
+            "uv pip install --system --require-hashes -r requirements.txt",
+            ":4: uv pip install --require-hashes",
+        ),
         (
             "COPY . ./",
             "uv pip install --system -r requirements.txt",
@@ -2278,7 +2334,26 @@ _UV_RUN = "FROM python:3.13\nWORKDIR /app\nCOPY {} ./\nRUN uv pip install --syst
 
 
 @pytest.mark.parametrize(
-    "flags", ["-U", "--upgrade", "-q", "--quiet", "--no-cache", "--no-cache-dir", "-U -q --no-cache"]
+    "flags",
+    [
+        "-U",
+        "--upgrade",
+        "-q",
+        "--quiet",
+        "--no-cache",
+        "--no-cache-dir",
+        "--compile-bytecode",
+        "--compile",
+        "--no-progress",
+        "--link-mode copy",
+        "--link-mode=copy",
+        "--break-system-packages",
+        "--strict",
+        "--no-python-downloads",
+        "--no-deps",
+        "-U -q --no-cache",
+        "-U --compile-bytecode --link-mode copy --no-deps",
+    ],
 )
 def test_dockerfile_requirements_reads_the_flags_uv_has(tmp_path, flags):
     # uv spells the file option --requirements, and takes pip's --requirement too.
@@ -2300,6 +2375,17 @@ def test_dockerfile_requirements_reads_the_flags_uv_has(tmp_path, flags):
         "--root-user-action ignore",
         "--root-user-action=ignore",
         "--prefer-binary",
+        "--no-compile",
+        "--progress-bar off",
+        "--progress-bar=off",
+        "--no-warn-script-location",
+        "--no-color",
+        "--retries 5",
+        "--retries=5",
+        "--timeout 60",
+        "--timeout=60",
+        "--default-timeout 100",
+        "--default-timeout=100",
     ],
 )
 def test_dockerfile_requirements_refuses_pip_only_flags_on_a_uv_line(tmp_path, flags):
@@ -2307,13 +2393,74 @@ def test_dockerfile_requirements_refuses_pip_only_flags_on_a_uv_line(tmp_path, f
     path = _context(tmp_path, _UV_RUN.format("requirements.txt", f"{flags} -r requirements.txt"))
     message = (
         f":4: uv pip install {re.escape(flags.split()[0])}: --dockerfile-inputs only reads --system, -r FILE, "
-        r"-c FILE, --no-cache, --no-cache-dir, --upgrade \(-U\) and --quiet \(-q\) for uv"
+        r"-c FILE, --no-cache, --no-cache-dir, --upgrade \(-U\), --quiet \(-q\), "
+        r"--compile-bytecode \(--compile\), --no-progress, --link-mode, --break-system-packages, --strict, "
+        r"--no-python-downloads and --no-deps for uv"
     )
     with pytest.raises(DockerfileError, match=message):
         dockerfile_requirements(path, uv_installs=set())
     # The same flags on a pip line are read.
     path.write_text(path.read_text(encoding="utf-8").replace("uv pip install --system", "pip install"), "utf-8")
     assert dockerfile_requirements(path) == [(4, tmp_path / "requirements.txt")]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        "--compile-bytecode",
+        "--no-progress",
+        "--link-mode copy",
+        "--link-mode=copy",
+        "--strict",
+        "--no-python-downloads",
+    ],
+)
+def test_dockerfile_requirements_refuses_uv_only_flags_on_a_pip_line(tmp_path, flags):
+    # pip has none of these uv flags.
+    path = _context(
+        tmp_path, f"FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install {flags} -r requirements.txt\n"
+    )
+    message = (
+        f":4: pip install {re.escape(flags.split()[0])}: --dockerfile-inputs only reads -r FILE, -c FILE, "
+        r"--no-cache-dir, --upgrade \(-U\), --disable-pip-version-check, --root-user-action, --no-input, "
+        r"--quiet \(-q\), --no-compile, --compile, --progress-bar, --no-warn-script-location, --no-color, "
+        r"--break-system-packages, --retries, --timeout, --default-timeout, --no-deps and, "
+        "with pinned requirements, --prefer-binary"
+    )
+    with pytest.raises(DockerfileError, match=message):
+        dockerfile_requirements(path)
+    # The same flags on a uv line are read.
+    path.write_text(_UV_RUN.format("requirements.txt", f"{flags} -r requirements.txt"), "utf-8")
+    assert dockerfile_requirements(path, uv_installs=set()) == [(4, tmp_path / "requirements.txt")]
+
+
+@pytest.mark.parametrize("flags", ["--link-mode bogus", "--link-mode=bogus", "--link-mode Copy", "--link-mode"])
+def test_dockerfile_requirements_refuses_a_link_mode_uv_does_not_take(tmp_path, flags):
+    # uv exits on a --link-mode other than clone, copy, hardlink or symlink (`uv pip install --help`, uv 0.13.1),
+    # and the word after the flag is never taken for a requirement.
+    path = _context(tmp_path, _UV_RUN.format("requirements.txt", f"{flags} -r requirements.txt"))
+    with pytest.raises(DockerfileError, match=rf":4: uv pip install {re.escape(flags.split()[0])}: "):
+        dockerfile_requirements(path, uv_installs=set())
+
+
+def test_dockerfile_requirements_no_deps_read_without_deps_refused_with_deps(tmp_path):
+    # pip: read without --deps
+    path_pip = _context(
+        tmp_path / "pip", "FROM python:3.13\nWORKDIR /app\nCOPY . .\nRUN pip install --no-deps -r requirements.txt\n"
+    )
+    assert dockerfile_requirements(path_pip) == [(4, tmp_path / "pip" / "requirements.txt")]
+    # pip: refused with --deps
+    with pytest.raises(DockerfileError, match=r":4: pip install --no-deps installs no dependencies, .*: drop --deps"):
+        dockerfile_requirements(path_pip, dependencies=True)
+
+    # uv: read without --deps
+    path_uv = _context(tmp_path / "uv", _UV_RUN.format("requirements.txt", "--no-deps -r requirements.txt"))
+    assert dockerfile_requirements(path_uv, uv_installs=set()) == [(4, tmp_path / "uv" / "requirements.txt")]
+    # uv: refused with --deps
+    with pytest.raises(
+        DockerfileError, match=r":4: uv pip install --no-deps installs no dependencies, .*: drop --deps"
+    ):
+        dockerfile_requirements(path_uv, dependencies=True, uv_installs=set())
 
 
 def test_dockerfile_requirements_uv_needs_every_requirement_pinned(tmp_path):
@@ -3117,6 +3264,8 @@ _INSTALL = "RUN pip install -r requirements.txt\n"
         ),
         ("RUN set -eux; python -m pip install --no-cache-dir -r requirements.txt; pip check\n", {"shell": [4]}),
         ("RUN pip --no-cache-dir install -r requirements.txt > /dev/null 2>&1\n", {}),
+        ("RUN pip -q --no-color install -r requirements.txt\n", {}),
+        ("RUN uv pip --no-progress install --system -r requirements.txt\n", {}),
         ("RUN /usr/local/bin/pip install -r /app/requirements.txt\n", {}),
         ("RUN cd / && pip install -r app/requirements.txt\n", {"shell": [4]}),
         ("RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt\n", {"venv": [4]}),
@@ -3129,6 +3278,13 @@ _INSTALL = "RUN pip install -r requirements.txt\n"
             "RUN python -m pip install -U 'pip>=24' wheel && python -m ensurepip\n" + _INSTALL,
             {"installer-tools": [4]},
         ),
+        # A flag's value isn't a requirement name.
+        ("RUN pip install --progress-bar off --retries 3 -U pip\n" + _INSTALL, {"installer-tools": [4]}),
+        (
+            "RUN pip install --root-user-action ignore --timeout 60 -U pip setuptools\n" + _INSTALL,
+            {"installer-tools": [4]},
+        ),
+        ("RUN uv pip install --system --link-mode copy -U pip\n" + _INSTALL, {"installer-tools": [4]}),
     ],
 )
 def test_dockerfile_requirements_passes_over_runs_that_install_nothing(tmp_path, body, classes):
@@ -3606,11 +3762,19 @@ _ANOTHER_INDEX = (
         ("pip install six*", ":4: .*six\\* isn't a value"),
         ("pip install {six,numpy}", ":4: .*\\{six,numpy\\} isn't a value"),
         ("pip install --pre six", ":4: pip install --pre: --dockerfile-inputs only reads"),
-        ("pip install --no-deps six", ":4: pip install --no-deps: --dockerfile-inputs only reads"),
+        ("pip install --require-hashes six", ":4: pip install --require-hashes: --dockerfile-inputs only reads"),
         ("pip install --only-binary=:all: six", ":4: pip install --only-binary=:all:: --dockerfile-inputs only"),
         ("pip install -c requirements.txt six", ":4: pip install -c FILE with requirements on the command line"),
         ("pip install --prefer-binary six", ":4: pip install --prefer-binary makes .* on the line is pinned"),
         ("pip install --no-cache-dir", ":4: pip install names nothing to install"),
+        # A flag's value pip doesn't take isn't read, and the word after it isn't the flag's value (pip exits).
+        ("pip install --timeout six", ":4: pip install --timeout: --dockerfile-inputs only reads"),
+        ("pip install --progress-bar six", ":4: pip install --progress-bar: --dockerfile-inputs only reads"),
+        ("uv pip install --system --link-mode six==1.16.0", ":4: uv pip install --link-mode: .* for uv"),
+        # Only general options come before the subcommand: pip and uv exit on an install option there.
+        ("pip --compile install six", ":4: `pip --compile install six`: only `install` is read of pip's"),
+        ("pip -U install six", ":4: `pip -U install six`: only `install` is read of pip's"),
+        ("uv pip --strict install --system six==1.16.0", ":4: .*only `install` is read of uv pip"),
         ("pip install six || true", ":4: `pip install six` is in a list with \\|\\|"),
         # uv picks its own version for a range, so under uv a name must be pinned.
         ("uv pip install --system six", ":4: uv pip install: six isn't pinned with ==, and uv and pip can pick"),

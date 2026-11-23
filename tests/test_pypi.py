@@ -8,7 +8,7 @@ import pytest
 from conftest import FAKE_INDEX
 
 import wheelgap
-from wheelgap import Status, pypi
+from wheelgap import Status, cache, pypi
 from wheelgap.check import explain, explain_lines
 from wheelgap.cli import main
 from wheelgap.pyodide import PyodideLockError, load_pyodide_lock
@@ -959,3 +959,69 @@ def test_extract_issues_url_a_reserved_path_doesnt_hide_a_later_repository():
         pypi.extract_issues_url({"Source": "https://github.com/sponsors/x"}, homepage="https://github.com/org/repo")
         == "https://github.com/org/repo/issues"
     )
+
+
+HASHPKG_LINUX = "hashpkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"
+HASHPKG_WIN = "hashpkg-1.0-cp313-cp313-win_amd64.whl"
+HALF_LINUX = "halfhashed-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"
+HALF_WIN = "halfhashed-1.0-cp313-cp313-win_amd64.whl"
+
+
+@pytest.mark.parametrize(
+    "name,hashes,files,error",
+    [
+        # Only the sdist's hash: pip takes the sdist (#633).
+        ("hashpkg", {"3" * 64}, ["hashpkg-1.0.tar.gz"], None),
+        ("hashpkg", {"1" * 64, "3" * 64}, [HASHPKG_LINUX, "hashpkg-1.0.tar.gz"], None),
+        # The index gave every file's sha256 and none is listed: pip downloads its pick and refuses its hash.
+        ("hashpkg", {"9" * 64}, None, "none of the hashes in requirements.txt matches a file of hashpkg 1.0"),
+        # A file the index gives no sha256 for stays, as in pip's filter_unallowed_hashes: pip checks it after the
+        # download, so a mirror without digests isn't a false error.
+        ("halfhashed", {"6" * 64}, [HALF_LINUX, "halfhashed-1.0.tar.gz"], None),
+        # Nothing listed matches, but one file's hash is unknown: it may be the one, so every file stays.
+        ("halfhashed", {"9" * 64}, [HALF_LINUX, HALF_WIN, "halfhashed-1.0.tar.gz"], None),
+    ],
+)
+def test_requirement_hashes_pick_files_as_pip_does(fake_pypi, name, hashes, files, error):
+    pkg = pypi.fill(Package(name, "1.0", origin="requirements.txt", hashes=frozenset(hashes)))
+    assert pkg.files == files and pkg.error == error
+
+
+def test_requirement_hashes_name_the_wheels_they_leave_out(fake_pypi):
+    pkg = pypi.fill(Package("hashpkg", "1.0", origin="base.txt", hashes=frozenset({"3" * 64})))
+    assert pkg.hash_rejected == dict.fromkeys([HASHPKG_LINUX, HASHPKG_WIN], "its hash isn't listed in base.txt")
+    half = pypi.fill(Package("halfhashed", "1.0", origin="base.txt", hashes=frozenset({"6" * 64})))
+    assert half.hash_rejected == {HALF_WIN: "its hash isn't listed in base.txt"}
+
+
+def test_requirement_hashes_ask_again_when_the_cached_files_have_no_digests(fake_pypi):
+    index = pypi.index_url()
+    # A file list cached before file hashes were kept: read as it is without --hash, asked again with one.
+    cache.save_files(index, "hashpkg", "1.0", [{"filename": HASHPKG_LINUX}, {"filename": "hashpkg-1.0.tar.gz"}])
+    plain = pypi.fill(Package("hashpkg", "1.0"), read_cache=True, write_cache=True)
+    assert plain.files == [HASHPKG_LINUX, "hashpkg-1.0.tar.gz"] and fake_pypi == []
+    hashed = Package("hashpkg", "1.0", hashes=frozenset({"3" * 64}))
+    assert pypi.fill(hashed, read_cache=True, write_cache=True).files == ["hashpkg-1.0.tar.gz"]
+    assert fake_pypi == ["https://pypi.org/pypi/hashpkg/1.0/json"]
+    # The new entry keeps each file's sha256 (and still no URL), so the next run answers from the cache.
+    assert cache.load_files(index, "hashpkg", "1.0") == [
+        {"filename": HASHPKG_LINUX, "digests": {"sha256": "1" * 64}},
+        {"filename": HASHPKG_WIN, "digests": {"sha256": "2" * 64}},
+        {"filename": "hashpkg-1.0.tar.gz", "digests": {"sha256": "3" * 64}},
+    ]
+    again = Package("hashpkg", "1.0", hashes=frozenset({"3" * 64}))
+    assert pypi.fill(again, read_cache=True).files == ["hashpkg-1.0.tar.gz"] and len(fake_pypi) == 1
+
+
+def test_requirement_hashes_pick_the_release_of_a_range_as_pip_does(fake_pypi, monkeypatch):
+    # pip filters every release a range allows by --hash before it picks one: pip 26.3 installs demo 1.0 for
+    # `demo>=0.5 --hash=sha256:<1.0's file>` with demo 2.0 on the index. A bare name is read the same way.
+    monkeypatch.setitem(
+        FAKE_INDEX["hashpkg"], "2.0", [{"filename": "hashpkg-2.0-py3-none-any.whl", "digests": {"sha256": "4" * 64}}]
+    )
+    for spec in (">=0.5", None):
+        pkg = pypi.fill(Package("hashpkg", None, spec=spec, origin="requirements.txt", hashes=frozenset({"3" * 64})))
+        assert (pkg.version, pkg.files, pkg.error) == ("1.0", ["hashpkg-1.0.tar.gz"], None)
+    # No release has a listed file: pip downloads its pick of the newest and refuses its hash.
+    pkg = pypi.fill(Package("hashpkg", None, spec=">=0.5", origin="requirements.txt", hashes=frozenset({"9" * 64})))
+    assert pkg.error == "none of the hashes in requirements.txt matches a file of hashpkg 2.0"

@@ -243,12 +243,129 @@ def test_requirements_nested_constraints_combine_ranges_and_keep_pins(tmp_path):
     path = tmp_path / "requirements.txt"
     path.write_text("-r sub/more.txt\n-c sub/constraints.txt\n", encoding="utf-8")
     (directory / "more.txt").write_text("ranged>=1.5\npinned==3\n", encoding="utf-8")
-    (directory / "constraints.txt").write_text("-c nested.txt\npinned==1\n", encoding="utf-8")
+    (directory / "constraints.txt").write_text("-c nested.txt\npinned==3\n", encoding="utf-8")
     (directory / "nested.txt").write_text("ranged<2 \\\n    --hash=sha256:00  # note\n", encoding="utf-8")
     ranged, pinned = parse_requirements(path).packages
     assert ranged.spec == "<2,>=1.5"
     assert ranged.version is None
     assert pinned.version == "3"
+    assert pinned.error is None
+
+
+@pytest.mark.parametrize(
+    "req,constraint,expected_version,expected_spec,expected_error",
+    [
+        (
+            "idna==3.6",
+            "idna==3.7",
+            "3.6",
+            None,
+            "requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)",
+        ),
+        (
+            "idna==3.6",
+            "idna>=3.7",
+            "3.6",
+            None,
+            "requirement idna==3.6 conflicts with the constraint idna>=3.7 (pip refuses this)",
+        ),
+        (
+            "idna>=3.8",
+            "idna==3.7",
+            None,
+            ">=3.8",
+            "requirement idna>=3.8 conflicts with the constraint idna==3.7 (pip refuses this)",
+        ),
+        (
+            "idna==1.9",
+            "idna==1.9.0",
+            "1.9",
+            None,
+            None,
+        ),
+        (
+            "idna==3.6",
+            "idna>=3.0",
+            "3.6",
+            None,
+            None,
+        ),
+        # pip 26.3 checked: ==1.0 matches 1.0+local (PEP 440), so pip installs 1.0+local whichever side names it.
+        ("demo==1.0+local", "demo==1.0", "1.0+local", None, None),
+        ("demo==1.0", "demo==1.0+local", "1.0+local", None, None),
+        (
+            "demo==1.0+local",
+            "demo==1.0+cpu",
+            "1.0+local",
+            None,
+            "requirement demo==1.0+local conflicts with the constraint demo==1.0+cpu (pip refuses this)",
+        ),
+        (
+            "demo==1.0+cpu",
+            "demo!=1.0",
+            "1.0+cpu",
+            None,
+            "requirement demo==1.0+cpu conflicts with the constraint demo!=1.0 (pip refuses this)",
+        ),
+        ("demo==1.0+cpu", "demo==1.0\ndemo==1.0+cpu", "1.0+cpu", None, None),
+        ("demo", "demo==1.0\ndemo==1.0+cpu", "1.0+cpu", None, None),
+        # A pinned pre-release counts, as pip takes it; <2.0 leaves out 2.0's pre-releases.
+        ("demo==2.0b1", "demo>=1.0", "2.0b1", None, None),
+        ("demo>=1.0", "demo==2.0b1", "2.0b1", None, None),
+        (
+            "demo==2.0b1",
+            "demo<2.0",
+            "2.0b1",
+            None,
+            "requirement demo==2.0b1 conflicts with the constraint demo<2.0 (pip refuses this)",
+        ),
+        (
+            "demo==1!1.0",
+            "demo==1.0",
+            "1!1.0",
+            None,
+            "requirement demo==1!1.0 conflicts with the constraint demo==1.0 (pip refuses this)",
+        ),
+        ("demo==3.6", "demo", "3.6", None, None),
+        # An exact constraint must meet the other constraints too.
+        (
+            "demo>=1",
+            "demo==2.0\ndemo<1.5",
+            None,
+            ">=1",
+            "the constraint demo==2.0 conflicts with the constraint demo<1.5 (pip refuses this)",
+        ),
+        # A marked constraint that the pin meets changes nothing on any target; one it doesn't depends on the target.
+        ("idna==3.6", 'idna==3.6; sys_platform == "win32"', "3.6", None, None),
+        (
+            "idna==3.6",
+            'idna==3.7; sys_platform == "win32"',
+            "3.6",
+            None,
+            "constraint has an environment marker; target-dependent constraints aren't supported",
+        ),
+    ],
+)
+def test_requirements_constraint_conflict_and_agreement(
+    tmp_path, req, constraint, expected_version, expected_spec, expected_error
+):
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{req}\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text(f"{constraint}\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == expected_version
+    assert pkg.spec == expected_spec
+    assert pkg.error == expected_error
+
+
+def test_requirements_conflict_from_nested_constraints_file(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("idna==3.6\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("-c nested.txt\n", encoding="utf-8")
+    (tmp_path / "nested.txt").write_text("idna==3.7\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == "3.6"
+    assert pkg.error == "requirement idna==3.6 conflicts with the constraint idna==3.7 (pip refuses this)"
 
 
 def test_requirements_requirement_inside_constraints_file(tmp_path):
@@ -2285,6 +2402,42 @@ def test_requirements_options_after_a_requirement_keep_its_pin_and_hash_mode(tmp
         ("purewheel", None, ">=3"),
     ]
     assert source.compiled and source.specs == ["fastlib==2.0.0", "purewheel>=3"]
+    assert source.packages[0].hashes == frozenset({"aa"})
+    assert source.packages[1].hashes == frozenset()
+
+
+def test_requirements_hashes_preserved_for_both_spellings_and_continuation(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "pkg_eq==1.0 --hash=sha256:1111\n"
+        "pkg_space==2.0 --hash sha256:2222\n"
+        "pkg_continued==3.0 \\\n"
+        "    --hash=sha256:3333 \\\n"
+        "    --hash sha256:4444\n"
+    )
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.hashes) for p in source.packages] == [
+        ("pkg_eq", "1.0", frozenset({"1111"})),
+        ("pkg_space", "2.0", frozenset({"2222"})),
+        ("pkg_continued", "3.0", frozenset({"3333", "4444"})),
+    ]
+
+
+def test_requirements_hashes_keep_sha256_only_lowercased(tmp_path):
+    # pip lowercases the hashes it's given, and only a sha256 can match a file on PyPI, which gives no other digest
+    # (pip 26.3 takes the sdist for `--hash=sha256:<sdist> --hash=sha512:<wheel>`). A line with only sha384/sha512
+    # hashes is read as without --hash: pip checks its pick after the download, which wheelgap can't do.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        f"upper==1.0 --hash=sha256:{'AB' * 32}\n"
+        f"other==1.0 --hash=sha512:{'cd' * 64} --hash=sha384:{'cd' * 48}\n"
+        f"mixed==1.0 --hash=sha512:{'ef' * 64} --hash=sha256:{'12' * 32}\n"
+    )
+    assert [p.hashes for p in parse_requirements(req).packages] == [
+        frozenset({"ab" * 32}),
+        frozenset(),
+        frozenset({"12" * 32}),
+    ]
 
 
 @pytest.mark.parametrize(

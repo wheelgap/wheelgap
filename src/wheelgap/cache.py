@@ -87,9 +87,16 @@ def load_files(index: str, name: str, version: str) -> list[dict] | None:
 
 
 def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
-    """Store a pinned release's file list. Only `filename`, `yanked` and `requires_python` are kept: they're all
-    fill() reads, and a file's URL (which a private mirror may sign) never reaches the disk."""
-    kept = [{k: f[k] for k in ("filename", "yanked", "requires_python") if k in f} for f in files]
+    """Store a pinned release's file list. Only `filename`, `yanked`, `requires_python` and the sha256 digest are
+    kept: they're all fill() reads (the digest for a requirement's --hash), and a file's URL (which a private mirror
+    may sign) never reaches the disk."""
+    kept: list[dict] = []
+    for f in files:
+        entry = {k: f[k] for k in ("filename", "yanked", "requires_python") if k in f}
+        digests = f.get("digests")
+        if isinstance(digests, dict) and isinstance(digests.get("sha256"), str):
+            entry["digests"] = {"sha256": digests["sha256"]}
+        kept.append(entry)
     _save(index, name, version, "files", kept)
 
 

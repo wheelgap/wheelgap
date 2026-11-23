@@ -21,6 +21,9 @@ Run the same command with `--explain`: it lists every wheel the target rejected 
 - **A yanked wheel.** pip skips a yanked wheel when the release has other files it can use, so it builds the sdist;
   `--explain` names such a wheel with the reason `yanked`.
 
+For other known edge cases where wheelgap's answer can differ from pip's and uv's, see
+[Where wheelgap differs from pip and uv](differences.md).
+
 If none of these explain it, wheelgap may be wrong, and that's the most useful bug report there is. Check the cell with
 `pip download --only-binary=:all:` for the target's tags, as
 [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md#no-issue-fits-find-a-real-bug) describes, and

@@ -412,8 +412,18 @@ build it. `--explain` says which option did it.
 
 The same two options written after a requirement (`albumentations>=0.3.2 --no-binary qudida,albumentations`, after
 0.13.0) are read too, and mean what pip makes of them: the option counts for the whole install, exactly as on a line
-of its own, not only for that requirement. `--hash` and `--config-settings` after a requirement are accepted as
-before.
+of its own, not only for that requirement. `--config-settings` after a requirement is accepted as before.
+
+`--hash` options on a requirement (`--hash=sha256:…` or `--hash sha256:…`, after 0.13.0) limit which of the
+release's files pip may install, and wheelgap keeps only those: a file whose `sha256` from PyPI's JSON API is listed.
+Listing only the sdist's hash gives `source`, as pip and uv build it then; listing only another platform's wheels gives
+`missing`. If no file of the release has a listed hash, the package is `unknown` (`none of the hashes in
+requirements.txt matches a file of NAME VERSION`), as pip refuses the download. `--explain` names each wheel left
+out: `its hash isn't listed in requirements.txt`. As pip does, a file the index gives no `sha256` for (some mirrors
+behind `WHEELGAP_INDEX_URL`) isn't left out, since pip checks it after the download. Not read yet, so the answer is
+the one without them: `sha384` and `sha512` hashes (PyPI gives no such digest), `--hash` in a constraints file, and
+the lookups of [`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
+files come from the index.
 
 Other options after a requirement are read as pip 26.3 reads them there (after 0.13.0). pip parses them and then
 ignores `-f` / `--find-links`, `-i` / `--index-url`, `--extra-index-url`, `--no-index`, `--pre`, `--prefer-binary`,
@@ -432,10 +442,14 @@ An included file that can't be read (`-r FILE` or `-c FILE` naming a file that i
 names the including file and line, `requirements.txt:3: -r base.txt: file not found`; pip stops there too.
 
 **Constraint files** (`-c FILE`, `-cFILE`, `--constraint FILE` or `--constraint=FILE`) restrict unpinned requirements
-without adding packages. Exact constraints select a version; ranges are intersected. A constraint wheelgap can't apply
-leaves the package `unknown` rather than guessed: one with an environment marker, a URL or path, or two different
-exact versions. Constraint files given as a URL or an environment variable (`-c https://…`, `-c ${PIP_CONSTRAINT}`)
-are skipped.
+without adding packages. Exact constraints select a version; ranges are intersected. A requirement that conflicts with
+a constraint is an error (after 0.13.0), as pip refuses it: a pinned version that an exact constraint or a constraint's
+range leaves out, or an exact constraint that the requirement's range or another constraint leaves out. The package is
+reported `unknown` and the run fails. Versions match as pip matches them: `==1.9` and `==1.9.0` agree, and `==1.0`
+with `==1.0+cpu` is `1.0+cpu`. A constraint wheelgap can't apply leaves the package `unknown` rather than guessed: one
+with an environment marker (unless the requirement is pinned to a version it allows), a URL or path, or two exact
+versions that disagree. Constraint files given as a URL or an environment variable (`-c https://…`,
+`-c ${PIP_CONSTRAINT}`) are skipped.
 
 A `-r FILE` line inside a constraints file is read as pip reads it: `FILE` is a requirements file, so its packages
 are checked, while the constraints file's own lines stay constraints. A `-c` inside any file is a constraints file.
@@ -445,7 +459,7 @@ An include in a symlinked requirements file is read from the folder the link is 
 the link points into (after 0.13.0).
 
 **Skipped:** editable lines (`-e`), local paths (lines starting with `.` or `/`) and URLs (`git+https://…`,
-`name @ https://…`). Other pip options in the file, such as `--index-url` or `--hash`, are ignored: use wheelgap's
+`name @ https://…`). Other pip options in the file, such as `--index-url`, are ignored: use wheelgap's
 own [`--index-url`](cli.md#index-url) to look packages up on another index.
 
 **`--deps`:** with [`--deps`](cli.md#deps) a requirements file is resolved instead — every requirement line is a

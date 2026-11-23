@@ -127,6 +127,8 @@ class Result:
     requires_python_rejected: dict[str, str] = field(default_factory=dict)
     no_binary: bool = False
     only_binary: bool = False
+    # Files of a pinned release whose sha256 hash was not listed in requirements, mapped to their --explain reason.
+    hash_rejected: dict[str, str] = field(default_factory=dict)
     # _result installs per-instance data; the immutable default is not a public dataclass field.
     _resolutions: ClassVar[Mapping[str, Package]] = MappingProxyType({})
     # Each applicable Pyodide lock may ship a different version for its Python.
@@ -165,6 +167,7 @@ class Result:
                 p.requires_python_rejected,
                 no_binary=self.no_binary,
                 only_binary=self.only_binary,
+                hash_rejected=p.hash_rejected,
             )
             for t, s in self.statuses.items()
             if s in _EXPLAINED
@@ -185,6 +188,7 @@ class Result:
                     requires_python_rejected=p.requires_python_rejected,
                     no_binary=self.no_binary,
                     only_binary=self.only_binary,
+                    hash_rejected=p.hash_rejected,
                 )
             )
             for t, s in self.statuses.items()
@@ -277,6 +281,7 @@ def _result(
         {f: why for variant in pkg.variants for f, why in variant.requires_python_rejected.items()},
         pkg.no_binary,
         pkg.only_binary,
+        hash_rejected={f: why for variant in pkg.variants for f, why in variant.hash_rejected.items()},
         bundled_versions=bundled_versions,
         direct={
             t: tuple(dict.fromkeys(direct_via[t])) for t, s in statuses.items() if s in _TRACED and direct_via.get(t)

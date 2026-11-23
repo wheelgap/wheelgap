@@ -35,6 +35,22 @@ FAKE_INDEX = {
     },
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
+    # Distinct sha256 digests, as PyPI's JSON API gives them, for requirements that pin --hash (#633).
+    "hashpkg": {
+        "1.0": [
+            {"filename": "hashpkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl", "digests": {"sha256": "1" * 64}},
+            {"filename": "hashpkg-1.0-cp313-cp313-win_amd64.whl", "digests": {"sha256": "2" * 64}},
+            {"filename": "hashpkg-1.0.tar.gz", "digests": {"sha256": "3" * 64}},
+        ],
+    },
+    # A mirror that gives no digests for some files: pip checks those after the download.
+    "halfhashed": {
+        "1.0": [
+            {"filename": "halfhashed-1.0-cp313-cp313-manylinux_2_17_x86_64.whl"},
+            {"filename": "halfhashed-1.0-cp313-cp313-win_amd64.whl", "digests": {"sha256": "5" * 64}},
+            {"filename": "halfhashed-1.0.tar.gz", "digests": {"sha256": "6" * 64}},
+        ],
+    },
     # Only Linux wheels for a newer glibc / musl / macOS than a flag can lower the floor to: fine at the defaults,
     # source with --glibc 2.28 (e.g. RHEL 8), --musl 1.1 or --macos 13.0 (diff tests; #286).
     "glibclag": {

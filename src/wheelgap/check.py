@@ -285,6 +285,7 @@ def explain(
     *,
     no_binary: bool = False,
     only_binary: bool = False,
+    hash_rejected: dict[str, str] | None = None,
 ) -> list[tuple[str, str]]:
     """(filename, reason) for every wheel `target` rejects, the closest misses first.
 
@@ -311,6 +312,10 @@ def explain(
         for f, reason in requires_python_rejected.items():
             if f.endswith(".whl"):  # a wheel the target can't use anyway says why, not that a newer Python fits
                 out.append((f, rejection(f, target) or reason))
+    if hash_rejected:
+        for f, reason in hash_rejected.items():
+            if f.endswith(".whl"):
+                out.append((f, rejection(f, target) or reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
 
 
@@ -329,6 +334,7 @@ def explain_lines(
     align: bool = False,
     no_binary: bool = False,
     only_binary: bool = False,
+    hash_rejected: dict[str, str] | None = None,
 ) -> list[str]:
     """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
     `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
@@ -336,7 +342,15 @@ def explain_lines(
     The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
     unaligned (one space-separated "file  reason" per line) and with no limit.
     """
-    rejected = explain(files, target, yanked, requires_python_rejected, no_binary=no_binary, only_binary=only_binary)
+    rejected = explain(
+        files,
+        target,
+        yanked,
+        requires_python_rejected,
+        no_binary=no_binary,
+        only_binary=only_binary,
+        hash_rejected=hash_rejected,
+    )
     out = [] if rejected else [dim("no wheels published for this version")]
     shown = rejected[:limit]
     width = max((len(f) for f, _ in shown), default=0) if align else 0
