@@ -188,7 +188,7 @@ built on (bullseye for 3.10 and 3.11, bookworm for 3.12 and 3.13, trixie for 3.1
 answer that doesn't move. A Dockerfile wheelgap can't read the way Docker does is an error, not a guess.
 
 A tag that names a patch release (`python:3.9.1-slim`, `python:3.12.7`) is checked as its minor version, at that
-version's newest patch release, with a note that says so: see
+version's newest patch release, with (after 0.13.0) a note that says so: see
 [which patch release is checked](how-it-works.md#patch-release).
 
 A global `ARG` used in the final stage's `FROM` (`ARG PYTHON_VERSION=3.12` then `FROM python:${PYTHON_VERSION}-slim`)

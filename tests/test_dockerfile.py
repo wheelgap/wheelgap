@@ -211,6 +211,13 @@ def test_parse_image_keeps_the_patch_release_a_tag_pins(image, python, patch):
     assert target.image == image.split("@")[0]
 
 
+@pytest.mark.parametrize("tag", ["3.15.0a1a1-slim", "3.15.0a1rc2"])
+def test_parse_image_still_refuses_a_tag_with_two_pre_release_parts(tag):
+    # Keeping the patch release must not widen the tags read: these were refused before and no image has them.
+    with pytest.raises(UnknownImageError):
+        parse_image(f"python:{tag}")
+
+
 @pytest.mark.parametrize("quiet", [False, True])
 def test_cli_notes_a_patch_pinned_image(tmp_path, capsys, fake_pypi, quiet):
     path = tmp_path / "Dockerfile"

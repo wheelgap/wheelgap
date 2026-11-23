@@ -95,7 +95,7 @@ OLD_DEBIAN_TAGS = {
 # (python:3.16-rc, 3.16-rc-slim-trixie), which follow the newest pre-release of X.Y. Astral's uv images have had
 # them too (uv:python3.14-rc-alpine, python3.14-rc-bookworm-slim).
 _TAG_RE = re.compile(
-    r"^(\d+)\.(\d+)(?:(-rc)(?=-|$)|(?P<patch>\.\d+(?:(?:a|b|rc)\d+)?)?(?:(?:a|b|rc)\d+)?)(?:-(?P<variant>.+))?$",
+    r"^(\d+)\.(\d+)(?:(-rc)(?=-|$)|(?P<patch>\.\d+)?(?P<pre>(?:a|b|rc)\d+)?)(?:-(?P<variant>.+))?$",
     re.ASCII,
 )
 _UV_TAG_PREFIX_RE = re.compile(r"^(?:\d+\.\d+(?:\.\d+)?-)?python", re.ASCII)
@@ -979,7 +979,7 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     minor_tag = bool(_MINOR_TAG_RE.match(tag)) and not rc
     rc_release = False  # the Debian release came from RC_DEBIAN, whose images kept every arch they were built for
     # The patch release a tag names (3.9.1-slim, 3.15.0a1), kept as written; X.Y, X.Y-rc and X.YrcN name none.
-    patch = f"{python}{m.group('patch')}" if m.group("patch") else None
+    patch = f"{python}{m.group('patch')}{m.group('pre') or ''}" if m.group("patch") else None
     variant = m.group("variant").split("-") if m.group("variant") else []  # case-sensitive: -SLIM doesn't exist
 
     release = None
