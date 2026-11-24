@@ -478,6 +478,33 @@ def test_requirements_no_binary_applies_to_resolved_packages(index, capsys, tmp_
     assert code == 1
 
 
+@pytest.mark.parametrize(
+    ("a_txt", "code", "crypt"),
+    [
+        # pip 26.3 reads a.txt's --no-binary :all: for app and everything it pulls in, as for a requirement in a.txt.
+        ("--no-binary :all:\n", 1, "source"),
+        ("", 0, "wheel"),
+        # The extra index is pip's for app's tree too, which --deps can't see.
+        ("--extra-index-url https://example.test/simple\n", 2, None),
+    ],
+)
+def test_dockerfile_names_beside_a_requirements_file_take_its_options_under_deps(
+    index, capsys, tmp_path, a_txt, code, crypt
+):
+    (tmp_path / "a.txt").write_text(a_txt, encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.14\nWORKDIR /app\nCOPY a.txt .\nRUN pip install -r a.txt app\n", encoding="utf-8"
+    )
+    args = ["--dockerfile", str(tmp_path / "Dockerfile"), "--dockerfile-inputs", "--deps", "--json", "--no-cache"]
+    assert main([*args, "--all"]) == code
+    captured = capsys.readouterr()
+    if crypt is None:
+        assert "Dockerfile:4: the project configures an installer index or source" in captured.err
+    else:
+        pkgs = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(captured.out)["packages"]}
+        assert pkgs["crypt"] == crypt
+
+
 def test_requirements_skips_stay_skipped_under_deps(index, capsys, tmp_path):
     (tmp_path / "requirements.txt").write_text("-e .\nhttps://example.org/frozen-1.0.zip\napp\n", encoding="utf-8")
     code = main([str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"])

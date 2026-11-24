@@ -532,7 +532,8 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     """Replace the source's packages with what its requirements install on each target."""
     resolver = resolver or Resolver()
     resolver.cutoff = source.cutoff_for
-    resolver.policy = source.format_control.policy if source.requirements and source.format_control else None
+    # A requirements file's options, or those a Dockerfile line's -r files set for the names on it.
+    resolver.policy = source.format_control.policy if source.format_control else None
     roots = [Requirement(text) for text in source.specs]
     kept = [p for p in source.packages if p.skip]  # a name @ URL: nothing to look up, as without --deps
     roots = [r for r in roots if not r.url]
@@ -586,11 +587,10 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
                 direct[i] = tuple(resolver.names.get(name, name) for name in origin_names)
         deps_paths[target] = reach
         deps_direct[target] = direct
-    if source.requirements:
-        if fc := source.format_control:  # --no-binary/--only-binary lines apply to the resolved packages too
-            for p in packages:
-                if not p.skip:
-                    p.no_binary, p.only_binary = fc.policy(p.key)
+    if fc := source.format_control:  # --no-binary/--only-binary lines apply to the resolved packages too
+        for p in packages:
+            if not p.skip:
+                p.no_binary, p.only_binary = fc.policy(p.key)
     source.packages = packages
     source.deps_paths = deps_paths
     source.deps_direct = deps_direct

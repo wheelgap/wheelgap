@@ -1,0 +1,128 @@
+name: Fix end-to-end
+
+# Proves the --fix release criterion on clean machines rather than assuming it: in a fresh Python 3.15 container
+# with no compiler, an install that fails on PyPI alone succeeds with the lines `wheelgap --fix` prints.
+# scripts/fix_e2e.py does the work (its docstring has the details), with orjson 3.13.0, zstandard 0.25.0 and lz4
+# 4.4.5 pinned: PyPI has no cp315 wheel of zstandard or lz4 for Linux or Windows, and its cp315 orjson wheels for
+# Linux x86_64 need glibc 2.39, which Debian bookworm (2.36) lacks. The gap wheel index has all of them.
+#
+# - linux: python:3.15-slim (Debian trixie, glibc 2.41: orjson comes from PyPI, so --fix must not name it) and
+#   python:3.15-slim-bookworm (glibc 2.36: --fix must name orjson too). A plain pip install must fail building
+#   from source, then the --fix lines must install our wheels and the packages must work.
+# - linux-hashes: the same from a hash-pinned file made by `uv pip compile --generate-hashes`, adding the hashes
+#   --fix prints (one line per package) to each package's existing line, as its output says, then
+#   pip install --require-hashes.
+# - windows: GitHub's Windows runners have MSVC (and gcc, clang and cargo on PATH), so a plain install there can build
+#   from source. It shows instead that PyPI has no wheel (pip install --only-binary=:all: fails), and that the --fix
+#   install takes our wheels, from pip's --report, rather than building.
+# - linux-upgrade, windows-upgrade: pins a newer official release fixes (markupsafe 3.0.2 -> 3.0.4, PyYAML 6.0.3 ->
+#   6.0.4): --fix must lead with the upgrade, and the pin line it prints, applied literally, must install PyPI's own
+#   cp315 wheels with --only-binary=:all:.
+#
+# It needs PyPI and wheelgap.github.io, so it's kept out of CI's offline test job: it runs weekly, by hand, and on
+# pull requests that change --fix's output (fix.py, gapwheels.py, suggest.py) or this check. Read-only and no secrets.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays 05:23 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/fix-e2e.yml
+      - scripts/fix_e2e.py
+      - src/wheelgap/fix.py
+      - src/wheelgap/gapwheels.py
+      - src/wheelgap/suggest.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  linux:
+    name: linux (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: python:3.15-slim
+            expect: lz4,zstandard
+          - image: python:3.15-slim-bookworm
+            expect: lz4,orjson,zstandard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Without and with --fix
+        shell: bash
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: python scripts/fix_e2e.py plain -t linux-x86_64 --expect "$EXPECT" --pypi-only build
+
+  linux-hashes:
+    name: linux, hash-pinned
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: python:3.15-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Hashes for both targets, as for a requirements file shared by Linux and Windows: --fix gives each package a
+      # hash per target it fills.
+      - name: Without and with --fix, --require-hashes
+        shell: bash
+        run: python scripts/fix_e2e.py hashed -t linux-x86_64,win-amd64 --expect lz4,zstandard
+
+  windows:
+    name: windows, gap wheels used
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+      - name: Without and with --fix
+        shell: bash
+        run: python scripts/fix_e2e.py plain -t win-amd64 --expect lz4,zstandard --pypi-only only-binary
+
+  linux-upgrade:
+    name: linux, upgrade first
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: python:3.15-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: --fix's upgrade, applied as printed
+        shell: bash
+        run: python scripts/fix_e2e.py upgrade -t linux-x86_64 --expect markupsafe,pyyaml
+
+  windows-upgrade:
+    name: windows, upgrade first
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+      - name: --fix's upgrade, applied as printed
+        shell: bash
+        run: python scripts/fix_e2e.py upgrade -t win-amd64 --expect markupsafe,pyyaml

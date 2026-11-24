@@ -10,6 +10,14 @@ wheelgap diff origin/main:uv.lock uv.lock -p 3.13 -t linux-aarch64   # the base 
 
 It exits `1` if there are any, `0` if not, and `2` on bad input. `python -m wheelgap.diff OLD NEW` works the same way.
 
+Packages are looked up on PyPI, or on the JSON API mirror in `WHEELGAP_INDEX_URL`. As in the main command, a
+`WHEELGAP_INDEX_URL` ending in `/simple` is refused before any lookup (exit 2), since it isn't a JSON API (0.13.0 looked
+every package up there, so all were `unknown`). `wheelgap diff` has no `--index-url` for a simple index yet; check
+each lockfile with `wheelgap --index-url` instead. For the same reason, `index-url` in `[tool.wheelgap]` is refused
+(exit 2) when it's set in the `pyproject.toml` beside either input (for a `REF:PATH`, the one at that ref), or in the
+current directory's with `--deps`: the main command would check those packages on that index, and 0.13.0's diff
+checked PyPI instead without a word. Check each lockfile with `wheelgap` there.
+
 ## Comparing two package versions
 
 To compare a package's whole dependency tree between two releases without a lockfile, give two pinned specs and
@@ -57,15 +65,15 @@ Both lockfiles are checked and packages are matched by name. Per target:
   than `source`. So `✓ → ● source` and `● source → ✗ missing` are worse.
 - `unknown` (the package couldn't be checked) isn't on that scale, because it says nothing about what pip would do.
   Anything → `unknown` is worse, and `unknown` → `source` or `missing` is worse too; only `unknown` → `wheel`,
-  `bundled` or `n/a` is not. `unknown` on both sides counts as worse if the version changed; at the same version it's
-  unchanged, and a note on stderr names those packages.
+  `bundled` or `n/a` is not. `unknown` on both sides counts as worse if the version changed, since the new version
+  was never checked; at the same version it's unchanged, and a note on stderr names those packages.
 - A package installed from somewhere wheelgap doesn't check (git, a path, a URL, an editable install or a private
   index) is "skipped" on that target and treated like `unknown`. Skipped on both sides is unchanged. A new skipped
   package counts as a new gap, except a uv `virtual` project, which installs nothing.
 - A package listed more than once (a `uv.lock` fork) takes its worst status on each target.
 
 With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source, is
-missing or (after 0.13.0) couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
+missing or couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
 or `(via mcp +1)` when more than one does. The Action's PR comment shows the same.
 
 A requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) is matched by its path, so it shows up

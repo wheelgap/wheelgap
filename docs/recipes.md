@@ -66,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: wheelgap/wheelgap@v0.13.0
+      - uses: wheelgap/wheelgap@v0.14.0
         with:
           args: uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
           compare-to: base
@@ -264,7 +264,7 @@ uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --json > wheel
 - `uvx wheelgap@latest` runs the newest release from PyPI. Plain
   `uvx wheelgap` can run an older one: uv uses a version installed with
   `uv tool install` unless a version is requested, and may reuse one from its
-  cache. Pin a release, such as `uvx wheelgap@0.13.0`, when the result must not
+  cache. Pin a release, such as `uvx wheelgap@0.14.0`, when the result must not
   change between runs, and check `--help` on the same command for the flags
   that release has. `pipx run wheelgap` works too.
 - Always pass `-p` and `-t`. Without them, the Python comes from
@@ -367,7 +367,7 @@ uv run wheelgap tests/fixtures/uvproj/uv.lock -p 3.13 -t linux-aarch64 --explain
 
 <!-- sample: uvproj -p 3.13 -t linux-aarch64 --explain -->
 ```text
-wheelgap 0.13.0 · uv.lock · 5 packages · Python 3.13
+wheelgap 0.14.0 · uv.lock · 5 packages · Python 3.13
 
 package                  version  linux-aarch64
 fastlib                  2.0.0    ● source
@@ -392,7 +392,7 @@ puresdist 1.0 on linux-aarch64: ● source
 
 skipped 2 non-index packages: demo (editable), gitdep (git)
 3 of 5 packages have gaps: 3 will build from source.
-Run with --fix to see whether wheelgap's gap wheel index has a wheel for these.
+Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap wheel index.
 ```
 
 Source builds are acceptable here, so check that nothing fails to install:
@@ -411,13 +411,27 @@ gaps: fastlib, nativeext, puresdist
 
 ## Installing from the gap wheel index
 
-The [gap wheel index](https://wheelgap.github.io/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. Its current coverage is Windows on ARM with CPython 3.14 and free-threaded 3.14t; Linux wheels are not published yet. Check the index page for the latest coverage.
+The [gap wheel index](https://wheelgap.github.io/wheels/) is a supplementary pip index for packages that do not yet publish every needed wheel on PyPI. It has wheels for Windows on ARM (CPython 3.14 and free-threaded 3.14t), Windows x64 and Linux x86_64 (`manylinux_2_28`, for glibc 2.28 and newer) for CPython 3.15, Linux x86_64 for free-threaded 3.14t, and Alpine Linux on ARM (`musllinux_1_2_aarch64`) for CPython 3.14. The index page [lists every published wheel](https://wheelgap.github.io/wheels/#published_wheels).
 
 It works with pip and uv. uv's default [first-index strategy](https://docs.astral.sh/uv/concepts/indexes/#first-index) takes all of a package's files from the first index that has it, so each package's page on this index also lists every file PyPI has for it (refreshed hourly), plus the gap wheel. With uv, pin only the packages that need it to the index as an explicit index, as `--fix` prints below.
 
 ### Which gaps it fills: `--fix`
 
-`wheelgap --fix` checks as usual, then reads the index's list of wheels (one request to wheelgap.github.io that names
+`--fix` first looks for an upgrade: most gaps on a new Python are in packages whose latest release
+already has the wheel (PyYAML 6.0.3 has no CPython 3.15 wheel, 6.0.4 does). For each gap it names the nearest newer
+release with the wheel, the same one [`--suggest`](cli.md#suggest) would, and what to run for the input
+(`uv lock --upgrade-package pyyaml` for a uv.lock, the new pin for a requirements file); a gap wheel is only the
+fallback for a package you can't upgrade, and a summary counts the gaps each way fixes:
+
+```bash
+wheelgap requirements.txt -p 3.15 -t linux-x86_64 --fix
+```
+
+wheelgap doesn't resolve, so check that the rest of the dependencies allow the upgrade: uv says so when
+`uv lock --upgrade-package` can't, and pip when it installs. These lookups go to pypi.org, only for packages
+[positively from PyPI](how-it-works.md#pypi-origin).
+
+For the gaps no upgrade fixes, `wheelgap --fix` checks as usual, then reads the index's list of wheels (one request to wheelgap.github.io that names
 no package) and lists the gaps one of them fills, with how to install it:
 
 ```bash
@@ -426,9 +440,10 @@ wheelgap uv.lock -p 3.14t -t win-arm64 --fix
 
 A gap counts only when it's `source` or `missing`, the package is [positively PyPI's](how-it-works.md#pypi-origin), and
 the index has a wheel of exactly that version that the target accepts. The exit code doesn't change: wheelgap still
-reports what PyPI has. For a requirements file or package names it prints the `--extra-index-url` line (with each
-wheel's `--hash`, for requirements that pin hashes); for a uv.lock it prints a `pyproject.toml` snippet that adds the
-index with `explicit = true` and points each package at it in `[tool.uv.sources]`. uv applies `[tool.uv.sources]` only
+reports what PyPI has. For a requirements file or package names it prints the `--extra-index-url` line (and, for
+requirements that pin hashes, each package's gap wheel `--hash` options to add to its existing line); for a uv.lock
+it prints a `pyproject.toml` snippet that adds the index with `explicit = true` and points each package at it in
+`[tool.uv.sources]`. uv applies `[tool.uv.sources]` only
 to direct dependencies: for a package that comes in through another one, `--fix` also says to list it where that one is
 (the same dependencies, dependency group or extra), and when the lock can't show whether a package is direct, it says
 to list it to be safe. Other lockfiles get a line saying to add the index where the lockfile is made. Only follow the
@@ -436,7 +451,8 @@ pip advice if the packages come from PyPI: pip treats every index alike, and whe
 `pip.conf`. uv's `exclude-newer` won't see these packages' files on this index: its pages
 are HTML, which carries no upload times. `--fix` is refused with `--offline`, and reads nothing with `--index-url` or
 a `WHEELGAP_INDEX_URL` mirror. With `--json`, the [`gap_wheels`](output.md#fix) key lists each wheel with its URL and
-SHA-256.
+SHA-256, and each package's `fix` says, per gap target, whether an upgrade, a gap wheel or nothing
+fixes it.
 
 ### GitHub Actions
 
@@ -459,8 +475,10 @@ jobs:
 
 ### Docker
 
-Docker images are Linux, and the index has no Linux wheels yet, so it doesn't help a Docker build today. Run
-`wheelgap --dockerfile Dockerfile` to see which packages your image will build from source instead.
+The index has Linux wheels for glibc images on x86_64 (`python:3.15-slim`, say) and for Alpine on ARM, for the
+Pythons listed above. Run `wheelgap --dockerfile Dockerfile --dockerfile-inputs --fix` to see which packages your image
+will build from source and which of them the index fills, then add the `--extra-index-url` line to the requirements file
+the image installs.
 
 ### In the project
 
@@ -469,3 +487,20 @@ Put the setting in the project's `requirements.txt`, so it applies to that proje
 ```text
 --extra-index-url https://wheelgap.github.io/wheels/simple/
 ```
+
+If the file pins hashes (`--require-hashes`, or `--hash` options from `pip-compile --generate-hashes` or
+`uv pip compile --generate-hashes`), pip installs only files whose hash is listed. `--fix` prints each package's gap
+wheel hashes under an `add to the lz4==4.4.5 line:` label. Add them to that requirement's own `\`-continued block,
+keeping the hashes it has: put each right after the `lz4==4.4.5 \` line, ending it with ` \`:
+
+```text
+lz4==4.4.5 \
+    --hash=sha256:265974dacdab81e7790ebb14d95948e1909bc717b1cd9619ad450f494c9fe21a \
+    --hash=sha256:0846e6e78f374156ccf21c631de80967e03cc3c01c373c665789dc0c5431e7fc \
+    ...
+```
+
+A hash outside the block doesn't count. pip ignores one on a line of its own after the block, with only a warning
+(`has --hash but no requirement, and will be ignored`). A second `lz4==4.4.5 --hash=…` line doesn't work either: pip
+allows only the hashes every line for a package shares. Either way it won't use the gap wheel: it builds the sdist,
+or fails with `THESE PACKAGES DO NOT MATCH THE HASHES`.

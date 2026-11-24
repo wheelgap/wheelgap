@@ -38,7 +38,7 @@ A **directory** is searched for, in this order, `uv.lock`, `pylock.toml`, `poetr
 `--environment` makes a directory's `pixi.lock` the one read, and when a directory has `pixi.lock`
 next to another lockfile, a note on stderr names the `pixi.lock` it passed over.
 
-In a directory with none of those names, wheelgap looks further (after 0.13.0; before, this was an error). Each step
+In a directory with none of those names, wheelgap looks further (before, this was an error). Each step
 is tried only if the one before found nothing, a note on stderr says which file was checked and why (also with
 `--quiet`), and `--json` has it in [`directory_inputs`](output.md#json):
 
@@ -46,7 +46,7 @@ is tried only if the one before found nothing, a note on stderr says which file 
    [`wheelgap pyproject.toml`](#pyprojecttoml) checks it: the direct dependencies only, with the usual note that says
    so and names `--deps`. It comes first even when the root also has requirements files under other names (step 2,
    and `requirements*.lock`): wheelgap can't tell from a file whether it pins what the project installs or only its
-   build tools or docs (flask's `requirements/build.txt`). The note names them instead, after 0.13.0, as commands to
+   build tools or docs (flask's `requirements/build.txt`). The note names them instead, as commands to
    run (the first 3, then a count). One that looks like `pip-compile`, `uv pip compile` or `uv export` output is
    named first: `requirements-lock.txt looks compiled and pinned: wheelgap DIR/requirements-lock.txt checks what it
    pins`. It looks so when it has their mark (their header, `# via` comments or `--hash` options) and every package
@@ -89,7 +89,7 @@ step 2 finds no requirements file and step 3 no subfolder input, leaving aside t
 tests, docs or examples. A directory where nothing is found at all is an error that says what was looked for, and
 why its `pyproject.toml` couldn't be checked if it has one.
 
-**A file with nothing to check** (after 0.13.0): when the first lockfile found lists no package from an index (a
+**A file with nothing to check**: when the first lockfile found lists no package from an index (a
 `requirements.txt` that only says `.`, a `pixi.lock` with conda packages only, a `uv.lock` with only the project
 itself), wheelgap reads the next of the names above that has one, then the root's `pyproject.toml`, and a note says
 which file it passed over and why. If none has anything either, the first file is read as before. With
@@ -131,7 +131,7 @@ only a Windows-only dependency pulls in isn't reported on Linux.
 **Answers follow `uv sync`**, with and without `--online` (0.13.0 followed pip with `--online`). uv
 [checks only the lower bound of the `Requires-Python` range](https://docs.astral.sh/uv/reference/internals/resolver/#requires-python), so
 a pin whose release says `<3.15` still counts on Python 3.15, where pip would refuse it (when installing from a
-requirements file exported from the lock, for example). With `--online` (after 0.13.0), wheelgap says where the two
+requirements file exported from the lock, for example). With `--online`, wheelgap says where the two
 differ: a note on stderr gives the number of such packages, `--explain` names them, and `--json` lists the files in
 each package's `pip_refuses`. Without `--online` it can't tell, because the lock doesn't record each file's
 `Requires-Python`. The same rule covers every kind of clause: on Python 3.15, uv also takes a file that says
@@ -187,7 +187,7 @@ that target. Where a lock declares conflicting extras or groups (`[tool.uv] conf
 refuses, wheelgap checks both sides: every way of turning on none or one item of each conflict, as `uv sync
 --all-extras --no-extra ...` would, and a package counts if any of them installs it.
 
-**Conflict markers** (after 0.13.0): uv writes which side of a conflict a dependency needs into the lock's markers
+**Conflict markers**: uv writes which side of a conflict a dependency needs into the lock's markers
 (`extra == 'extra-4-demo-old'` for the extra `old` of `demo`, `extra == 'group-4-demo-cpu'` for a group), with clauses
 that hold only when two sides of one conflict are on at once. wheelgap evaluates them as `uv sync` does: against the
 items each install turns on (the selected extras and groups of the packages it installs, and every extra a dependency
@@ -214,7 +214,7 @@ Default selections can go in [`[tool.wheelgap]`](configuration.md#extras) as `ex
 **Default targets:** wheelgap reads `[tool.uv] required-environments` from the project's `pyproject.toml` as default
 targets; see [Targets](targets.md#how-targets-are-chosen).
 
-**A lock limited by `[tool.uv] environments`** (after 0.13.0): with
+**A lock limited by `[tool.uv] environments`**: with
 [`environments`](https://docs.astral.sh/uv/concepts/resolution/#limited-resolution-environments) set, uv locks for
 those environments only. The lock records them as `supported-markers`, leaves out the packages and wheels that only
 other environments need, and `uv sync` fails anywhere else ("The current Python platform is not compatible with the
@@ -245,7 +245,7 @@ cover, add it to `environments` and run `uv lock`.
 **Read:** each package's wheel and sdist filenames, its `marker`, its `index`, and the file's `requires-python`
 (with the same re-check as `uv.lock` for Pythons it leaves out).
 
-A package's own `requires-python` is applied to the target Python (after 0.13.0): where the range leaves the Python
+A package's own `requires-python` is applied to the target Python: where the range leaves the Python
 out, the pin is `missing` there, because an installer must refuse it
 ([the pylock.toml specification](https://packaging.python.org/en/latest/specifications/pylock-toml/#installation)),
 and `--explain` gives the range. With `--online`, a package looked up on the index goes by the index's per-file
@@ -260,7 +260,7 @@ selection flags don't apply.
 
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` in older locks) and its markers.
 
-A package's `python-versions` is applied to the target Python (after 0.13.0) in locks from lock-version 2.1 on: where
+A package's `python-versions` is applied to the target Python in locks from lock-version 2.1 on: where
 the range leaves the Python out, the pin is `missing` there and `--explain` gives the range. Poetry only locks a
 package for the Pythons its markers select, so this changes an answer only for a Python outside the range the project
 was locked for (`-p 3.14` when the project says `<3.14`), where it shows which pins hold the project back. `*`, and a
@@ -309,7 +309,7 @@ the lock alone can't tell, wheelgap checks a superset of what any Poetry 2.x ins
 **Read:** each package's files (from its `files` list, or from `[metadata.files]` before PDM 2.8) and its `marker`.
 A package with no recorded files is looked up on the index.
 
-A package's `requires_python` is applied to the target Python (after 0.13.0) in locks made with the
+A package's `requires_python` is applied to the target Python in locks made with the
 `inherit_metadata` strategy (PDM's default since 2.11), which records each package's marker: where the range leaves
 the Python out, the pin is `missing` there and `--explain` gives the range. As with `poetry.lock`, this changes an
 answer only for a Python outside the range the project was locked for. It isn't applied to a lock without
@@ -410,11 +410,27 @@ and to every requirement, including those in `-r` and `-c` files: with `--no-bin
 (`source` if it has an sdist), and with `--only-binary` a package with no fitting wheel is `missing`, since pip won't
 build it. `--explain` says which option did it.
 
+**`--pre`, `--all-releases`, `--only-final` and `--prefer-binary`** lines are read as pip 26.3 reads them (after
+0.13.0), in the file and in the files it includes. With `--pre` (anywhere in the file, before or after the requirement),
+a range or a bare name is checked at the newest matching release, pre-releases included, as pip installs it:
+`tokenizers>=0.23` is `1.0.0rc5`, not `0.23.3`. `--all-releases NAMES` allows pre-releases for those packages (`:all:`
+for every package), and `--only-final NAMES` never takes one; a package named wins over `:all:`, and later lines change
+earlier ones, as in pip. Under `--only-final`, a pin to a pre-release (`demo==2.0rc1`) is `unknown`, since pip finds no
+version for it. A pin to any other version isn't affected. pip ignores `--pre` and `--prefer-binary` on a line with `-r`
+or `-c` (`--pre -r base.txt`): it reads the file and drops the line's other options, and wheelgap does the same. pip
+ignores them on a line with `-e` (`--pre -e ./pkg`) too, which it reads as a requirement. `--all-releases` and
+`--only-final` count on both kinds of line, and after a requirement too, because pip's parser applies them as it reads
+the line (and so do `--no-binary` and `--only-binary`). `--prefer-binary` makes pip take an older release that has a
+wheel over a newer one with only an sdist; wheelgap still checks the newest, and says so on stderr when the file has an
+unpinned requirement: `wheelgap: note: requirements.txt:1 sets --prefer-binary: for an unpinned requirement pip may take
+an older release that has a wheel, and wheelgap checked the newest` (`-q` drops it). [`--deps`](cli.md#deps) refuses a
+file with any of these four options, since they change every dependency's release too.
+
 The same two options written after a requirement (`albumentations>=0.3.2 --no-binary qudida,albumentations`, after
 0.13.0) are read too, and mean what pip makes of them: the option counts for the whole install, exactly as on a line
 of its own, not only for that requirement. `--config-settings` after a requirement is accepted as before.
 
-`--hash` options on a requirement (`--hash=sha256:…` or `--hash sha256:…`, after 0.13.0) limit which of the
+`--hash` options on a requirement (`--hash=sha256:…` or `--hash sha256:…`) limit which of the
 release's files pip may install, and wheelgap keeps only those: a file whose `sha256` from PyPI's JSON API is listed.
 Listing only the sdist's hash gives `source`, as pip and uv build it then; listing only another platform's wheels gives
 `missing`. If no file of the release has a listed hash, the package is `unknown` (`none of the hashes in
@@ -425,25 +441,24 @@ the one without them: `sha384` and `sha512` hashes (PyPI gives no such digest), 
 the lookups of [`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
 files come from the index.
 
-Other options after a requirement are read as pip 26.3 reads them there (after 0.13.0). pip parses them and then
+Other options after a requirement are read as pip 26.3 reads them there. pip parses them and then
 ignores `-f` / `--find-links`, `-i` / `--index-url`, `--extra-index-url`, `--no-index`, `--pre`, `--prefer-binary`,
 `-r`, `-c`, `--trusted-host`, `--require-hashes` and `--no-require-hashes`: the requirement is installed as if they
 weren't there, from the same index and at the same version, and no file they name is read. wheelgap ignores them
 too and says so on stderr, once per file and option (`-q` drops it):
 `wheelgap: note: requirements.txt:2: pip ignores -f after a requirement`. To use another index or folder, put the
 option on a line of its own. `--use-feature` is accepted without a note, since no feature changes which file pip
-picks. The rest is an input error that names the file and line: an option pip doesn't have, an ambiguous
-abbreviation, a missing value or one pip's parser refuses (`--hash=abc`, `-C foo`, `--no-binary --pre`)
-(pip refuses the line too); `-e` (pip reads it as making the requirement itself
-editable, and refuses that for a name); and `--all-releases` / `--only-final`, which pip applies to the whole install
-and wheelgap doesn't read.
+picks, and `--all-releases` / `--only-final` are read as on a line of their own (see above). The rest is an input
+error that names the file and line: an option pip doesn't have, an ambiguous abbreviation, a missing value or one
+pip's parser refuses (`--hash=abc`, `-C foo`, `--no-binary --pre`, `--only-final --pre`) (pip refuses the line too);
+and `-e` (pip reads it as making the requirement itself editable, and refuses that for a name).
 
 An included file that can't be read (`-r FILE` or `-c FILE` naming a file that isn't there) is an input error that
 names the including file and line, `requirements.txt:3: -r base.txt: file not found`; pip stops there too.
 
 **Constraint files** (`-c FILE`, `-cFILE`, `--constraint FILE` or `--constraint=FILE`) restrict unpinned requirements
 without adding packages. Exact constraints select a version; ranges are intersected. A requirement that conflicts with
-a constraint is an error (after 0.13.0), as pip refuses it: a pinned version that an exact constraint or a constraint's
+a constraint is an error, as pip refuses it: a pinned version that an exact constraint or a constraint's
 range leaves out, or an exact constraint that the requirement's range or another constraint leaves out. The package is
 reported `unknown` and the run fails. Versions match as pip matches them: `==1.9` and `==1.9.0` agree, and `==1.0`
 with `==1.0+cpu` is `1.0+cpu`. A constraint wheelgap can't apply leaves the package `unknown` rather than guessed: one
@@ -456,11 +471,18 @@ are checked, while the constraints file's own lines stay constraints. A `-c` ins
 An include cycle (two files that include each other, or a file that includes itself, with `-r` or `-c`) is an input
 error naming the chain, as pip refuses it; a file included twice from two different files still lists its packages once.
 An include in a symlinked requirements file is read from the folder the link is in, as pip reads it, not from the folder
-the link points into (after 0.13.0).
+the link points into.
 
 **Skipped:** editable lines (`-e`), local paths (lines starting with `.` or `/`) and URLs (`git+https://…`,
 `name @ https://…`). Other pip options in the file, such as `--index-url`, are ignored: use wheelgap's
-own [`--index-url`](cli.md#index-url) to look packages up on another index.
+own [`--index-url`](cli.md#index-url) to look packages up on another index. An index option on a line of its own
+(`-i` / `--index-url` / `--pypi-url`, `--extra-index-url`, `-f` / `--find-links` or `--no-index`, in the file or one
+it includes) changes where pip looks, so wheelgap's answer is PyPI's alone, and it says so on stderr,
+once per input, naming the option but never its value: `wheelgap: note: requirements.txt sets --extra-index-url,
+which wheelgap doesn't read: its packages were checked on PyPI only, so a package pip finds elsewhere may install
+differently`. `-q` drops the note, and a run with `--index-url` or a `WHEELGAP_INDEX_URL` mirror doesn't print it,
+since that run doesn't check PyPI. An index option on a line with `-r` or `-c` (`--find-links wheels -r base.txt`)
+gets no note: pip 26.3 reads the file and ignores the line's other options, so it looks on PyPI too.
 
 **`--deps`:** with [`--deps`](cli.md#deps) a requirements file is resolved instead — every requirement line is a
 root, and the whole tree it installs is checked per target. Constraint files and `--no-binary` / `--only-binary`
@@ -485,7 +507,7 @@ wheelgap environment.yml -p 3.12 -t linux-aarch64,win-arm64
 
 **Read:** each item in a `pip:` list is read as a [requirements file](#requirements-files) line, so pins, ranges,
 markers, `-r` / `-c` includes, `--no-binary` / `--only-binary` and `--deps` work the same way. An `--index-url` or
-`--extra-index-url` entry in `pip:` marks the file as not PyPI-only, just as in a requirements file.
+`--extra-index-url` entry in `pip:` marks the file as not PyPI-only, and gets the same note, just as in a requirements file.
 
 **Skipped:** conda dependencies (such as `python=3.12`, `numpy`, `pip`) are listed as skipped (`conda`), and editable,
 path and URL lines under `pip:` are skipped as in a requirements file. When the `pip:` list is empty (or absent),
@@ -600,7 +622,7 @@ unknown, since uv won't install it. `exclude-newer-package` gives each package i
 timestamp, a date or a duration), or none with `false`.
 
 A cutoff is an RFC 3339 timestamp with an explicit offset (for example `"2025-01-01T00:00:00Z"`), or a `"YYYY-MM-DD"`
-date, which includes that whole day in the local time zone, as uv does. It can also be a duration (after 0.13.0),
+date, which includes that whole day in the local time zone, as uv does. It can also be a duration,
 uv's [dependency cooldown](https://docs.astral.sh/uv/concepts/resolution/#dependency-cooldowns): `"3 days"`,
 `"1 week"`, `"24 hours"`, `"P3D"`, `"PT24H"`. uv counts a duration back from the current time whenever it resolves,
 and wheelgap counts it back from the time of the run, so the answer is what `uv lock` would pick now and can change

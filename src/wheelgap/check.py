@@ -220,6 +220,10 @@ def _platform_reason(plat: str, target: Target) -> str:
     return f"{plat} doesn't match {target.platform}"
 
 
+# --explain's reason for an abi3 wheel on a free-threaded target; --fix names it for a gap with no fix (fix.abi3_only).
+ABI3_ON_FREETHREADED = "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+
+
 def rejection(filename: str, target: Target) -> str | None:
     """Why `target` can't install this wheel, or None if it can."""
     wheel = _parsed_tags(filename)
@@ -235,7 +239,7 @@ def rejection(filename: str, target: Target) -> str | None:
                 minors = [int(t.interpreter[3:]) for t in stable if t.interpreter[3:].isdigit()]
                 return f"abi3t wheels need CPython 3.{min(minors)}+ (free-threaded)" if minors else "abi3t wheel"
             if any(t.abi == "abi3" for t in wheel):
-                return "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+                return ABI3_ON_FREETHREADED
         built = ", ".join(sorted({f"{t.interpreter}-{t.abi}" for t in wheel}))
         return f"built for {built}, not CPython {target.python}"
     # Name the tag closest to the target: same arch first, and the modern manylinux_2_17_* form
@@ -754,6 +758,31 @@ def _narrow_candidates(
     return candidates
 
 
+def _uv_manifest_fork(source: Source, candidates: list[int], target: Target) -> list[int]:
+    """The entries of a uv.lock manifest dependency that `uv sync` can install on `target`.
+
+    The `[manifest]` requirements (a script's dependencies) and dependency groups (a virtual workspace root's) name
+    only the package, not the `version` and `marker` a package's edges carry, so a package uv forked per Python or
+    platform matches an entry per fork. uv takes the one entry whose own `resolution-markers` hold on the target, or
+    that has none (find_by_markers in https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-lock/src/lock/mod.rs,
+    commit 6b2d39dcc390, called for the manifest's requirements and dependency groups in to_resolution_from_packages
+    in crates/uv-lock/src/lock/installable.rs, which `uv sync` and `uv sync --script` always run with the manifest).
+    It evaluates them without extras; it writes them simplified against requires-python, which doesn't change them
+    on a target inside it. A marker the target can't decide counts as holding, and when no entry fits (uv would fail:
+    MissingRootPackage) every entry is kept, so a gap is never hidden."""
+    if len(candidates) < 2:
+        return candidates
+    packages = source.uv_packages or []
+    kept: list[int] = []
+    for i in candidates:
+        markers = packages[i].get("resolution-markers", [])
+        if not isinstance(markers, list) or not all(isinstance(m, str) for m in markers):
+            return candidates
+        if not markers or any(marker_holds(m, target) for m in markers):
+            kept.append(i)
+    return kept or candidates
+
+
 def _uv_reachable(source: Source, target: Target, paths: dict[int, list[str]] | None = None) -> dict[int, Parent]:
     """Walk selected uv roots, re-visiting a package when another edge activates more extras. In a lock with
     `conflicts`, the packages any of the installs _conflict_worlds lists makes, each with its shortest path."""
@@ -939,6 +968,8 @@ def _uv_walk(
                 dependency.get("version"),
                 dependency.get("source"),
             )
+            if manifest in ("requirements", "group"):
+                candidates = _uv_manifest_fork(source, candidates, target)
             for i in candidates:
                 visit(i, parent, requested, [*path, source.packages[i].name])
 

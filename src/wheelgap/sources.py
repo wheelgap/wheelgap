@@ -68,6 +68,8 @@ class Package:
     markers: list[str] | None = None
     # A version range that isn't an exact pin (numpy>=1.26,<2): the index picks the newest match.
     spec: str | None = None
+    # `spec` with its clauses in the order the requirement writes them (packaging sorts them), for --fix to show.
+    written_spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
     # uv.lock / pylock.toml / poetry.lock / Pipfile.lock: the index the lock says the package came from, e.g.
@@ -108,6 +110,10 @@ class Package:
     # Distribution selection policy from requirements files or uv project configuration.
     no_binary: bool = False
     only_binary: bool = False
+    # A requirements file's release control for this package, as pip's ReleaseControl.allows_prereleases gives it
+    # (--pre, --all-releases, --only-final): True takes pre-releases, False never does (a pinned one is an error), and
+    # None is the default: a pre-release only when the range names one or nothing else matches.
+    prereleases: bool | None = None
     # The relevant uv setting(s), used to explain a gap caused by the configured policy.
     install_policy: str | None = None
     # PyPI project metadata URLs (project_urls and home_page).
@@ -252,6 +258,13 @@ class Source:
     # The input names no index but PyPI, so a package this run found on pypi.org is a PyPI package (for --conda-forge,
     # which sends only such names). False when unsure: lockfiles rely on each package's registry instead.
     pypi_only: bool = False
+    # A requirements file's index options on lines of their own (`--extra-index-url URL`, in it or a file it
+    # includes), by their full names and never with their values, which may hold credentials: pip reads them and
+    # wheelgap doesn't, so the CLI says the file was checked on PyPI only.
+    index_options: list[str] = field(default_factory=list)
+    # The same for the other -r files of its pip install line, whose index options pip applies to it too: (the file
+    # that sets them, their names).
+    line_index_options: list[tuple[str, list[str]]] = field(default_factory=list)
     # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
     passed_over: Path | None = None
     # The input was a directory: which of its files this is and why (None for a file or package names).
@@ -1932,7 +1945,21 @@ def requirement_to_package(text: str, origin: str, hashes: frozenset[str] = froz
         return Package(req.name, None, skip="url", origin=origin, markers=markers, hashes=hashes)
     version = _pinned_version(req)
     spec = str(req.specifier) if req.specifier and version is None else None
-    return Package(req.name, version, origin=origin, markers=markers, spec=spec, hashes=hashes)
+    written = _as_written(text, req.specifier) if spec else None
+    return Package(req.name, version, origin=origin, markers=markers, spec=spec, hashes=hashes, written_spec=written)
+
+
+def _as_written(text: str, specifier: SpecifierSet) -> str:
+    """The specifier's clauses in the order `text` writes them, or packaging's order when that can't be told (a clause
+    that isn't found exactly once)."""
+    flat = re.sub(r"\s+", "", text.split(";", 1)[0])
+    found = []
+    for clause in specifier:
+        hits = [m.start() for m in re.finditer(re.escape(str(clause)) + r"(?=,|\)|$)", flat)]
+        if len(hits) != 1:
+            return str(specifier)
+        found.append((hits[0], str(clause)))
+    return ",".join(clause for _, clause in sorted(found))
 
 
 # "name @ url", "name@url" and "name[extra] @ url": PEP 508 direct references, which Requirement parses.
@@ -1945,7 +1972,8 @@ _VIA_COMMENT_RE = re.compile(r"^#\s*via\b")
 
 
 # pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
-_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "--no-index")
+# --pypi-url is pip's other name for --index-url.
+_INDEX_OPTIONS = ("--index-url", "--pypi-url", "--extra-index-url", "--find-links", "--no-index")
 
 
 def _names_index_option(line: str) -> bool:
@@ -1959,6 +1987,55 @@ def _names_index_option(line: str) -> bool:
         if len(option) > 2 and option.startswith("--") and any(name.startswith(option) for name in _INDEX_OPTIONS):
             return True
     return False
+
+
+def _index_option_names(lines: Iterable[str]) -> list[str]:
+    """The index options pip reads on these lines of options, by their long names (`-i URL` is `--index-url`, the
+    abbreviation `--extra URL` is `--extra-index-url`), in order and once each. Tokens are read as pip's optparse reads
+    them (_REQUIREMENT_LINE_OPTIONS), so a value (`--trusted-host -ifoo`) and an ambiguous abbreviation (`--no`, which
+    pip refuses) name none. A requirement line is passed over: pip ignores an index option after a requirement, and
+    _requirement_options notes that. So is a line with -r or -c: pip reads the file it names and never applies the
+    line's other options (`_parse_and_recurse` doesn't hand the line to `handle_option_line`), so pip 26.3 doesn't
+    look in `--find-links wheels -r base.txt`'s folder."""
+    names: dict[str, None] = {}
+    for line in lines:
+        if not line.startswith("-"):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        found: list[str] = []
+        include = False
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            i += 1
+            if token == "--":
+                break
+            if token.startswith("--"):
+                option, eq, _ = token.partition("=")
+                matches = (
+                    [option]
+                    if option in _LONG_LINE_OPTIONS
+                    else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+                )
+                if len(matches) != 1:
+                    continue
+                name, entry, attached = matches[0], _LONG_LINE_OPTIONS[matches[0]], bool(eq)
+            elif token.startswith("-") and token[:2] in _SHORT_LINE_OPTIONS:
+                entry = _SHORT_LINE_OPTIONS[token[:2]]
+                name, attached = entry[0][1], len(token) > 2  # `-fURL` holds its value
+            else:
+                continue
+            include = include or name in ("--requirement", "--constraint")
+            if name in _INDEX_OPTIONS:
+                found.append(name)
+            if entry[1] and not attached:  # `-i URL`, `--extra-index-url URL`: the next token is the value
+                i += 1
+        if not include:
+            names.update(dict.fromkeys(found))
+    return list(names)
 
 
 def _abbreviated_include(line: str) -> bool:
@@ -1987,6 +2064,8 @@ _VALUE_OPTIONS = (
     "--use-feature",
     "--hash",
     "--config-settings",
+    "--all-releases",
+    "--only-final",
 )
 _FLAG_OPTIONS = ("--no-index", "--pre", "--prefer-binary", "--require-hashes")
 
@@ -2064,13 +2143,58 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
 
 
 class _FormatControl:
-    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files."""
+    """Matches pip's FormatControl for --no-binary and --only-binary options in requirements files, and the other
+    finder options of option lines that change which file or release pip picks: its ReleaseControl (--pre,
+    --all-releases, --only-final; pip/_internal/models/release_control.py) and --prefer-binary."""
 
     def __init__(self) -> None:
         self.no_binary: set[str] = set()
         self.only_binary: set[str] = set()
+        self.all_releases: set[str] = set()
+        self.only_final: set[str] = set()
+        # Where a release option or --prefer-binary was first read (`base.txt:1 sets --pre`), for --deps to refuse and
+        # the CLI's note.
+        self.release_set: str | None = None
+        self.prefer_binary: str | None = None
+
+    def apply_release(self, option: str, value: str) -> None:
+        """--all-releases or --only-final, as ReleaseControl.handle_mutual_excludes reads its value: `:all:` clears
+        both sets, and a name after it counts only after a `:none:`."""
+        target, other = (
+            (self.all_releases, self.only_final) if option == "--all-releases" else (self.only_final, self.all_releases)
+        )
+        new = value.split(",")
+        while ":all:" in new:
+            other.clear()
+            target.clear()
+            target.add(":all:")
+            del new[: new.index(":all:") + 1]
+            if ":none:" not in new:
+                return
+        for item in new:
+            if item == ":none:":
+                target.clear()
+                continue
+            key = canonicalize_name(item)
+            other.discard(key)
+            target.add(key)
+
+    def allows_prereleases(self, key: str) -> bool | None:
+        """ReleaseControl.allows_prereleases: a package named in a set wins over :all:."""
+        if key in self.all_releases:
+            return True
+        if key in self.only_final:
+            return False
+        if ":all:" in self.all_releases:
+            return True
+        if ":all:" in self.only_final:
+            return False
+        return None
 
     def apply(self, option: str, value: str) -> None:
+        if option in ("--all-releases", "--only-final"):
+            self.apply_release(option, value)
+            return
         target, other = (
             (self.no_binary, self.only_binary) if option == "--no-binary" else (self.only_binary, self.no_binary)
         )
@@ -2171,6 +2295,67 @@ def _apply_format_options(line: str, format_control: _FormatControl) -> bool:
     return True
 
 
+def _apply_release_options(line: str, format_control: _FormatControl, where: str, handled: bool) -> None:
+    """The release options and --prefer-binary of a line of options, as pip 26.3 applies them. --all-releases and
+    --only-final change the install's settings from their parser callbacks, so they count on any line pip parses.
+    --pre and --prefer-binary count only where pip hands the line to handle_option_line (`handled`): not on a line
+    with -r or -c, whose file pip reads instead, so `--pre -r base.txt` takes no pre-release. `--pre` adds `:all:` to
+    the releases it allows, as handle_option_line does, without clearing --only-final's names."""
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        return  # _read_requirements has refused the line already
+    refused = f"{where}: pip refuses this line:"
+    found: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        if token == "--":
+            break
+        value: str | None
+        if token.startswith("--"):
+            option, eq, given = token.partition("=")
+            matches = (
+                [option] if option in _LONG_LINE_OPTIONS else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+            )
+            if len(matches) != 1:
+                continue
+            name, entry, value = matches[0], _LONG_LINE_OPTIONS[matches[0]], given if eq else None
+        elif token.startswith("-") and token[:2] in _SHORT_LINE_OPTIONS:
+            entry = _SHORT_LINE_OPTIONS[token[:2]]
+            name, value = entry[0][1], token[2:] or None
+        else:
+            continue
+        if entry[1] and value is None:
+            value = tokens[i] if i < len(tokens) else None
+            i += 1
+        found.append((name, value))
+    # A line with -e is a requirement line to pip (ParsedLine.requirement is the editable), so handle_line never
+    # hands it to handle_option_line: pip 26.3 takes no pre-release for `--pre -e ./pkg`.
+    handled = handled and all(name != "--editable" for name, _ in found)
+    for name, value in found:
+        if name in ("--all-releases", "--only-final"):
+            if value is None:
+                raise SourceError(f"{refused} {name} option requires 1 argument")
+            if value.startswith("-"):
+                raise SourceError(f"{refused} --all-releases / --only-final option requires 1 argument.")
+            format_control.apply_release(name, value)
+            format_control.release_set = format_control.release_set or f"{where} sets {name}"
+        elif name == "--pre" and handled:
+            format_control.all_releases.add(":all:")
+            format_control.release_set = format_control.release_set or f"{where} sets --pre"
+        elif name == "--prefer-binary" and handled:
+            format_control.prefer_binary = format_control.prefer_binary or where
+
+
+def _is_prerelease(version: str) -> bool:
+    try:
+        return Version(version).is_prerelease
+    except InvalidVersion:  # an === pin of a version PEP 440 can't read: pip's filter keeps it
+        return False
+
+
 def _pin_specifier(version: str) -> str:
     """The specifier of an exact pin: `==`, or `===` for a version PEP 440 can't read (which only `===` can pin)."""
     try:
@@ -2233,9 +2418,17 @@ def _constraint_conflict(pkg: Package, entries: list[Package]) -> str | None:
     return f"{first} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
 
 
-def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> Source:
+def parse_requirements(
+    path: Path, constraint_paths: tuple[Path, ...] = (), line_files: tuple[Path, ...] = ()
+) -> Source:
     """`constraint_paths` are constraints files given beside the file (`pip install -r FILE -c CONSTRAINTS`): pip
-    reads them before FILE, so they count as a `-c CONSTRAINTS` line at the top of it would."""
+    reads them before FILE, so they count as a `-c CONSTRAINTS` line at the top of it would.
+
+    `line_files` are all the -r files of that one install (`pip install -r a.txt -r b.txt`), in the order of the line,
+    FILE among them. pip reads them into one install with one finder (get_requirements in
+    pip/_internal/cli/req_command.py at 26.3), after the constraints files and before it resolves, so the option
+    lines of every file (--no-binary, --only-binary, --pre, an index option) and the -c lines inside them count for
+    FILE's requirements too, in either order. Only FILE's own requirements are the source's packages."""
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
     index_options: list[str] = []
@@ -2260,20 +2453,74 @@ def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> S
                 ignored_options=ignored_options,
             )
         )
-    pkgs.extend(
-        _read_requirements(
-            path,
-            seen,
-            constraints,
-            index_options=index_options,
-            format_control=format_control,
-            req_lines=req_lines,
-            compiler_signs=compiler_signs,
-            ignored_options=ignored_options,
-        )
+    own = Path(os.path.abspath(path))
+    line_index_options: list[tuple[str, list[str]]] = []
+    for file in line_files or (path,):
+        if Path(os.path.abspath(file)) == own:
+            pkgs.extend(
+                _read_requirements(
+                    path,
+                    seen,
+                    constraints,
+                    index_options=index_options,
+                    format_control=format_control,
+                    req_lines=req_lines,
+                    compiler_signs=compiler_signs,
+                    ignored_options=ignored_options,
+                )
+            )
+        else:
+            line_index_options += _read_line_options(file, seen, constraints, format_control)
+    shared = [line for _, lines in line_index_options for line in lines]
+    source = _finalize_requirements(
+        path, pkgs, constraints, index_options + shared, format_control, req_lines, compiler_signs
     )
-    source = _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source.index_options = _index_option_names(index_options)
+    source.line_index_options = [(name, _index_option_names(lines)) for name, lines in line_index_options]
     source.ignored_options = list(ignored_options.values())
+    return source
+
+
+def _read_line_options(
+    file: Path, seen: dict[bool, set[Path]], constraints: list[Package], format_control: _FormatControl
+) -> list[tuple[str, list[str]]]:
+    """Read another -r file of a pip install line for what it sets for the whole install: its options into
+    `format_control`, its -c lines into `constraints`, and (returned) its index option lines, as (its name, lines).
+    Its requirements are its own source's. It gets its own record of requirement files read, so a file both include
+    still lists its packages in each; the constraints files read are shared (`seen`), so none is added twice."""
+    index_options: list[str] = []
+    _read_requirements(
+        file,
+        {False: set(), True: seen[True]},
+        constraints,
+        index_options=index_options,
+        format_control=format_control,
+    )
+    return [(file.name, index_options)] if index_options else []
+
+
+def parse_named_requirements(label: str, names: list[str], line_files: tuple[Path, ...]) -> Source:
+    """Requirements named on a pip install line (`pip install -r a.txt fastlib==2.0.0`), with what the line's -r and -c
+    files set for the whole install, as pip reads them with one finder (pip 26.3: --no-binary :all: in a.txt leaves
+    fastlib no wheel, in either order): the option lines, the -c lines inside them, and their index options. (A -c
+    FILE beside names on the line isn't read: dockerfile_requirements refuses it.)"""
+    constraints: list[Package] = []
+    seen: dict[bool, set[Path]] = {False: set(), True: set()}
+    format_control = _FormatControl()
+    line_index_options: list[tuple[str, list[str]]] = []
+    for file in line_files:
+        line_index_options += _read_line_options(file, seen, constraints, format_control)
+    pkgs = [requirement_to_package(name, label) for name in names]
+    shared = [line for _, lines in line_index_options for line in lines]
+    read = _finalize_requirements(Path(label), pkgs, constraints, shared, format_control, [], [])
+    source = Source(label, read.packages, pypi_only=not shared)
+    source.specs = list(names)
+    source.line_index_options = [(name, _index_option_names(lines)) for name, lines in line_index_options]
+    source.format_control = read.format_control
+    source.constraint_specs = read.constraint_specs
+    source.marker_constraint_specs = read.marker_constraint_specs
+    source.constraint_errors = read.constraint_errors
+    source.deps_blockers = read.deps_blockers
     return source
 
 
@@ -2332,11 +2579,28 @@ def _finalize_requirements(
     for pkg in pkgs:
         if not pkg.skip:
             pkg.no_binary, pkg.only_binary = format_control.policy(pkg.key)
+            pkg.prereleases = format_control.allows_prereleases(pkg.key)
+            if pkg.prereleases is False and pkg.version and not pkg.error and _is_prerelease(pkg.version):
+                # pip filters the candidates with prereleases=False, which leaves out even the one a pin names: pip
+                # 26.3 with `--only-final :all:` and `demo==2.0rc1` says "Could not find a final version".
+                pkg.error = (
+                    f"pip installs only final releases of {pkg.name} here (--only-final), so it finds no "
+                    f"{pkg.version} (pip refuses this)"
+                )
+    # These change which release pip picks for every dependency too, and the resolver doesn't read them yet.
+    if format_control.release_set:
+        deps_blockers.append(f"{format_control.release_set}, which changes the releases pip picks for dependencies")
+    if format_control.prefer_binary:
+        deps_blockers.append(
+            f"{format_control.prefer_binary} sets --prefer-binary, which changes the releases pip picks for "
+            "dependencies"
+        )
     return Source(
         path.name,
         pkgs,
         requirements=True,
         pypi_only=not index_options and not _nearby_config_names_an_index(path),
+        index_options=_index_option_names(index_options),
         specs=req_lines,
         compiled="hash" in compiler_signs,  # hash mode makes pip refuse anything unpinned: the file is complete
         constraint_specs=constraint_specs,
@@ -2379,7 +2643,7 @@ def _include_error(path: Path, number: int | None, line: str, error: OSError, st
 # only --hash and --config-settings, and never calls handle_option_line for the line, so the index, include and
 # finder options are dropped ("ignored"). Some still take effect, because their parser callback changes the install's
 # own settings as the line is parsed: --no-binary and --only-binary ("format", which wheelgap reads) and
-# --all-releases and --only-final ("release", which wheelgap doesn't), for the whole install. -e makes the line's
+# --all-releases and --only-final ("release", which wheelgap reads too), for the whole install. -e makes the line's
 # requirement an editable one, which pip refuses for a name. --use-feature turns the feature on for the run (its
 # parser list is shared), and no feature changes which file pip picks. Each entry: spellings, takes a value, kind.
 _REQUIREMENT_LINE_OPTIONS: tuple[tuple[tuple[str, ...], bool, str], ...] = (
@@ -2419,12 +2683,12 @@ def _requirement_options(
     text: str, where: str
 ) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str]]:
     """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
-    by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash, each --no-binary or
-    --only-binary as (long name, value) in order, for the install's format control, what pip ignores there, for
-    a note: each option as
-    (the name it was written with, its long name), and words that aren't options, which optparse sets aside, as one
-    entry, and the frozenset of sha256 digests from --hash options. SourceError where pip refuses
-    the line, or where it applies an option that wheelgap doesn't read."""
+    by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash; each --no-binary,
+    --only-binary, --all-releases or --only-final as (long name, value) in order, for the install's format and release
+    control; what pip ignores there, for a note: each option as (the name it was written with, its long name), and
+    words that aren't options, which optparse sets aside, as one entry; and the frozenset of sha256 digests from
+    --hash options. SourceError where pip refuses the line, or where it applies an option that wheelgap doesn't read
+    (-e)."""
     try:
         tokens = shlex.split(text)
     except ValueError:
@@ -2475,6 +2739,8 @@ def _requirement_options(
         # The checks pip's parser callbacks make (the first is a CommandError, the others optparse errors).
         if kind == "format" and given_value.startswith("-"):
             raise SourceError(f"{refused} --no-binary / --only-binary option requires 1 argument.")
+        if kind == "release" and given_value.startswith("-"):
+            raise SourceError(f"{refused} --all-releases / --only-final option requires 1 argument.")
         if kind == "hash":
             if ":" not in given_value:
                 raise SourceError(
@@ -2495,16 +2761,13 @@ def _requirement_options(
                 f"{where}: pip reads {name} after a requirement as making that requirement editable, and refuses it "
                 'for a name ("is not a valid editable requirement"); put the editable on a line of its own'
             )
-        if kind == "release":
-            raise SourceError(
-                f"{where}: pip applies {name} after a requirement to the whole install, and it can change which "
-                "release pip picks; wheelgap doesn't read it"
-            )
         if kind == "ignored":
             ignored.append((name, names[-1]))  # -f and --find-links are one option
         hashed = hashed or kind == "hash"
-        if kind == "format" and given_value:
-            formats.append((name, given_value))  # the value pip's callback reads, never a word after another option
+        if kind in ("format", "release") and given_value:
+            # The value pip's callback reads, never a word after another option; the callback applies it to the whole
+            # install, exactly as on a line of its own.
+            formats.append((name, given_value))
     return hashed, formats, ignored, frozenset(sha256_hashes)
 
 
@@ -2580,6 +2843,8 @@ def _read_requirements(
                 include = _line_include(tokens, path.name)
             if include and format_control is not None:
                 _apply_format_options(line, format_control)  # pip applies `--no-binary X -r f` before reading f
+                where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                _apply_release_options(line, format_control, where, handled=False)
             if include and include[0]:
                 target = include[1]
                 # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
@@ -2637,6 +2902,12 @@ def _read_requirements(
                 pkgs.extend(included)
                 continue
             if line.startswith("-e ") or line.startswith("--editable"):
+                if format_control is not None:
+                    # pip's parser callbacks apply `-e ./pkg --all-releases demo` and `-e ./pkg --no-binary demo` as
+                    # it reads the line, though the line is a requirement to pip (pip 26.3 ran both).
+                    _apply_format_options(line, format_control)
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    _apply_release_options(line, format_control, where, handled=False)
                 if not already_seen:
                     name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
                     append(Package(name, None, skip="editable", origin=path.name))
@@ -2644,6 +2915,8 @@ def _read_requirements(
             if line.startswith("-"):
                 if format_control is not None:
                     _apply_format_options(line, format_control)
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    _apply_release_options(line, format_control, where, handled=True)
                 continue  # pip options: --index-url, --no-binary, --hash continuation, ...
             # The requirement ends where pip ends it: before the first word, split at single spaces, that starts
             # with "-" (break_args_options), so "name\t--no-binary x" is one requirement pip can't parse. The rest is
@@ -2665,6 +2938,8 @@ def _read_requirements(
                     # and the later option wins.
                     for format_option, format_value in formats:
                         format_control.apply(format_option, format_value)
+                        if format_option in ("--all-releases", "--only-final"):
+                            format_control.release_set = format_control.release_set or f"{where} sets {format_option}"
             if already_seen:
                 continue
             # Only on requirement lines: a --hash or "# via" in a constraints file never marked the input compiled.
@@ -3353,17 +3628,21 @@ def load_file(
     constraint_paths: tuple[Path, ...] = (),
     *,
     kind: str | None = None,
+    line_files: tuple[Path, ...] = (),
 ) -> Source:
     """Read one input file. `environment` picks a pixi.lock environment (default: `default`). `constraint_paths` are
-    the constraints files given beside a requirements file (see parse_requirements). `kind` overrides `file_kind(path)`
-    when the caller already knows the format (for example `pip install -r FILE` in a Dockerfile)."""
+    the constraints files given beside a requirements file, and `line_files` the -r files of its install line (see
+    parse_requirements). `kind` overrides `file_kind(path)` when the caller already knows the format (for example
+    `pip install -r FILE` in a Dockerfile)."""
     kind = kind or file_kind(path)
     if constraint_paths and kind != "requirements":
         raise SourceError(f"{path.name}: constraints files (pip install -c) only apply to a requirements file")
+    if len(line_files) > 1 and kind != "requirements":
+        raise SourceError(f"{path.name}: other -r files of an install line only apply to a requirements file")
     if kind == "pixi":
         source = parse_pixi_lock(path, environment)
-    elif constraint_paths:
-        source = parse_requirements(path, constraint_paths)
+    elif constraint_paths or len(line_files) > 1:
+        source = parse_requirements(path, constraint_paths, line_files)
     else:
         source = READERS[kind](path)
     source.path, source.kind, source.constraint_paths = path, kind, constraint_paths
@@ -3874,11 +4153,13 @@ def load_inputs(
     *,
     requirements_constraints: Mapping[Path, tuple[Path, ...]] | None = None,
     file_kinds: Mapping[Path, str] | None = None,
+    requirements_line_files: Mapping[Path, tuple[Path, ...]] | None = None,
 ) -> list[Source]:
     """Each input is a file, a directory (its input is found by load_directory) or a requirement like 'numpy==2.3.4'.
     `environment` picks the pixi.lock environment; with no pixi.lock input it's an error.
     `requirements_constraints` maps a requirements file among the inputs to the constraints files given beside it
-    (--dockerfile-inputs: `pip install -r FILE -c CONSTRAINTS`).
+    (--dockerfile-inputs: `pip install -r FILE -c CONSTRAINTS`), and `requirements_line_files` to all the -r files of
+    its install line (`pip install -r a.txt -r b.txt`), whose options pip applies to each of them.
     `file_kinds` overrides `file_kind()` for specific files (e.g. `pip install -r` files with any name)."""
     if environment == "":
         raise SourceError("--environment needs a name")
@@ -3891,7 +4172,8 @@ def load_inputs(
         elif p.is_file():
             constraints = requirements_constraints.get(p, ()) if requirements_constraints is not None else ()
             kind = file_kinds.get(p) if file_kinds is not None else None
-            sources.append(load_file(p, environment, constraints, kind=kind))
+            line_files = requirements_line_files.get(p, ()) if requirements_line_files is not None else ()
+            sources.append(load_file(p, environment, constraints, kind=kind, line_files=line_files))
         elif "/" in item or item.endswith((".lock", ".txt", ".toml", ".json", ".in", ".yml", ".yaml")):
             raise SourceError(f"{item}: no such file")
         else:

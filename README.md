@@ -11,9 +11,34 @@
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 [![good first issues](https://img.shields.io/github/issues/wheelgap/wheelgap/good%20first%20issue?label=good%20first%20issues&color=7057ff)](https://github.com/wheelgap/wheelgap/labels/good%20first%20issue)
 
-**Find the Python dependencies that have no prebuilt wheel for your target platform, before your Docker build does.**
+**Find the Python dependencies that have no prebuilt wheel for your platform, before your Docker build does, and get the exact change that fixes each one.**
 
-Point it at your lockfile and the platforms you ship to (ARM servers, Alpine images, Windows on ARM, free-threaded Python 3.14t). It tells you which packages pip or uv will have to compile from source, and which can't be installed at all.
+Point it at your lockfile and the platforms you ship to (ARM servers, Alpine images, Windows on ARM, Python 3.15, free-threaded 3.14t). It tells you which packages pip or uv will have to compile from source, and which can't be installed at all. With `--fix` it says how to close each gap: first the upgrade to an official release that has the wheel, with the command for your lockfile; then, only where you can't upgrade, an unofficial wheel from wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/):
+
+```console
+$ uvx wheelgap requirements.txt -p 3.15 -t linux-x86_64,win-amd64 --fix
+wheelgap 0.14.0 · requirements.txt · 3 packages · Python 3.15
+
+package     version  linux-x86_64  win-amd64
+markupsafe  3.0.2    ● source      ● source
+pyyaml      6.0.3    ● source      ● source
+zstandard   0.25.0   ● source      ● source
+...
+--fix: 6 gaps (3 packages × their targets): 4 can be fixed by upgrading to an official release; 2 only by an unofficial gap wheel; 0 have no fix yet.
+
+Upgrade: a newer official release has the wheel:
+  markupsafe 3.0.2 -> 3.0.4: linux-x86_64, win-amd64
+  pyyaml 6.0.3 -> 6.0.4: linux-x86_64, win-amd64
+In requirements.txt, change the pins to markupsafe==3.0.4, pyyaml==6.0.4.
+wheelgap doesn't resolve dependencies: the rest of them must allow these releases.
+
+As a fallback, wheelgap's gap wheel index has unofficial wheels PyPI lacks (built by wheelgap from PyPI's sdist, not by the packages' maintainers) for:
+  pyyaml 6.0.3: linux-x86_64 (if you can't upgrade pyyaml)
+  zstandard 0.25.0: linux-x86_64, win-amd64
+...
+```
+
+In 83 pinned projects from the 300 most-starred Python repositories, 82% of the Python 3.15 gaps on Linux x86-64 were stale pins like these: the release with the wheel was already out. For a `uv.lock`, `--fix` prints the `uv lock --upgrade-package` command instead. Gap wheels are built twice from the sdist on PyPI, published only if both builds are byte-for-byte identical, and installed and imported on a fresh machine first ([how they're made](https://wheelgap.github.io/wheels/)).
 
 🔎 **Try it on any public repo, in your browser: [wheelgap.github.io/tracker/check](https://wheelgap.github.io/tracker/check/).** Paste a GitHub repository. It reads the lockfile, works out the platforms the repo ships to from its CI and Dockerfiles, and lists every dependency with no prebuilt wheel there, with the release that fixes it. Nothing to install.
 
@@ -39,7 +64,7 @@ pipx run wheelgap
 
 Or install it: `pip install wheelgap`.
 
-Run either one in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt`, `requirements.lock` or `pixi.lock` on its own. Without one of those it checks the dependencies in `pyproject.toml`, or the project's one requirements file under another name or in a subfolder, and says which file it read (after 0.13.0). [Getting started](https://wheelgap.github.io/wheelgap/getting-started/) walks through a first run.
+Run either one in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt`, `requirements.lock` or `pixi.lock` on its own. Without one of those it checks the dependencies in `pyproject.toml`, or the project's one requirements file under another name or in a subfolder, and says which file it read. [Getting started](https://wheelgap.github.io/wheelgap/getting-started/) walks through a first run.
 
 ## Usage
 
@@ -84,7 +109,7 @@ wheelgap --dist dist -p 3.13 -t win-arm64,linux-aarch64
 # (a global `ARG PYTHON_VERSION=3.13` before the first FROM works too)
 wheelgap --dockerfile Dockerfile
 
-# FROM ubuntu, nvidia/cuda or any other image (after 0.13.0): say what to check with -p and -t
+# FROM ubuntu, nvidia/cuda or any other image: say what to check with -p and -t
 wheelgap --dockerfile Dockerfile -p 3.13 -t linux-x86_64 --glibc 2.39
 
 # ...and check what it installs with RUN pip install -r requirements.txt
@@ -137,7 +162,7 @@ resolutions appear in separate rows, including in JSON, with `n/a` for targets u
 
 `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`), piwheels wheels for a Raspberry Pi gap (`--piwheels`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)). `--suggest` is on by default when `--deps` resolved every input, since it already looked the whole tree up on PyPI; `--no-suggest` turns it off.
 
-`--fix` lists the gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/) fills (today Windows on ARM, musl Linux on ARM and free-threaded x86_64 Linux, for CPython 3.14 and 3.14t), with the `pyproject.toml` snippet for uv or the `--extra-index-url` line for pip. It reads the index's list in one request that names no package, and never changes the exit code ([how](https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index)); `--print-gap-wheel-snippet` prints just that configuration for one uv.lock or requirements file, without writing it ([details](https://wheelgap.github.io/wheelgap/cli/#print-gap-wheel-snippet)).
+`--fix` says how to fix each gap, leading with the upgrade: the nearest newer release that has the wheel, with the command for your input (`uv lock --upgrade-package pyyaml` for a uv.lock, or the new pin), since most new-Python gaps are fixed that way; it looks those packages up on pypi.org, as `--suggest` does, and wheelgap doesn't resolve, so the rest of your dependencies must allow the release. For the rest, it lists the gaps an unofficial wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/) fills (the [index page](https://wheelgap.github.io/wheels/#published_wheels) lists the targets it covers), with the `pyproject.toml` snippet for uv or the `--extra-index-url` line for pip. It reads the index's list in one request that names no package, and never changes the exit code ([how](https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index)); `--print-gap-wheel-snippet` prints just that configuration for one uv.lock or requirements file, without writing it ([details](https://wheelgap.github.io/wheelgap/cli/#print-gap-wheel-snippet)).
 
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 
@@ -151,7 +176,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.13.0
+- uses: wheelgap/wheelgap@v0.14.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -163,7 +188,7 @@ The job fails when a dependency would build from source on a target you ship, fo
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.13.0
+    rev: v0.14.0
     hooks:
       - id: wheelgap
 ```
@@ -226,7 +251,7 @@ This checks both lockfiles and lists the packages that got worse on a target (a 
 
 - **Lockfiles are read offline.** `uv.lock` (and a script's `example.py.lock`), `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version. wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
 - **`requirements.txt`, `Pipfile.lock`, `pixi.lock`, `environment.yml`, `pyproject.toml`, a script's `# /// script` block and bare package names** are looked up on the PyPI JSON API (or your `--index-url`). wheelgap checks the requirements you give it and doesn't resolve dependencies, except for package names, requirements files, `environment.yml`, `pyproject.toml` and scripts with `--deps`, which resolves what they install per target from PyPI's metadata. For `pyproject.toml`, `--group NAME` also checks a PEP 735 dependency group and `--only-group NAME` checks just the named groups (no group is selected by default). If the file has groups but no `[project]` table, select a group explicitly with either flag.
-- **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too. A `uv.lock` limited by `[tool.uv] environments` is checked only where uv installs it (after 0.13.0): a target outside its environments is an error, not a list of false gaps.
+- **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too. A `uv.lock` limited by `[tool.uv] environments` is checked only where uv installs it: a target outside its environments is an error, not a list of false gaps.
 - **No guessing.** Where wheelgap can't be sure, it says `unknown`, which counts as a gap, rather than guess.
 
 [How it works](https://wheelgap.github.io/wheelgap/how-it-works/) covers version ranges, `--online` and `--offline`, the lookup cache and private indexes, and the [FAQ](https://wheelgap.github.io/wheelgap/faq/) answers "why does it say source when pip installs a wheel?".

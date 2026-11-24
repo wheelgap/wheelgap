@@ -22,7 +22,7 @@ For the known cases where wheelgap's answer can differ from pip's and uv's, see
 Version ranges such as `numpy>=1.26,<2` use the newest matching release with a non-yanked file whose
 `Requires-Python` permits the selected Python. With several `-p` versions, each Python major/minor selects its own
 release from one index response. Regular and free-threaded builds of the same Python share release selection, but
-each still checks its own wheel tags. Missing or invalid `Requires-Python` metadata is treated as unrestricted.
+each still checks its own wheel tags. Missing or invalid `Requires-Python` metadata is treated as unrestricted. A pre-release counts only when the range names one or nothing else matches, as in pip, unless a requirements file sets `--pre`, `--all-releases` or `--only-final` (see [requirements files](inputs.md#requirements-files)).
 Exact pins (`name==1.2.3`) skip files whose `Requires-Python` excludes the selected Python, as pip does, and resolve
 per Python the same way. Bare package names keep their existing behavior. This applies to both the PyPI JSON API and
 `--index-url` simple indexes. A `uv.lock` is the exception: it's answered the way `uv sync` installs it, and uv
@@ -48,7 +48,7 @@ That is right for an image that follows a minor version, like `python:3.9-slim`.
 an early patch release: cryptography 44.0.0 has `Requires-Python: !=3.9.0,!=3.9.1,>=3.7`, so pip in
 `python:3.9.1-slim` refuses it, and wheelgap, which checks 3.9, doesn't flag it. `-p` takes no patch release
 (`-p 3.9.1` is an error), so when `--dockerfile` reads a tag that names one, wheelgap checks the minor version and
-(after 0.13.0) says so:
+ says so:
 
 ```
 wheelgap: note: Dockerfile: python:3.9.1-slim pins Python 3.9.1; wheelgap checks 3.9 at its newest patch release, so a package that needs a later 3.9 patch isn't flagged
@@ -71,7 +71,7 @@ still checked, so a possible gap is reported rather than hidden. See
   locked files, so their names are never sent to PyPI. Use it when a project has uploaded new wheels for an existing
   version since you locked.
 - A `uv.lock` made with `[tool.uv] environments` is locked for those environments only: uv leaves out what other
-  platforms need and `uv sync` fails there, so (after 0.13.0) a target outside them is an error rather than a list
+  platforms need and `uv sync` fails there, so a target outside them is an error rather than a list
   of gaps, and the default targets are narrowed to the ones the lock covers. See [uv.lock](inputs.md#uvlock).
 - A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with
   `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without
@@ -132,9 +132,10 @@ points the JSON API lookups at a mirror; see [Pipfile.lock](inputs.md#pipfileloc
 
 Five opt-in flags send the names of packages with gaps somewhere other than the index: `--conda-forge` to
 anaconda.org, `--piwheels` to piwheels.org, `--notes` to wheelgap.github.io, `--build-info` to PyPI's file host, for
-the sdist, and `--suggest` to PyPI's JSON API, for the package's list of releases. A name from a private index must
-never leave the run, so all five send a package's name only when wheelgap knows the package is PyPI's. That's one
-rule, shared by the five, and it holds when all of these do:
+the sdist, and `--suggest` to PyPI's JSON API, for the package's list of releases. `--fix` sends the
+same names as `--suggest`, for the same list of releases (its upgrade lookups; one request per package however many
+of the two flags ask). A name from a private index must never leave the run, so all of them send a package's name
+only when wheelgap knows the package is PyPI's. That's one rule, shared by them all, and it holds when all of these do:
 
 - **Lookups go to pypi.org:** no `--index-url` (or `index-url` in `[tool.wheelgap]`) and no `WHEELGAP_INDEX_URL`
   pointing at another index. With either, none of the five sends anything, and a note on stderr says so.
@@ -150,18 +151,19 @@ rule, shared by the five, and it holds when all of these do:
 - **And either** its lock records its index as exactly `https://pypi.org/simple` (a `uv.lock` registry or a
   `pylock.toml` index; a `poetry.lock` legacy source or a `pixi.lock` index with that exact URL counts too, except for
   `--notes`), **or** this run looked it up and found it on pypi.org, and nothing points pip or uv at another index:
-    - **The input names no other index.** That's package names, a requirements file with no `-i`/`--index-url`,
-      `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in it or in the files it
-      pulls in with `-r` and `-c`), a `pyproject.toml` with no index or sources in `[tool.uv]`, `[tool.uv.pip]`,
-      `[tool.poetry]`, `[tool.pdm]` or `[tool.pixi.pypi-options]`, a script whose `# /// script` block has none in
-      its `[tool.uv]`, or a `Pipfile.lock` whose sources are all PyPI. A
+    - **The input names no other index.** That's package names, a requirements file with no `-i`/`--index-url`
+      (or `--pypi-url`), `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in
+      it or in the files it pulls in with `-r` and `-c`), a `pyproject.toml` with no index or sources in
+      `[tool.uv]`, `[tool.uv.pip]`, `[tool.poetry]`, `[tool.pdm]` or `[tool.pixi.pypi-options]`, a script whose
+      `# /// script` block has none in its `[tool.uv]`, or a `Pipfile.lock` whose sources are all PyPI. A
       `-c` file that isn't read (a URL or `${VAR}`) or an abbreviated `--requirement`/`--constraint` option counts as
       naming one.
     - **No `uv.toml`, `pyproject.toml` or `pdm.toml` sets an index** in the input's folder or a folder above it, up to
       the repository root (the first with a `.git`). One that can't be read counts as setting one.
-    - **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
-      `PIP_NO_INDEX`, `PIP_CONFIG_FILE` (any case after `PIP_`), `UV_INDEX_URL`, `UV_DEFAULT_INDEX`, `UV_INDEX`,
-      `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_NO_INDEX`, `UV_CONFIG_FILE` or any `UV_INDEX_*`.
+    - **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_PYPI_URL`, `PIP_EXTRA_INDEX_URL`,
+      `PIP_FIND_LINKS`, `PIP_NO_INDEX`, `PIP_CONFIG_FILE` (any case after `PIP_`), `UV_INDEX_URL`,
+      `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_NO_INDEX`, `UV_CONFIG_FILE` or any
+      `UV_INDEX_*`.
 
 So `pdm.lock` entries, `poetry.lock` and `pixi.lock` entries that record no index, `pylock.toml` entries without an
 `index`, and packages from another index are never sent. User and system settings aren't read: a `pip.conf` or
@@ -178,8 +180,10 @@ Each flag then adds its own limits:
 - **`--notes`** takes the recorded-index route only from `uv.lock` and `pylock.toml`, and is off with `--offline`
   (or `offline = true`).
 - **`--fix`** follows the rule as it is, with a note naming the packages it didn't check, and is refused with
-  `--offline` (or `offline = true`). It sends no names at all, but it suggests installing from another index, so the
-  rule decides which packages it may suggest that for. The settings it can't read matter more here: pip treats every
+  `--offline` (or `offline = true`). Its gap wheel list is one request that names no package, but it suggests
+  installing from another index, so the rule decides which packages it may suggest that for. Its
+  upgrade lookups send the names `--suggest` would, by the same rule, and its section says in one line which packages'
+  releases weren't looked up, and why. The settings it can't read matter more here: pip treats every
   index alike, so with a private index in `pip.conf` a private package with the same name and version as one on the
   gap wheel index could install the gap wheel. Don't follow its pip advice in that setup.
 - **`--build-info`** is off for the whole run when an environment variable above is set, as well as with

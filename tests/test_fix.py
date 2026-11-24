@@ -6,10 +6,11 @@ import tomllib
 import urllib.error
 
 import pytest
+from conftest import FAKE_INDEX
 from packaging.requirements import Requirement
 from test_cli import _assert_matches_output_schema, run
 
-from wheelgap import cache, cli, gapwheels, pypi
+from wheelgap import cache, cli, fix, gapwheels, pypi
 from wheelgap.check import Row, Status
 from wheelgap.sources import Package, Source, load_inputs
 from wheelgap.targets import build_targets
@@ -19,8 +20,22 @@ DOWNLOAD = "https://github.com/wheelgap/wheels/releases/download/gap-wheels/"
 FT_WHEEL = "nowheels-0.9-cp314-cp314t-win_arm64.whl"
 NOWHEELS = ["nowheels==0.9", "-p", "3.14t", "-t", "win-arm64"]
 NOTHING_FITS = "wheelgap: note: --fix: no wheel on the gap wheel list fetched at "
-UNREADABLE = "wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions"
-FIX_HINT = "Run with --fix to see whether wheelgap's gap wheel index has a wheel for these."
+UNREADABLE = "wheelgap: note: couldn't read the gap wheel list, so --fix suggests no gap wheels"
+FIX_HINT = (
+    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap wheel index."
+)
+
+
+def summary(gaps, upgrade, gap_wheel, none, packages=1, unchecked=0):
+    """The first line of the --fix section: only upgrades count as fixed."""
+    line = (
+        f"--fix: {gaps} gap{'s' * (gaps != 1)} ({packages} package{'s' * (packages != 1)} × "
+        f"{'its' if packages == 1 else 'their'} targets): {upgrade} can be fixed by upgrading to an official "
+        f"release; {gap_wheel} only by an unofficial gap wheel; {none} {'has' if none == 1 else 'have'} no fix yet"
+    )
+    if unchecked:
+        line += f"; {unchecked} {'was' if unchecked == 1 else 'were'}n't checked for an upgrade"
+    return line + "."
 
 
 def without_fix_hint(output):
@@ -53,15 +68,19 @@ def test_pip_way_for_package_names_and_the_same_exit_code(capsys, fake_pypi, gap
     assert code == code_plain == 1 and err == err_plain
     section = (
         "\n"
-        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        f"{summary(1, 0, 1, 0)}\n"
+        "\n"
+        f"{gapwheels.HEAD}\n"
         "  nowheels 0.9: win-arm64\n"
         "\n"
         "To install them with pip, add this line to your requirements file:\n"
         f"  --extra-index-url {INDEX}\n"
         "or pass it to pip install:\n"
         f"  pip install --extra-index-url {INDEX} ...\n"
-        "If the requirements pin hashes, also add each wheel's hash to its line:\n"
-        f"  nowheels==0.9 --hash=sha256:{'ab' * 32}\n"
+        "If the requirements pin hashes, add each package's hashes to its existing line, keeping the hashes it has "
+        "(on a second line for the same package, pip won't use them):\n"
+        "  add to the nowheels==0.9 line:\n"
+        f"    --hash=sha256:{'ab' * 32}\n"
         f"{gapwheels.PIP_CAVEAT}\n"
         "\n"
         "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
@@ -77,6 +96,62 @@ def test_pip_way_for_a_requirements_file(capsys, fake_pypi, gap_wheels, tmp_path
     assert code == 1 and "  nowheels 0.9: win-arm64\n" in out and f"  --extra-index-url {INDEX}\n" in out
 
 
+# A package a gap wheel fills on two targets: pip allows only the hashes that every line for a package shares, so
+# both wheels' hashes go on the package's one existing line, never one line per wheel (#695).
+TWO_TARGETS = ["-p", "3.14t", "-t", "win-arm64,win-amd64", "--fix"]
+HASHES = f"--hash=sha256:{'ab' * 32} --hash=sha256:{'cd' * 32}"
+
+
+def _two_target_wheels(gap_wheels):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    gap_wheels.add("nowheels", "0.9", "nowheels-0.9-cp314-cp314t-win_amd64.whl", sha256="cd" * 32)
+
+
+def test_hashes_of_a_package_on_two_targets_go_on_its_one_line(capsys, fake_pypi, gap_wheels, tmp_path):
+    _two_target_wheels(gap_wheels)
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text(f"nowheels==0.9 --hash=sha256:{'00' * 32}\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(reqs), *TWO_TARGETS)
+    assert code == 1
+    assert out.endswith(
+        "If the requirements pin hashes, add each package's hashes to its existing line, keeping the hashes it has "
+        "(on a second line for the same package, pip won't use them):\n"
+        "  add to the nowheels==0.9 line:\n"
+        f"    {HASHES}\n"
+        f"{gapwheels.PIP_CAVEAT}\n"
+        "\n"
+        "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
+    )
+    assert out.count("--hash=") == 2 and "nowheels==0.9 --hash" not in out  # no line pip would take as a requirement
+
+
+def test_hashes_of_a_package_on_two_targets_in_markdown(capsys, fake_pypi, gap_wheels):
+    _two_target_wheels(gap_wheels)
+    code, out, _ = run(capsys, "nowheels==0.9", *TWO_TARGETS, "--markdown")
+    assert code == 1
+    assert (
+        "If the requirements pin hashes, add each package's hashes to its existing line, keeping the hashes it has "
+        "(on a second line for the same package, pip won't use them):\n"
+        "\n"
+        f"- add to the `nowheels==0.9` line: `{HASHES}`\n"
+        "\n"
+    ) in out
+    assert out.count("--hash=") == 2 and "nowheels==0.9 --hash" not in out
+
+
+def test_hashes_of_a_package_on_two_targets_in_the_snippet(capsys, fake_pypi, gap_wheels, tmp_path):
+    _two_target_wheels(gap_wheels)
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text("nowheels==0.9\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(reqs), *TWO_TARGETS, "--print-gap-wheel-snippet")
+    assert code == 1
+    assert out.endswith(
+        f"--extra-index-url {INDEX}\n"
+        "# If the requirements pin hashes, add these to the existing nowheels==0.9 line, keeping the hashes it has "
+        f"(not as a line of their own, which pip won't use): {HASHES}\n"
+    )
+
+
 def test_pip_way_for_a_conda_environment_file(capsys, fake_pypi, gap_wheels, tmp_path):
     gap_wheels.add("nowheels", "0.9", FT_WHEEL)
     env = tmp_path / "environment.yml"
@@ -89,7 +164,7 @@ def test_pip_way_for_a_conda_environment_file(capsys, fake_pypi, gap_wheels, tmp
     assert f"pip install --extra-index-url {INDEX} nowheels==0.9" in out
 
 
-def test_uv_way_for_a_uv_lock_with_direct_and_transitive_packages(capsys, fixtures, gap_wheels):
+def test_uv_way_for_a_uv_lock_with_direct_and_transitive_packages(capsys, fake_pypi, fixtures, gap_wheels):
     # puresdist is a direct dependency of the uvproj project; nativeext comes in through fastlib.
     gap_wheels.add("puresdist", "1.0", "puresdist-1.0-cp314-cp314t-win_arm64.whl")
     gap_wheels.add("nativeext", "0.3", "nativeext-0.3-cp314-cp314t-win_arm64.whl")
@@ -99,7 +174,16 @@ def test_uv_way_for_a_uv_lock_with_direct_and_transitive_packages(capsys, fixtur
     assert code == code_plain == 1
     assert out.removeprefix(without_fix_hint(out_plain)) == (
         "\n"
-        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        f"{summary(4, 0, 2, 2, packages=4)}\n"
+        "\n"
+        "No fix yet:\n"
+        "  fastlib 2.0.0: no newer release has a wheel for win-arm64\n"
+        "  winonly 311: no newer release has a wheel for win-arm64\n"
+        "\n"
+        # Not in FAKE_INDEX: a 404, as pypi.org gives for a name it doesn't have.
+        "Newer releases of nativeext, puresdist weren't looked up: the lookup failed (HTTP 404).\n"
+        "\n"
+        f"{gapwheels.HEAD}\n"
         "  nativeext 0.3: win-arm64\n"
         "  puresdist 1.0: win-arm64\n"
         "\n"
@@ -223,7 +307,30 @@ def test_json_key_only_with_fix(capsys, fake_pypi, gap_wheels):
             "sha256": "cd" * 32,
         }
     ]
-    assert {k: v for k, v in data.items() if k != "gap_wheels"} == plain  # nothing else changes
+    assert data["fix_summary"] == {
+        "gaps": 2,
+        "upgrade": 0,
+        "gap_wheel": 1,
+        "none": 1,
+        "not_looked_up": 0,
+        "uv_may_fork": 0,
+    }
+    assert [p["fix"] for p in data["packages"]] == [
+        {
+            "3.14t win-arm64": {
+                "kind": "gap_wheel",
+                "wheel": FT_WHEEL,
+                "url": DOWNLOAD + FT_WHEEL,
+                "sha256": "cd" * 32,
+                "unofficial": True,
+            },
+            "3.14 win-arm64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+        }
+    ]
+    for p in data["packages"]:
+        del p["fix"]
+    # Nothing else changes.
+    assert {k: v for k, v in data.items() if k not in ("gap_wheels", "fix_summary")} == plain
 
 
 def test_markdown_section(capsys, fixtures, gap_wheels):
@@ -249,7 +356,10 @@ def test_fix_hint_in_text_and_markdown_never_reads_the_list(capsys, fake_pypi, g
     assert gap_wheels.calls == 0
 
 
-COUNTED_HINT = "Run with --fix: wheelgap's gap wheel index has a wheel for 1 of these gaps."
+COUNTED_HINT = (
+    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap wheel index, "
+    "which has a wheel for 1 of these gaps."
+)
 
 
 def fix_hint_lines(out: str) -> list[str]:
@@ -293,7 +403,7 @@ def test_fix_hint_uses_only_the_cached_list(
 def test_fix_hint_counts_the_cells_the_cached_list_fills(capsys, fake_pypi, gap_wheels):
     cache_gap_wheel_list(gap_wheels, FT_WHEEL, "nowheels-0.9-cp314-cp314t-win_amd64.whl")
     _, out, _ = run(capsys, "nowheels==0.9", "-p", "3.14t", "-t", "win-arm64,win-amd64,linux-x86_64")
-    assert fix_hint_lines(out) == ["Run with --fix: wheelgap's gap wheel index has a wheel for 2 of these gaps."]
+    assert fix_hint_lines(out) == [COUNTED_HINT.replace("for 1 of", "for 2 of")]
     assert gap_wheels.calls == 0
 
 
@@ -416,7 +526,10 @@ def test_unreadable_list_is_a_note_with_the_same_exit_code(capsys, fake_pypi, ga
     gap_wheels.doc = doc
     code_plain, out_plain, _ = run(capsys, *NOWHEELS)
     code, out, err = run(capsys, *NOWHEELS, "--fix")
-    assert code == code_plain == 1 and out == without_fix_hint(out_plain)
+    assert code == code_plain == 1
+    assert out == without_fix_hint(out_plain) + (
+        f"\n{summary(1, 0, 0, 1)}\n\nNo fix yet:\n  nowheels 0.9: no newer release has a wheel for win-arm64\n"
+    )
     assert UNREADABLE in err and NOTHING_FITS not in err
     _, out, err = run(capsys, *NOWHEELS, "--fix", "-q")
     assert UNREADABLE in err  # even with -q: otherwise it would read as "nothing fits"
@@ -545,7 +658,7 @@ def test_dev_group_package_is_listed_where_its_parent_is_not_in_project_dependen
 def test_the_same_target_from_two_inputs_is_listed_once():
     lines = gapwheels.text_lines([_fill("requirements", "a.txt"), _fill("requirements", "b.txt")], False)
     assert "  x 1: win-arm64" in lines
-    assert sum(line.startswith("  x==1 --hash=") for line in lines) == 1
+    assert lines.count("  add to the x==1 line:") == 1 and sum("--hash=" in line for line in lines) == 1
 
 
 def test_no_binary_package_isnt_blamed_on_its_origin(capsys, fake_pypi, gap_wheels, tmp_path):
@@ -566,7 +679,9 @@ def test_uv_way_for_a_script_goes_in_its_script_block(capsys, fake_pypi, gap_whe
     assert code == code_plain == 1
     assert out.removeprefix(without_fix_hint(out_plain)) == (
         "\n"
-        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        f"{summary(1, 0, 1, 0)}\n"
+        "\n"
+        f"{gapwheels.HEAD}\n"
         "  nowheels 0.9: win-arm64\n"
         "\n"
         "To install them with uv run, add this at the end of example.py's # /// script block:\n"
@@ -599,7 +714,7 @@ def script_lock(registry="https://pypi.org/simple"):
     )
 
 
-def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, gap_wheels, tmp_path):
+def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, fake_pypi, gap_wheels, tmp_path):
     # A pyproject.toml beside it is another project's: uv run doesn't take the script's sources from it.
     gap_wheels.add("nowheels", "0.9", FT_WHEEL)
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "app"\nversion = "0"\n', encoding="utf-8")
@@ -611,7 +726,9 @@ def test_uv_way_for_a_script_lock_goes_in_the_scripts_block(capsys, gap_wheels, 
     assert code == code_plain == 1
     assert out.removeprefix(without_fix_hint(out_plain)) == (
         "\n"
-        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        f"{summary(1, 0, 1, 0)}\n"
+        "\n"
+        f"{gapwheels.HEAD}\n"
         "  nowheels 0.9: win-arm64\n"
         "\n"
         "To install them with uv run, add this at the end of example.py's # /// script block, then run "
@@ -912,7 +1029,8 @@ def test_print_gap_wheel_snippet_for_a_requirements_file(capsys, fake_pypi, gap_
         "# fills: nowheels 0.9: win-arm64\n"
         f"# {gapwheels.PIP_CAVEAT}\n"
         f"--extra-index-url {INDEX}\n"
-        f"# If the requirements pin hashes, add --hash=sha256:{'ab' * 32} to the nowheels==0.9 line.\n"
+        "# If the requirements pin hashes, add these to the existing nowheels==0.9 line, keeping the hashes it has "
+        f"(not as a line of their own, which pip won't use): --hash=sha256:{'ab' * 32}\n"
     )
     assert requirements.read_text(encoding="utf-8") == "nowheels==0.9\n"
     assert list(tmp_path.iterdir()) == [requirements]
@@ -1142,3 +1260,440 @@ def test_github_annotation_warning_keeps_its_level_with_a_gap_wheel(capsys, fake
         " A gap wheel on wheelgap's gap wheel index fills win-arm64 (unofficial, built by wheelgap from the PyPI "
         f"sdist). Install it with: pip install --extra-index-url {INDEX} nowheels==0.9"
     )
+
+
+# --fix, upgrade first: fixme (tests/conftest.py) has no wheel at 1.0; 1.3 adds a Windows on ARM one, 1.4 a Windows x64
+# one too. The yanked 1.1, the pre-release 2.0rc1 and 1.2 (whose Requires-Python leaves 3.14 out) never count.
+FIXME_WHEEL = "fixme-1.0-cp314-cp314t-win_arm64.whl"
+BOTH_WINDOWS = ["-p", "3.14t", "-t", "win-arm64,win-amd64"]
+
+
+def _fixme_requirements(tmp_path, text="fixme==1.0\nnowheels==0.9\n"):
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text(text, encoding="utf-8")
+    return str(reqs)
+
+
+def _fixme_gap_wheels(gap_wheels):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    gap_wheels.add("fixme", "1.0", FIXME_WHEEL)  # an upgrade fixes this cell too: the gap wheel is the fallback
+
+
+def test_fix_leads_with_the_upgrade_and_keeps_the_exit_code(capsys, fake_pypi, gap_wheels, tmp_path):
+    _fixme_gap_wheels(gap_wheels)
+    reqs = _fixme_requirements(tmp_path)
+    code_plain, out_plain, _ = run(capsys, reqs, *BOTH_WINDOWS)
+    code, out, _ = run(capsys, reqs, *BOTH_WINDOWS, "--fix")
+    assert code == code_plain == 1
+    section = out.removeprefix(without_fix_hint(out_plain))
+    assert section.startswith(
+        "\n"
+        f"{summary(4, 2, 1, 1, packages=2)}\n"
+        "\n"
+        "Upgrade: a newer official release has the wheel:\n"
+        "  fixme 1.0 -> 1.4: win-arm64, win-amd64\n"
+        "In requirements.txt, change the pins to fixme==1.4.\n"
+        f"{fix.RESOLVE_NOTE}\n"
+        "\n"
+        "No fix yet:\n"
+        "  nowheels 0.9: no newer release has a wheel for win-amd64\n"
+        "\n"
+        f"{gapwheels.FALLBACK_HEAD}\n"
+        "  fixme 1.0: win-arm64 (if you can't upgrade fixme)\n"
+        "  nowheels 0.9: win-arm64\n"
+    )
+    # The gap wheel stays installable for whoever can't upgrade: it's for the pinned version, so it never conflicts.
+    assert f"  add to the fixme==1.0 line:\n    --hash=sha256:{'ab' * 32}\n" in section
+    assert section.endswith("How these wheels are built and checked: https://wheelgap.github.io/wheels/\n")
+
+
+@pytest.mark.parametrize(
+    "targets,version",
+    [
+        # 1.1's only wheel is yanked and 1.2's Requires-Python excludes 3.14: the nearest is 1.3.
+        (["-p", "3.14t", "-t", "win-arm64"], "1.3"),
+        # 1.3 has no Windows x64 wheel; 2.0rc1's pure wheel is a pre-release, and the pin isn't one.
+        (["-p", "3.14t", "-t", "win-amd64"], "1.4"),
+    ],
+)
+def test_fix_names_only_a_live_release_with_the_wheel(capsys, fake_pypi, gap_wheels, targets, version):
+    _, out, _ = run(capsys, "fixme==1.0", *targets, "--fix")
+    assert f"  fixme 1.0 -> {version}: " in out and "Use fixme==" + version + " instead." in out
+    assert not any(f"-> {v}" in out for v in ("1.1", "1.2", "2.0rc1") if v != version)
+
+
+def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels, tmp_path):
+    _fixme_gap_wheels(gap_wheels)
+    reqs = _fixme_requirements(tmp_path)
+    _, plain, _ = gap_wheels_json(capsys, reqs, *BOTH_WINDOWS)
+    assert "fix_summary" not in plain and not any("fix" in p for p in plain["packages"])
+    code, data, _ = gap_wheels_json(capsys, reqs, *BOTH_WINDOWS, "--fix")
+    assert code == 1
+    assert data["fix_summary"] == {
+        "gaps": 4,
+        "upgrade": 2,
+        "gap_wheel": 1,
+        "none": 1,
+        "not_looked_up": 0,
+        "uv_may_fork": 0,
+    }
+    fixes = {p["name"]: p["fix"] for p in data["packages"]}
+    fallback = {"wheel": FIXME_WHEEL, "url": DOWNLOAD + FIXME_WHEEL, "sha256": "ab" * 32, "unofficial": True}
+    how = "In requirements.txt, change the pins to fixme==1.4."
+    assert fixes["fixme"] == {
+        "win-arm64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": fallback},
+        "win-amd64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": None},
+    }
+    assert fixes["nowheels"] == {
+        "win-arm64": {"kind": "gap_wheel", **fallback, "wheel": FT_WHEEL, "url": DOWNLOAD + FT_WHEEL},
+        "win-amd64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+    }
+    # The existing keys are unchanged: every filled cell is in gap_wheels, the fallback one too.
+    assert [(w["name"], w["target"]) for w in data["gap_wheels"]] == [("fixme", "win-arm64"), ("nowheels", "win-arm64")]
+
+
+def test_fix_markdown_leads_with_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
+    _fixme_gap_wheels(gap_wheels)
+    code, out, _ = run(capsys, _fixme_requirements(tmp_path), *BOTH_WINDOWS, "--fix", "--markdown")
+    assert code == 1
+    assert (
+        "#### Fixes\n"
+        "\n"
+        f"{summary(4, 2, 1, 1, packages=2)}\n"
+        "\n"
+        "Upgrade: a newer official release has the wheel:\n"
+        "\n"
+        "- `fixme 1.0 -> 1.4`: win-arm64, win-amd64\n"
+        "\n"
+        "In `requirements.txt`, change the pins to `fixme==1.4`.\n"
+        "\n"
+        f"{fix.RESOLVE_NOTE}\n"
+        "\n"
+        "No fix yet:\n"
+        "\n"
+        "- `nowheels 0.9`: no newer release has a wheel for win-amd64\n"
+        "\n"
+        "#### Gap wheels\n"
+        "\n"
+        f"{gapwheels.FALLBACK_HEAD}\n"
+        "\n"
+        "- `fixme 1.0: win-arm64 (if you can't upgrade fixme)`\n"
+    ) in out
+
+
+def test_fix_and_suggest_look_each_package_up_once(capsys, fake_pypi, gap_wheels):
+    _, out_suggest, _ = run(capsys, "fixme==1.0", *BOTH_WINDOWS, "--explain", "--suggest")
+    fake_pypi.clear()
+    _, out, _ = run(capsys, "fixme==1.0", *BOTH_WINDOWS, "--explain", "--suggest", "--fix")
+    assert fake_pypi.count("https://pypi.org/pypi/fixme/json") == 1
+    assert "fixme 1.0 -> 1.4 has wheels for win-arm64, win-amd64" in out_suggest
+    # --suggest's own lines are unchanged; --explain --fix adds the upgrade under each target it fixes.
+    assert set(without_fix_hint(out_suggest).splitlines()) <= set(out.splitlines())
+    assert "  upgrade: fixme 1.4 has the wheel (an official release; see the --fix section)\n" in out
+
+
+def test_fix_upgrade_for_hash_pinned_requirements_says_to_regenerate(capsys, fake_pypi, gap_wheels, tmp_path):
+    reqs = _fixme_requirements(tmp_path, f"fixme==1.0 --hash=sha256:{'0' * 64}\n")
+    _, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert (
+        "Upgrade: a newer official release has the wheel:\n"
+        "  fixme 1.0 -> 1.3: win-arm64\n"
+        "requirements.txt pins hashes, so instead of editing the pins to fixme==1.3, regenerate it: "
+        "pip-compile --upgrade-package fixme==1.3, or uv pip compile --upgrade-package fixme==1.3 with the options "
+        "you made it with.\n"
+    ) in out
+
+
+def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
+    _, out, _ = run(capsys, _fixme_requirements(tmp_path, "fixme<1.3\n"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
+
+
+def fixme_uv_lock(specifier):
+    return (
+        'version = 1\nrequires-python = ">=3.12"\n\n'
+        '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "fixme" }]\n\n'
+        f'[package.metadata]\nrequires-dist = [{{ name = "fixme", specifier = "{specifier}" }}]\n\n'
+        '[[package]]\nname = "fixme"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/fixme-1.0.tar.gz" }\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "specifier,said",
+    [
+        (">=1.0", "within your pyproject.toml constraint fixme>=1.0"),
+        ("", "your pyproject.toml puts no version bound on it"),
+        ("==1.0", "needs pyproject.toml's fixme==1.0 relaxed"),
+    ],
+)
+def test_fix_upgrade_for_a_uv_lock(capsys, fake_pypi, gap_wheels, tmp_path, specifier, said):
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "app"\nversion = "0"\ndependencies = ["fixme{specifier}"]\n', encoding="utf-8"
+    )
+    (tmp_path / "uv.lock").write_text(fixme_uv_lock(specifier), encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path / "uv.lock"), *BOTH_WINDOWS, "--fix")
+    assert code == 1
+    assert f"  fixme 1.0 -> 1.4: win-arm64, win-amd64 ({said})\n" in out
+    assert (
+        f"In {tmp_path}, run uv lock --upgrade-package fixme, then uv sync: uv moves each to the newest release your "
+        "constraints allow, so check that it's at least fixme==1.4, then run wheelgap again.\n"
+    ) in out
+    _, data, _ = gap_wheels_json(capsys, str(tmp_path / "uv.lock"), *BOTH_WINDOWS, "--fix")
+    constraint = data["packages"][0]["fix"]["win-arm64"]["constraint"]
+    assert constraint == {
+        "file": "pyproject.toml",
+        "requirements": [f"fixme{specifier}"] if specifier else [],
+        "allows": "==" not in specifier,
+        "via": "requirement",
+    }
+
+
+def test_fix_says_nothing_about_a_constraint_it_doesnt_read():
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    row = Row(Package("x", "1"), {target: Status.SOURCE})  # a transitive dependency: no requirement of the project
+    cell = fix.Cell(row, target, Source("uv.lock", kind="uv", uv_packages=[]), fix.UPGRADE, version="2")
+    assert fix.constraint(cell) is None
+    lock = Source("poetry.lock", kind="poetry")
+    assert fix.constraint(fix.Cell(Row(Package("x", "1", spec=">=1"), {}), target, lock, fix.UPGRADE, "2")) is None
+
+
+@pytest.mark.parametrize(
+    "kind,label,expected",
+    [
+        (
+            "poetry",
+            "poetry.lock",
+            "Run poetry update x for poetry.lock: it stays within pyproject.toml's constraints and picks the newest "
+            "release they allow, so check that it's at least x==2 (widen the constraint if not), then run wheelgap "
+            "again.",
+        ),
+        ("pdm", "pdm.lock", "Run pdm update x for pdm.lock: it stays within pyproject.toml's constraints"),
+        ("pylock", "pylock.toml", "Upgrade to x==2 with the tool that made pylock.toml, then lock again."),
+        ("pipfile", "Pipfile.lock", "Upgrade to x==2 with the tool that made Pipfile.lock, then lock again."),
+        ("conda-env", "environment.yml", "In environment.yml's pip: list, change the pins to x==2."),
+        ("script", "example.py", "In example.py's # /// script block, change the requirements to x==2."),
+        ("pyproject", "pyproject.toml", "In pyproject.toml, change the requirements so they allow x==2."),
+        (None, "x==1", "Use x==2 instead."),
+    ],
+)
+def test_fix_upgrade_how_per_input(kind, label, expected):
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    cell = fix.Cell(Row(Package("x", "1"), {target: Status.SOURCE}), target, Source(label, kind=kind), fix.UPGRADE, "2")
+    assert fix.how(cell.source, [cell])[0].startswith(expected)
+
+
+def test_fix_uv_script_lock_upgrade_command():
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    source = Source("example.py.lock", kind="uv", uv_script="tools/example.py")
+    cell = fix.Cell(Row(Package("x", "1"), {target: Status.SOURCE}), target, source, fix.UPGRADE, "2")
+    assert fix.how(source, [cell]) == [
+        "For example.py's lock, run uv lock --script tools/example.py --upgrade-package x: uv moves each to the "
+        "newest release your constraints allow, so check that it's at least x==2, then run wheelgap again."
+    ]
+
+
+def test_fix_private_package_gets_no_upgrade_lookup(capsys, fake_pypi, gap_wheels, tmp_path):
+    reqs = _fixme_requirements(tmp_path, "--extra-index-url https://pkgs.example.com/simple\nfixme==1.0\n")
+    code, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert code == 1 and not [url for url in fake_pypi if url.endswith("/fixme/json")]
+    assert "->" not in out and f"\n{summary(1, 0, 0, 0, unchecked=1)}\n" in out
+    assert "No fix yet" not in out  # not known to have no fix: it wasn't checked
+    assert (
+        "Newer releases of fixme weren't looked up: wheelgap can't tell they come from PyPI, so their names stay "
+        "private (see how-it-works.md#pypi-origin).\n"
+    ) in out
+
+
+def test_fix_with_another_index_makes_no_upgrade_lookup(capsys, fake_pypi, fake_simple, gap_wheels):
+    code, out, _ = run(capsys, "fixme==1.0", *BOTH_WINDOWS, "--fix", "--index-url", "https://pkgs.example.com/simple")
+    assert code == 1 and not fake_pypi and "->" not in out
+    assert f"\n{summary(2, 0, 0, 0, unchecked=2)}\n" in out
+    assert (
+        "Newer releases of fixme weren't looked up: packages may come from another index (--index-url), so no names "
+        "went to pypi.org.\n"
+    ) in out
+
+
+def test_fix_no_binary_has_no_fix_and_no_lookup(capsys, fake_pypi, gap_wheels, tmp_path):
+    reqs = _fixme_requirements(tmp_path, "--no-binary fixme\nfixme==1.0\n")
+    _, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.0: --no-binary, so pip uses no wheel for it for win-arm64\n" in out
+    assert not [url for url in fake_pypi if url.endswith("/fixme/json")]
+
+
+def test_fix_names_each_release_when_no_one_release_covers_every_target(capsys, fake_pypi, gap_wheels):
+    # laggard (tests/conftest.py): 1.1 has the Windows wheel, only 1.3 the macOS one, and 1.3 has no Windows wheel.
+    _, out, _ = run(capsys, "laggard==1.0", "-p", "3.13", "-t", "win-amd64,macos-arm64", "--fix")
+    assert "  laggard 1.0 -> 1.1: win-amd64\n  laggard 1.0 -> 1.3: macos-arm64\n" in out
+    assert (
+        "No one release of laggard has wheels for all of these targets (laggard==1.1 for win-amd64; laggard==1.3 for "
+        "macos-arm64): pick the one for the targets you need.\n" in out
+    )
+    assert "Use laggard==" not in out  # one input can't pin both
+
+
+def test_fix_never_offers_an_upgrade_that_drops_a_wheel(capsys, fake_pypi, gap_wheels):
+    # wheellost 1.1 has the Windows wheel but drops 1.0's Linux one.
+    _, out, _ = run(capsys, "wheellost==1.0", "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--fix")
+    assert "->" not in out
+    assert (
+        "  wheellost 1.0: every newer release with a wheel drops one it has elsewhere for win-amd64 (1.1 has none for "
+        "linux-x86_64)\n"
+    ) in out
+    assert "ask for a wheel" not in out  # upstream has one: asking doesn't help
+
+
+def test_fix_says_when_only_abi3_wheels_block_free_threaded_python(capsys, fake_pypi, gap_wheels):
+    code, out, _ = run(capsys, "abi3only==1.0", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert code == 1
+    assert (
+        "  abi3only 1.0: no newer release has a wheel for win-arm64; only abi3 wheels for win-arm64, which "
+        "free-threaded Python can't use: ask abi3only for a cp314t wheel at https://github.com/example/abi3only/issues\n"
+    ) in out
+    _, data, _ = gap_wheels_json(capsys, "abi3only==1.0", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": True}
+    _, out, _ = run(capsys, "nowheels==0.9", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "abi3" not in out  # only when that's the reason
+
+
+def test_fix_annotation_leads_with_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _fixme_gap_wheels(gap_wheels)
+    reqs = _fixme_requirements(tmp_path)
+    _, out, _ = run(capsys, reqs, *BOTH_WINDOWS, "--fix", "--github-annotations")
+    (line,) = [ln for ln in _annotations(out) if "fixme 1.0" in ln and ln.startswith("::error")]
+    assert (
+        "Upgrade: fixme 1.4 has the wheel for win-arm64, win-amd64 (an official release); the --fix section of the log "
+        "says how. If you can't upgrade: a gap wheel on wheelgap's gap wheel index fills win-arm64"
+    ) in line
+    (other,) = [ln for ln in _annotations(out) if "nowheels 0.9" in ln]
+    assert "Upgrade" not in other and " A gap wheel on wheelgap's gap wheel index fills win-arm64" in other
+
+
+def test_fix_names_the_file_that_pins_the_package(capsys, fake_pypi, gap_wheels, tmp_path):
+    (tmp_path / "base.txt").write_text("fixme==1.0\n", encoding="utf-8")
+    (tmp_path / "top.txt").write_text("-r base.txt\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "top.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "In base.txt, change the pins to fixme==1.3.\n" in out
+
+
+def test_fix_says_a_constraints_file_pin_holds_the_upgrade_back(capsys, fake_pypi, gap_wheels, tmp_path):
+    (tmp_path / "c.txt").write_text("fixme==1.0\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-c c.txt\nfixme\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.0 -> 1.3: win-arm64 (needs fixme==1.0 in the -c constraints of requirements.txt relaxed)\n" in out
+    assert "In requirements.txt, change the requirements to fixme==1.3.\n" in out  # its line is a bare name
+
+
+def test_fix_counts_packages_not_looked_up_apart_in_json(capsys, fake_pypi, gap_wheels, tmp_path):
+    reqs = _fixme_requirements(tmp_path, "--extra-index-url https://pkgs.example.com/simple\nfixme==1.0\n")
+    _, data, _ = gap_wheels_json(capsys, reqs, *BOTH_WINDOWS, "--fix")
+    assert data["fix_summary"] == {
+        "gaps": 2,
+        "upgrade": 0,
+        "gap_wheel": 0,
+        "none": 0,
+        "not_looked_up": 2,
+        "uv_may_fork": 0,
+    }
+    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "not_looked_up", "abi3_only": False}
+
+
+def pyfork_uv_lock():
+    return (
+        'version = 1\nrequires-python = ">=3.13"\n\n'
+        '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "pyfork" }]\n\n'
+        '[[package]]\nname = "pyfork"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/pyfork-1.0.tar.gz" }\n'
+        'wheels = [{ url = "https://files.example/pyfork-1.0-cp313-cp313-manylinux_2_17_x86_64.whl" }]\n'
+    )
+
+
+def test_fix_says_uv_may_fork_where_only_another_pythons_wheel_is_lost(capsys, fake_pypi, gap_wheels, tmp_path):
+    # pyfork 2.0 has the 3.14 wheel but none for 3.13, which 1.0 has: pip would lose it, uv may fork per Python.
+    (tmp_path / "uv.lock").write_text(pyfork_uv_lock(), encoding="utf-8")
+    args = ["-p", "3.13,3.14", "-t", "linux-x86_64", "--fix"]
+    code, out, _ = run(capsys, str(tmp_path / "uv.lock"), *args)
+    assert code == 1
+    assert (
+        "Maybe, with uv:\n"
+        "  pyfork 1.0: every newer release with a wheel drops one it has on another Python for 3.14 linux-x86_64 (2.0 "
+        "has none for 3.13 linux-x86_64); uv may fork pyfork per Python: try uv lock --upgrade-package pyfork in "
+        f"{tmp_path} and run wheelgap again\n"
+    ) in out
+    assert "No fix yet" not in out and "; 1 may be fixed by an upgrade uv locks per Python." in out
+    _, data, _ = gap_wheels_json(capsys, str(tmp_path / "uv.lock"), *args)
+    assert data["fix_summary"]["uv_may_fork"] == 1 and data["fix_summary"]["none"] == 0
+    # pip has no forks: a requirements file pins one release for every Python.
+    _, out, _ = run(capsys, "pyfork==1.0", *args)
+    assert "No fix yet:\n  pyfork 1.0: every newer release with a wheel drops one it has elsewhere for 3.14" in out
+    assert "uv may fork" not in out
+
+
+def test_fix_shows_a_ranged_requirement_as_written(capsys, fake_pypi, gap_wheels, tmp_path):
+    reqs = _fixme_requirements(tmp_path, "fixme>=1.0,<1.3\n")  # packaging's own order would be <1.3,>=1.0
+    _, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme>=1.0,<1.3 relaxed)\n" in out
+    assert "In requirements.txt, change the requirements to fixme==1.3.\n" in out  # a range, not a pin
+
+
+def test_fix_gap_wheels_are_a_fallback_only_after_an_upgrade(capsys, fake_pypi, gap_wheels):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    _, out, _ = run(capsys, *NOWHEELS, "--fix")
+    assert f"\n{gapwheels.HEAD}\n" in out and "As a fallback" not in out
+
+
+def test_explain_fix_leads_with_the_upgrade_under_each_target(capsys, fake_pypi, gap_wheels, tmp_path):
+    _fixme_gap_wheels(gap_wheels)
+    _, out, _ = run(capsys, _fixme_requirements(tmp_path), *BOTH_WINDOWS, "--fix", "--explain")
+    assert (
+        "  upgrade: fixme 1.4 has the wheel (an official release; see the --fix section)\n"
+        f"  if you can't upgrade, gap wheel for win-arm64: {gapwheels.UNOFFICIAL}\n"
+    ) in out
+    assert f"  gap wheel for win-arm64: {gapwheels.UNOFFICIAL}\n" in out  # nowheels: no upgrade, so no "if"
+
+
+def test_fix_says_no_uv_fork_when_the_newer_release_still_admits_the_older_python(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch
+):
+    # 2.0 drops the 3.13 wheel but its Requires-Python admits 3.13: uv would build it there, so no fork helps.
+    monkeypatch.setitem(
+        FAKE_INDEX["pyfork"],
+        "2.0",
+        ["pyfork-2.0-cp314-cp314-manylinux_2_17_x86_64.whl", "pyfork-2.0.tar.gz"],
+    )
+    (tmp_path / "uv.lock").write_text(pyfork_uv_lock(), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
+    assert "uv may fork" not in out
+    assert "No fix yet:\n  pyfork 1.0: every newer release with a wheel drops one it has elsewhere for 3.14" in out
+
+
+def test_fix_uv_may_fork_only_where_the_project_allows_the_release(capsys, fake_pypi, gap_wheels, tmp_path):
+    lock = pyfork_uv_lock().replace(
+        'dependencies = [{ name = "pyfork" }]\n',
+        'dependencies = [{ name = "pyfork" }]\n\n[package.metadata]\n'
+        'requires-dist = [{ name = "pyfork", specifier = "<2" }]\n',
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
+    assert "uv may fork" not in out
+    assert (
+        "No fix yet:\n  pyfork 1.0: every newer release with a wheel drops one it has elsewhere for 3.14 linux-x86_64 "
+        "(2.0 has none for 3.13 linux-x86_64) (pyproject.toml's pyfork<2 leaves out 2.0)\n"
+    ) in out
+
+
+def test_fix_uv_may_fork_names_the_script_for_a_script_lock(capsys, fake_pypi, gap_wheels, tmp_path):
+    (tmp_path / "tool.py.lock").write_text(
+        pyfork_uv_lock().replace(
+            '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+            'dependencies = [{ name = "pyfork" }]\n\n',
+            '[manifest]\nrequirements = [{ name = "pyfork" }]\n\n',
+        ),
+        encoding="utf-8",
+    )
+    _, out, _ = run(capsys, str(tmp_path / "tool.py.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
+    assert f"try uv lock --script {tmp_path / 'tool.py'} --upgrade-package pyfork and run wheelgap again" in out

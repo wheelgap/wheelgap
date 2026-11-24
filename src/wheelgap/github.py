@@ -21,7 +21,7 @@ from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
-from . import gapwheels
+from . import fix, gapwheels
 from .check import Row, Status
 from .sources import _COMMENT_RE, _NAMED_URL_RE, Package, Source, SourceError, _line_include, requirement_to_package
 from .targets import Target
@@ -375,12 +375,22 @@ GAP_WORDS = {
 }
 
 
-def gap_wheel_sentence(fills: list[gapwheels.Fill], multi_py: bool) -> str:
+def upgrade_sentence(cells: list[fix.Cell], multi_py: bool) -> str:
+    """--fix: what a package's annotation says first when a newer official release has the wheel for some gaps."""
+    by_version: dict[str, list[str]] = {}
+    for c in cells:
+        by_version.setdefault(f"{c.row.package.name} {c.version}", []).append(c.target.label(multi_py))
+    has = "; ".join(f"{v} has the wheel for {', '.join(dict.fromkeys(labels))}" for v, labels in by_version.items())
+    return f" Upgrade: {has} (an official release); the --fix section of the log says how."
+
+
+def gap_wheel_sentence(fills: list[gapwheels.Fill], multi_py: bool, fallback: bool = False) -> str:
     """--fix: what a package's annotation says when a gap wheel fills some of its gaps. `fills`: all of that
     package's, which come from one input. The pip command for an input pip installs from as it is; a lockfile or a
     script is pointed to the log's gap wheel section, as in gapwheels.explain_lines."""
     on = ", ".join(dict.fromkeys(f.target.label(multi_py) for f in fills))
     said = f" A gap wheel on wheelgap's gap wheel index fills {on} (unofficial, built by wheelgap from the PyPI sdist)"
+    said = f" If you can't upgrade:{said[:2].lower()}{said[2:]}" if fallback else said
     if command := gapwheels.pip_install(fills[0]):
         return f"{said}. Install it with: {command}"
     return f"{said}; see the gap wheel section of the log for how to use it."
@@ -396,6 +406,7 @@ def annotation(
     *,
     installed_by: str | None = None,
     installed_through: Mapping[Path, str] | None = None,
+    upgrades: list[fix.Cell] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     by_status: dict[Status, list[str]] = {}
@@ -452,9 +463,11 @@ def annotation(
         line = location[1] if file is not None else None
         if file is None:
             message += f" (in {location[0]})"
+    if upgrades:  # --fix: the official release first, as in the log's --fix section
+        message += upgrade_sentence(upgrades, multi_py)
     if fills:  # --fix: a gap wheel never changes the level, the title or the line
         # Last, after "(in FILE)", so the pip command ends the annotation and copies cleanly (#609).
-        message += gap_wheel_sentence(fills, multi_py)
+        message += gap_wheel_sentence(fills, multi_py, fallback=bool(upgrades))
     return workflow_command(level, message, file, line, f"{name}: {GAP_WORDS[worst][0]}")
 
 
@@ -468,6 +481,7 @@ def github_annotations(
     *,
     installed_by: Mapping[int, str] | None = None,
     installed_through: Mapping[int, Mapping[Path, str]] | None = None,
+    fix_cells: list[fix.Cell] | None = None,
 ) -> list[str]:
     """One ::error per failing package and one ::warning per package whose gaps don't fail the run (source builds
     that --fail-on missing allows, or gaps only on --advisory targets), at most ANNOTATION_LIMIT of each: past that,
@@ -476,6 +490,10 @@ def github_annotations(
     filled: dict[int, list[gapwheels.Fill]] = {}
     for f in fills or []:
         filled.setdefault(id(f.row), []).append(f)
+    upgraded: dict[int, list[fix.Cell]] = {}
+    for c in fix_cells or []:
+        if c.kind == fix.UPGRADE:
+            upgraded.setdefault(id(c.row), []).append(c)
     failing_ids = {id(r) for r in failing}
     locator = Locator(sources)
     out = []
@@ -492,6 +510,7 @@ def github_annotations(
                 filled.get(id(r)),
                 installed_by=installed_by.get(id(r.package)) if installed_by is not None else None,
                 installed_through=installed_through.get(id(r.package)) if installed_through is not None else None,
+                upgrades=upgraded.get(id(r)),
             )
             for r in shown
         ]

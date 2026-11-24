@@ -886,13 +886,17 @@ def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
         # A range, or no pin: the newest matching release that isn't fully yanked. As in fill(), a range only
         # counts files whose Requires-Python admits `python`.
         def usable(e: dict) -> bool:
-            return not _is_yanked(e) and (not pkg.spec or _supports_python(e, python, "requires-python"))
+            ranged = pkg.spec or pkg.prereleases is not None  # picked from the releases, as a range is
+            return not _is_yanked(e) and (not ranged or _supports_python(e, python, "requires-python"))
 
         live = {v: kept for v, es in grouped.items() if (kept := [e for e in es if usable(e)])}
-        chosen = max(SpecifierSet(pkg.spec or "").filter(live), default=None)
+        chosen = max(SpecifierSet(pkg.spec or "").filter(live, prereleases=pkg.prereleases), default=None)
         if chosen is None:
+            final = " final" if pkg.prereleases is False else ""
             if pkg.spec:
-                pkg.error = f"no release matches {pkg.spec}" + (f" for Python {python}" if python else "")
+                pkg.error = f"no{final} release matches {pkg.spec}" + (f" for Python {python}" if python else "")
+            elif pkg.prereleases is not None and grouped:
+                pkg.error = f"no{final} release" + (f" for Python {python}" if python else "")
             else:
                 pkg.error = "not on index"
             return pkg
@@ -930,10 +934,14 @@ def _newest_matching(
     python: str | None = None,
     exclude_newer: datetime | None = None,
     hashes: frozenset[str] = frozenset(),
+    prereleases: bool | None = None,
 ) -> tuple[str, list[dict]] | None:
     """The newest matching release with non-yanked files supporting `python`, when supplied. With a requirement's
-    `hashes`, the newest such release that has a file with a listed sha256, if any release has one."""
+    `hashes`, the newest such release that has a file with a listed sha256, if any release has one. `prereleases` is
+    the requirements file's release control (Package.prereleases), passed to the filter as pip passes it."""
     releases = data.get("releases")
+    if not isinstance(releases, dict) and prereleases is not None:
+        raise ValueError("no release list")  # the latest release may not be the one --pre or --only-final picks
     if not isinstance(releases, dict):
         # A mirror without the (deprecated) release list: fall back to the latest, if it matches.
         info, latest = data.get("info"), None
@@ -965,7 +973,7 @@ def _newest_matching(
         # with a listed hash first (filter_unallowed_hashes and _sort_key in pip/_internal/index/package_finder.py):
         # pip 26.3 installs demo 1.0 for `demo>=0.5 --hash=sha256:<1.0's wheel>` with demo 2.0 on the index.
         usable = {v: (t, live) for v, (t, live) in usable.items() if any(_sha256(e) in hashes for e in live)}
-    chosen = max(constraint.filter(usable), default=None)
+    chosen = max(constraint.filter(usable, prereleases=prereleases), default=None)
     return usable[chosen] if chosen is not None else None
 
 
@@ -994,7 +1002,9 @@ def _resolve_pythons(
 ) -> Package:
     """Share one index response, never files, between per-Python resolutions."""
     versions = tuple(dict.fromkeys(pythons))
-    if (bool(pkg.version) or bool(pkg.spec) or pkg.exclude_newer is not None) and len(versions) > 1:
+    if (bool(pkg.version) or bool(pkg.spec) or pkg.exclude_newer is not None or pkg.prereleases is not None) and len(
+        versions
+    ) > 1:
         for py in versions:
             resolved = resolve(replace(pkg, resolutions={}), py)
             # Equal versions can still have different eligible files. Coalesce only identical answers.
@@ -1153,12 +1163,14 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                 pkg.project_urls = {"Homepage": info["home_page"]}
             if isinstance(info.get("home_page"), str):
                 pkg.home_page = info["home_page"]
-        if not pinned and (pkg.spec or pkg.exclude_newer or pkg.hashes):
-            # A range (numpy>=1.26,<2): check the release an installer would pick, not the latest.
-            found = _newest_matching(data, pkg.spec or "", python, pkg.exclude_newer, pkg.hashes)
+        if not pinned and (pkg.spec or pkg.exclude_newer or pkg.hashes or pkg.prereleases is not None):
+            # A range (numpy>=1.26,<2): check the release an installer would pick, not the latest. So for a bare name
+            # under --pre or --only-final, which change which release that is.
+            found = _newest_matching(data, pkg.spec or "", python, pkg.exclude_newer, pkg.hashes, pkg.prereleases)
             if found is None:
+                final = " final" if pkg.prereleases is False else ""
                 pkg.error = (
-                    (f"no release matches {pkg.spec}" if pkg.spec else "no release")
+                    (f"no{final} release matches {pkg.spec}" if pkg.spec else f"no{final} release")
                     + (f" uploaded before exclude-newer ({describe(pkg.exclude_newer)})" if pkg.exclude_newer else "")
                     + (f" for Python {python}" if python else "")
                 )

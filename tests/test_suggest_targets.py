@@ -406,6 +406,20 @@ def test_dockerfile_it_cant_read(tmp_path):
     assert unreadable(found) == [("Dockerfile", None, "ARG BASE has no default and no --build-arg BASE=VALUE")]
 
 
+def test_dockerfile_old_syntax_heredoc_names_the_line_and_no_path(tmp_path):
+    # #692: the refusal now starts with path:line:, which mustn't leak into the reason.
+    (tmp_path / "Dockerfile").write_text(
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN cat << EOF\nhi\nEOF\n"
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    reason = (
+        "# syntax=docker/dockerfile:1.4 may read the heredocs in 'RUN cat << EOF' differently from "
+        "docker/dockerfile 1.16 and later, which wheelgap follows"
+    )
+    assert unreadable(found) == [("Dockerfile", 3, reason)]
+
+
 @pytest.mark.parametrize("linked", ["files", "workflows folder"])
 def test_symlinks_out_of_the_project_are_not_read(tmp_path, linked):
     elsewhere = tmp_path / "elsewhere"

@@ -91,7 +91,7 @@ Check every package a lockfile (or a project directory) installs on at least one
 `uv.lock` dependency graph are respected, as on the command line. A `uv.lock` whose `requires-python` leaves out a
 target's Python may be missing wheels for it, so its PyPI packages are also looked up on the index (keeping the
 lock's files if a lookup fails). A `uv.lock` made with `[tool.uv] environments` covers those environments only, so
-(after 0.13.0) a target outside them raises `SourceError`, as on the [command line](inputs.md#uvlock). With no
+ a target outside them raises `SourceError`, as on the [command line](inputs.md#uvlock). With no
 `targets`, the default platforms are narrowed to the ones it covers.
 
 - `deps=True` resolves the dependency tree for requirements files, a conda `environment.yml` (its `pip:` list),
@@ -162,7 +162,7 @@ Each check returns a `Result` (a list of them for `check_packages()`, `check_loc
 | `gaps` | the targets with a gap (`source`, `missing` or `unknown`) |
 | `bundled_versions`, `bundled_version`, `bundled_version_differs` | with `pyodide_locks`: see [Pyodide](#pyodide) |
 | `issues_url` | the package's issue tracker URL from PyPI metadata, or `None` when absent or not on PyPI |
-| `pip_refuses` | for a `uv.lock` checked with `online=True` (after 0.13.0): the files uv installs and pip would refuse, each mapped to the reason (`"requires Python <3.15,>=3.10"`); empty otherwise. uv checks the `Requires-Python` lower bound, and `statuses` follow uv. `to_dict()` includes `"pip_refuses"` when it isn't empty |
+| `pip_refuses` | for a `uv.lock` checked with `online=True`: the files uv installs and pip would refuse, each mapped to the reason (`"requires Python <3.15,>=3.10"`); empty otherwise. uv checks the `Requires-Python` lower bound, and `statuses` follow uv. `to_dict()` includes `"pip_refuses"` when it isn't empty |
 | `to_dict()` | the package in the shape of a `--json` package entry, keyed by each target's full label (`"3.13 musl-aarch64"`, with the Python even when only one is checked) |
 
 ### Explaining a gap
@@ -184,7 +184,7 @@ why), a result explains the gap the way `--explain` does:
   number of wheels (the command line shows 8), or `no wheels published for this version`, plus a line such as
   `there is an sdist, but pyodide can't build packages from source` on the targets that can't build sdists (Pyodide,
   iOS and Android).
-- `result.via` maps the same targets, and (after 0.13.0) any `unknown` target, to the dependency path from a root down to the package, as `--explain`'s `via:`
+- `result.via` maps the same targets, and any `unknown` target, to the dependency path from a root down to the package, as `--explain`'s `via:`
   line shows it: `("app", "pandas", "numpy")`, or `("(dev group)", "pytest")` when a dependency group pulls it in.
   `check_lockfile()` fills it for `uv.lock`, for `poetry.lock` files older than lock-version 2.1, and with
   `deps=True`, and `check_packages()` and `check_package()` fill it with `deps=True`; it's empty for other inputs.

@@ -1138,7 +1138,7 @@ def _context(tmp_path, dockerfile, files=("requirements.txt",)):
 )
 def test_dockerfile_requirements_reads(tmp_path, dockerfile, files, expected):
     path = _context(tmp_path, dockerfile, files)
-    assert dockerfile_requirements(path) == [(line, tmp_path / name) for line, name in expected]
+    assert dockerfile_requirements(path, line_files={}) == [(line, tmp_path / name) for line, name in expected]
 
 
 @pytest.mark.parametrize(
@@ -1359,11 +1359,12 @@ def test_dockerfile_requirements_dockerignore_skips_ignored_uv_config(tmp_path, 
         ["requirements.txt"],
     )
     (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
-    (tmp_path / config_name).write_text("", encoding="utf-8")
+    content = "[tool.uv]\n" if config_name == "pyproject.toml" else ""
+    (tmp_path / config_name).write_text(f"{content}no-binary = true\n", encoding="utf-8")
 
     with pytest.raises(
         DockerfileError,
-        match=rf"^{re.escape(str(path))}:3: this COPY puts a uv\.toml or pyproject\.toml in the image",
+        match=rf"^{re.escape(str(path))}:3: this COPY brings {config_name}",
     ):
         dockerfile_requirements(path, uv_installs=set())
 
@@ -1952,7 +1953,7 @@ def test_dockerfile_requirements_never_drops_install_constraints(tmp_path):
     with pytest.raises(DockerfileError, match=":4: pip install -c FILE isn't read here"):
         dockerfile_requirements(path)
     found: dict = {}
-    assert dockerfile_requirements(path, constraints=found) == [
+    assert dockerfile_requirements(path, constraints=found, line_files={}) == [
         (4, tmp_path / "requirements.txt"),
         (5, tmp_path / "dev.txt"),
     ]
@@ -2006,6 +2007,196 @@ def test_cli_dockerfile_inputs_applies_install_constraints(tmp_path, capsys, fak
     assert main([str(requirements), "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
     assert actual == json.loads(capsys.readouterr().out)["packages"]
     assert actual[0]["version"] == "3.1"
+
+
+_ONE_LINE = "FROM python:3.13\nWORKDIR /app\nCOPY a.txt b.txt c.txt ./\nRUN pip install {}\n"
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "run", "expected"),
+    [
+        # #701: pip reads every -r file of one install with one finder, so an option line in one file counts for the
+        # requirements of the others, whichever comes first on the line (pip 26.3, --no-index -f with tiny wheels).
+        ("--no-binary :all:\n", "fastlib==2.0.0\n", "-r a.txt -r b.txt", {"fastlib": ("2.0.0", "source")}),
+        ("--no-binary :all:\n", "fastlib==2.0.0\n", "-r b.txt -r a.txt", {"fastlib": ("2.0.0", "source")}),
+        ("--only-binary :all:\n", "nowheels==0.9\n", "-r a.txt -r b.txt", {"nowheels": ("0.9", "missing")}),
+        ("--only-binary :all:\n", "nowheels==0.9\n", "-r b.txt -r a.txt", {"nowheels": ("0.9", "missing")}),
+        ("--pre\n", "prelib>=0.5\n", "-r a.txt -r b.txt", {"prelib": ("2.0rc1", "source")}),
+        ("--pre\n", "prelib>=0.5\n", "-r b.txt -r a.txt", {"prelib": ("2.0rc1", "source")}),
+        # The last option pip reads wins, across the files as within one.
+        (
+            "--only-binary :all:\nfastlib==2.0.0\n",
+            "--no-binary :all:\n",
+            "-r a.txt -r b.txt",
+            {"fastlib": ("2.0.0", "source")},
+        ),
+        (
+            "--no-binary :all:\nfastlib==2.0.0\n",
+            "--only-binary :all:\n",
+            "-r a.txt -r b.txt",
+            {"fastlib": ("2.0.0", "wheel")},
+        ),
+        # A -c line inside one file constrains the others' requirements too (pip and uv 0.13.1 alike).
+        ("-c c.txt\n", "ranged\n", "-r a.txt -r b.txt", {"ranged": ("1.9", "source")}),
+        ("-c c.txt\n", "ranged\n", "-r b.txt -r a.txt", {"ranged": ("1.9", "source")}),
+        # The line's own -c file's options reach every -r file.
+        ("purewheel==3.1\n", "fastlib==2.0.0\n", "-c c.txt -r a.txt -r b.txt", None),
+        # A file with no option lines: the same answer as before.
+        (
+            "purewheel==3.1\n",
+            "fastlib==2.0.0\n",
+            "-r a.txt -r b.txt",
+            {"purewheel": ("3.1", "wheel"), "fastlib": ("2.0.0", "wheel")},
+        ),
+    ],
+)
+def test_cli_dockerfile_inputs_reads_the_files_of_one_line_as_one_install(
+    tmp_path, capsys, fake_pypi, a, b, run, expected
+):
+    path = _context(tmp_path, _ONE_LINE.format(run), ["a.txt", "b.txt", "c.txt"])
+    (tmp_path / "a.txt").write_text(a, encoding="utf-8")
+    (tmp_path / "b.txt").write_text(b, encoding="utf-8")
+    if expected is None:
+        (tmp_path / "c.txt").write_text("--no-binary :all:\n", encoding="utf-8")
+        expected = {"purewheel": ("3.1", "missing"), "fastlib": ("2.0.0", "source")}
+    else:
+        (tmp_path / "c.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    main(["--dockerfile", str(path), "--dockerfile-inputs", "--json", "--no-cache"])
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert {p["name"]: (p["version"], p["results"]["linux-x86_64"]) for p in packages} == expected
+
+
+def test_cli_dockerfile_inputs_notes_an_index_option_of_another_file_of_the_line(tmp_path, capsys, fake_pypi):
+    # pip 26.3 finds b.txt's package through a -f line in a.txt (`pip install --no-index -r a.txt -r b.txt`).
+    path = _context(tmp_path, _ONE_LINE.format("-r a.txt -r b.txt"), ["a.txt", "b.txt", "c.txt"])
+    (tmp_path / "a.txt").write_text("--extra-index-url https://example.test/simple\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--no-cache"]) == 0
+    err = capsys.readouterr().err
+    # The note names the file that sets the option, for the file whose packages it changes.
+    assert (
+        "note: a.txt sets --extra-index-url for the install that reads b.txt too, which wheelgap doesn't read: "
+        "b.txt's packages were checked on PyPI only" in err
+    )
+    assert "note: b.txt sets" not in err
+    assert "note: a.txt sets --extra-index-url, which wheelgap doesn't read" in err
+
+
+@pytest.mark.parametrize(
+    ("a", "run", "expected"),
+    [
+        # pip 26.3 reads the requirements named on the line with the -r files' options, in either order:
+        # `-r nb.txt fastlib==2.0.0` and `fastlib==2.0.0 -r nb.txt` both find no distribution with only a wheel.
+        ("--no-binary :all:\n", "-r a.txt fastlib==2.0.0", ("2.0.0", "source")),
+        ("--no-binary :all:\n", "fastlib==2.0.0 -r a.txt", ("2.0.0", "source")),
+        ("--only-binary :all:\n", "-r a.txt nowheels==0.9", ("0.9", "missing")),
+        ("--pre\n", "-r a.txt prelib>=0.5", ("2.0rc1", "source")),
+        ("--pre\n", "prelib>=0.5 -r a.txt", ("2.0rc1", "source")),
+        ("-c c.txt\n", "-r a.txt ranged", ("1.9", "source")),  # a -c line inside a.txt: pip 26.3 takes the pin
+        ("purewheel==3.1\n", "-r a.txt fastlib==2.0.0", ("2.0.0", "wheel")),  # no option lines: as before
+        ("--no-binary :all:\n", "fastlib==2.0.0", ("2.0.0", "wheel")),  # a.txt isn't on the line
+    ],
+)
+def test_cli_dockerfile_inputs_applies_the_lines_files_to_the_names_on_it(
+    tmp_path, capsys, fake_pypi, a, run, expected
+):
+    path = _context(tmp_path, _ONE_LINE.format(run), ["a.txt", "b.txt", "c.txt"])
+    (tmp_path / "a.txt").write_text(a, encoding="utf-8")
+    (tmp_path / "c.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    main(["--dockerfile", str(path), "--dockerfile-inputs", "--json", "--no-cache"])
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    named = {p["name"]: (p["version"], p["results"]["linux-x86_64"]) for p in packages if p["name"] != "purewheel"}
+    assert named == {run.replace(" -r a.txt", "").replace("-r a.txt ", "").split("=")[0].split(">")[0]: expected}
+
+
+def test_dockerfile_requirements_keeps_the_names_of_two_installs_with_other_files_apart(tmp_path):
+    path = _context(
+        tmp_path,
+        _ONE_LINE.format("-r a.txt six==1.16.0 && pip install idna==3.10 && pip install -r a.txt certifi==1"),
+        ["a.txt", "b.txt", "c.txt"],
+    )
+    report = InputsReport()
+    dockerfile_requirements(path, report=report, line_files={})
+    assert report.named == [(4, ["six==1.16.0"], False), (4, ["idna==3.10"], False), (4, ["certifi==1"], False)]
+    assert report.named_files == [(tmp_path / "a.txt",), (), (tmp_path / "a.txt",)]
+
+
+def test_cli_dockerfile_inputs_notes_a_files_prefer_binary_for_names_on_the_line(tmp_path, capsys, fake_pypi):
+    # pip 26.3 with --prefer-binary in a.txt and `ranged<2` on the line takes ranged 1.5's wheel over 1.9's sdist.
+    path = _context(
+        tmp_path, "FROM python:3.13\nWORKDIR /app\nCOPY a.txt .\nRUN pip install -r a.txt 'ranged<2'\n", ["a.txt"]
+    )
+    (tmp_path / "a.txt").write_text("--prefer-binary\n", encoding="utf-8")
+    main(["--dockerfile", str(path), "--dockerfile-inputs", "--no-cache"])
+    assert "note: a.txt:1 sets --prefer-binary: for an unpinned requirement" in capsys.readouterr().err
+
+
+def test_dockerfile_requirements_reads_the_files_of_one_line_together(tmp_path):
+    path = _context(tmp_path, _ONE_LINE.format("-r a.txt -r b.txt"), ["a.txt", "b.txt", "c.txt"])
+    # A caller that doesn't take the line's other -r files would read each file without the others' options.
+    with pytest.raises(DockerfileError, match=":4: pip install with more than one -r FILE isn't read here"):
+        dockerfile_requirements(path)
+    found: dict = {}
+    assert dockerfile_requirements(path, line_files=found) == [(4, tmp_path / "a.txt"), (4, tmp_path / "b.txt")]
+    assert found == {
+        name: (tmp_path / "a.txt", tmp_path / "b.txt") for name in (tmp_path / "a.txt", tmp_path / "b.txt")
+    }
+    a_txt, b_txt = tmp_path / "a.txt", tmp_path / "b.txt"
+    a_txt.write_text("--no-binary :all:\n", encoding="utf-8")
+    (source,) = load_inputs([str(b_txt)], requirements_line_files={b_txt: (a_txt, b_txt)})
+    assert [(p.name, p.no_binary) for p in source.packages] == [("purewheel", True)]
+    (source,) = load_inputs([str(b_txt)])
+    assert [(p.name, p.no_binary) for p in source.packages] == [("purewheel", False)]
+
+
+@pytest.mark.parametrize(
+    ("a", "message"),
+    [
+        # b.txt was read alone on line 4; on line 5 a.txt's --pre changes what pip picks for it.
+        ("--pre\n", ":5: b.txt is installed again with other -r files than on line 4, whose option lines change"),
+        ("purewheel==3.1\n", None),  # a.txt changes nothing for b.txt: read once, as before
+    ],
+)
+def test_dockerfile_requirements_refuses_a_file_read_again_with_other_options(tmp_path, a, message):
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nWORKDIR /app\nCOPY a.txt b.txt ./\nRUN pip install -r b.txt\n"
+        "RUN pip install -r a.txt -r b.txt\n",
+        ["a.txt", "b.txt"],
+    )
+    (tmp_path / "a.txt").write_text(a, encoding="utf-8")
+    (tmp_path / "b.txt").write_text("prelib>=0.5\n", encoding="utf-8")
+    if message is None:
+        assert dockerfile_requirements(path, line_files={}) == [(4, tmp_path / "b.txt"), (5, tmp_path / "a.txt")]
+    else:
+        with pytest.raises(DockerfileError, match=message):
+            dockerfile_requirements(path, line_files={})
+
+
+def test_dockerfile_requirements_refuses_a_file_read_again_with_a_dependency_constraint_under_deps(tmp_path):
+    # pip 26.3: line 5 downgrades b.txt's dependency dd to the 1.0 that a.txt's -c file pins, and --deps resolves
+    # b.txt once, as line 4 reads it. Without --deps no dependency is checked, so the answer is the same.
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nWORKDIR /app\nCOPY a.txt b.txt c.txt ./\nRUN pip install -r b.txt\n"
+        "RUN pip install -r a.txt -r b.txt\n",
+        ["a.txt", "b.txt", "c.txt"],
+    )
+    (tmp_path / "a.txt").write_text("-c c.txt\n", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("dd==1.0\n", encoding="utf-8")
+    assert dockerfile_requirements(path, line_files={}) == [(4, tmp_path / "b.txt"), (5, tmp_path / "a.txt")]
+    with pytest.raises(DockerfileError, match=":5: b.txt is installed again with other -r files than on line 4"):
+        dockerfile_requirements(path, line_files={}, dependencies=True)
+
+
+def test_dockerfile_requirements_refuses_a_lock_beside_other_files_on_a_pip_line(tmp_path):
+    # pip 26.3 picks the lock's files with the --no-binary of the line's requirements files, in either order.
+    path = _context(
+        tmp_path,
+        "FROM python:3.13\nWORKDIR /app\nCOPY a.txt pylock.toml ./\nRUN pip install -r a.txt -r pylock.toml\n",
+        ["a.txt", "pylock.toml"],
+    )
+    with pytest.raises(DockerfileError, match=r":4: pip install -r pylock.toml with other -r files: pip picks"):
+        dockerfile_requirements(path, line_files={})
 
 
 def test_dockerfile_install_constraint_file_includes_are_verified(tmp_path, capsys, fake_pypi):
@@ -2282,8 +2473,7 @@ def test_cli_dockerfile_inputs_reads_uv_pip_system_install(tmp_path, capsys, fak
         (
             "COPY . ./",
             "uv pip install --system -r requirements.txt",
-            ":3: this COPY puts a uv.toml or pyproject.toml in the image, and uv reads settings from them: "
-            "copy the requirements file alone and run uv pip install before this COPY",
+            ":3: this COPY brings uv.toml, which uv reads for uv pip install",
         ),
         ("COPY --from=ghcr.io/astral-sh/uv /other /bin/", "uv pip install --system -r requirements.txt", ":3: COPY"),
         ("COPY --from=other /uv /bin/", "uv pip install --system -r requirements.txt", ":3: COPY"),
@@ -2305,6 +2495,139 @@ def test_dockerfile_inputs_refuses_unsupported_uv_installs(tmp_path, copy, run, 
     (tmp_path / "uv.toml").write_text("no-binary = true\n", encoding="utf-8")
     with pytest.raises(DockerfileError, match=message):
         dockerfile_requirements(path)
+
+
+_UV_COPY_RUN = "FROM python:3.13\nWORKDIR /app\nCOPY . ./\nRUN uv pip install --system -r requirements.txt\n"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "message"),
+    [
+        # A pyproject.toml with no [tool.uv] table, and an empty uv.toml, hold no settings uv reads.
+        ("pyproject.toml", '[project]\nname = "app"\nversion = "0"\n', None),
+        ("pyproject.toml", "[tool.ruff]\nline-length = 120\n[dependency-groups]\ndev = []\n", None),
+        ("pyproject.toml", "[tool.uv]\n", None),  # an empty [tool.uv] table sets nothing
+        ("uv.toml", "", None),
+        ("uv.toml", "# nothing set\n", None),
+        ("uv.toml", "no-binary = true\n", ":3: this COPY brings uv.toml, which uv reads for uv pip install"),
+        ("pyproject.toml", '[tool.uv]\nprerelease = "allow"\n', ":3: .*brings pyproject.toml, whose \\[tool.uv\\]"),
+        ("pyproject.toml", '[tool.uv.pip]\nprerelease = "allow"\n', ":3: .*brings pyproject.toml, whose \\[tool.uv\\]"),
+        ("pyproject.toml", '[[tool.uv.index]]\nurl = "https://e.test"\n', ":3: .*whose \\[tool.uv\\] table"),
+        # Named by its path in the build context, so a monorepo's COPY . . says which one.
+        ("sub/pyproject.toml", "[tool.uv]\nno-binary = true\n", ":3: this COPY brings sub/pyproject\\.toml, whose"),
+        # A Windows image's file system doesn't tell the case apart.
+        ("UV.toml", "no-binary = true\n", ":3: this COPY brings UV.toml, which uv reads for uv pip install"),
+        ("pyproject.toml", "[project\n", ":3: this COPY brings pyproject.toml, which isn't valid TOML"),
+        ("uv.toml", "no-binary = [\n", ":3: this COPY brings uv.toml, which isn't valid TOML"),
+    ],
+)
+def test_dockerfile_inputs_uv_install_reads_the_configs_a_copy_brings(tmp_path, filename, content, message):
+    path = _context(tmp_path, _UV_COPY_RUN, files=("requirements.txt", filename))
+    (tmp_path / filename).write_text(content, encoding="utf-8")
+    if message is None:
+        assert dockerfile_requirements(path, uv_installs=set()) == [(4, tmp_path / "requirements.txt")]
+    else:
+        with pytest.raises(DockerfileError, match=message):
+            dockerfile_requirements(path)
+
+
+@pytest.mark.parametrize(
+    ("copy", "filename", "content", "message"),
+    [
+        ("COPY requirements.txt pyproject.toml ./", "pyproject.toml", '[project]\nname = "app"\n', None),
+        (
+            "COPY requirements.txt pyproject.toml ./",
+            "pyproject.toml",
+            '[tool.uv]\nprerelease = "allow"\n',
+            ":3: this COPY brings pyproject.toml, whose \\[tool.uv\\] table",
+        ),
+        # The file is read under the name it lands with.
+        ("COPY requirements.txt ./\nCOPY pyproject.toml /app/uv.toml", "pyproject.toml", "", None),
+        (
+            "COPY requirements.txt ./\nCOPY pyproject.toml /app/uv.toml",
+            "pyproject.toml",
+            '[project]\nname = "app"\n',
+            ":4: this COPY brings pyproject.toml as uv.toml, which uv reads for uv pip install",
+        ),
+        # Into a folder, even one named pyproject.toml, the file keeps its own name.
+        (
+            "COPY requirements.txt ./\nCOPY uv.toml /app/pyproject.toml/",
+            "uv.toml",
+            "no-binary = true\n",
+            ":4: this COPY brings uv.toml, which uv reads for uv pip install",
+        ),
+    ],
+)
+def test_dockerfile_inputs_uv_install_reads_a_copied_config_file(tmp_path, copy, filename, content, message):
+    path = _context(
+        tmp_path, f"FROM python:3.13\nWORKDIR /app\n{copy}\nRUN uv pip install --system -r requirements.txt\n"
+    )
+    (tmp_path / filename).write_text(content, encoding="utf-8")
+    if message is None:
+        assert dockerfile_requirements(path, uv_installs=set())[0][1] == tmp_path / "requirements.txt"
+    else:
+        with pytest.raises(DockerfileError, match=message):
+            dockerfile_requirements(path)
+
+
+@pytest.mark.parametrize(
+    ("copy", "run"),
+    [
+        # With COPY . . now read, a cp can still write the [tool.uv] table the install reads.
+        ("COPY . .", "cp pyproject.docker.toml pyproject.toml"),
+        ("COPY requirements.txt .", "printf '[tool.uv]\\nprerelease = \"allow\"\\n' > pyproject.toml"),
+    ],
+)
+def test_dockerfile_inputs_uv_install_refuses_a_run_that_names_pyproject(tmp_path, copy, run):
+    path = _context(
+        tmp_path,
+        f"FROM python:3.13\nWORKDIR /app\n{copy}\nRUN {run}\nRUN uv pip install --system -r requirements.txt\n",
+        files=("requirements.txt", "pyproject.docker.toml"),
+    )
+    (tmp_path / "pyproject.docker.toml").write_text('[tool.uv]\nprerelease = "allow"\n', encoding="utf-8")
+    with pytest.raises(
+        DockerfileError, match=r":4: `.*` names pyproject\.toml, which may be a pyproject\.toml with a \[tool\.uv\]"
+    ):
+        dockerfile_requirements(path, uv_installs=set())
+    # pip reads no settings from a pyproject.toml: the same RUN before a pip install is read as before.
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("uv pip install --system", "pip install"), encoding="utf-8"
+    )
+    assert dockerfile_requirements(path) == [(5, tmp_path / "requirements.txt")]
+
+
+def test_dockerfile_inputs_uv_install_refuses_a_linked_config(tmp_path):
+    """Docker copies a link inside a copied folder as a link, which resolves in the image: the file it points to in
+    the build context isn't what uv reads there."""
+    path = _context(tmp_path, _UV_COPY_RUN)
+    (tmp_path / "plain.toml").write_text('[project]\nname = "app"\n', encoding="utf-8")
+    try:
+        (tmp_path / "pyproject.toml").symlink_to("plain.toml")
+    except OSError:
+        pytest.skip("symlinks aren't available here")
+    with pytest.raises(DockerfileError, match=":3: this COPY brings pyproject.toml, a symlink, which"):
+        dockerfile_requirements(path)
+
+
+def test_dockerfile_inputs_uv_install_under_copy_dot(tmp_path):
+    """#641's example: COPY . . with a pyproject.toml that holds no uv settings reads the install like one that
+    copies requirements.txt alone."""
+    requirements = tmp_path / "requirements.txt"
+    path = _context(
+        tmp_path,
+        "FROM python:3.13-slim\n"
+        "COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/\n"
+        "WORKDIR /app\nCOPY . .\nRUN uv pip install --system -r requirements.txt\n",
+    )
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "app"\nversion = "0"\n', encoding="utf-8")
+    assert dockerfile_requirements(path, uv_installs=set()) == [(5, requirements)]
+    alone = _context(
+        tmp_path,
+        "FROM python:3.13-slim\n"
+        "COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/\n"
+        "WORKDIR /app\nCOPY requirements.txt .\nRUN uv pip install --system -r requirements.txt\n",
+    )
+    assert dockerfile_requirements(alone, uv_installs=set()) == [(5, requirements)]
 
 
 def test_cli_dockerfile_inputs_checks_a_uv_install_as_uv_installs_it(tmp_path, capsys, fake_pypi, monkeypatch):
@@ -3028,6 +3351,139 @@ def test_cli_dockerfile_inputs_reads_any_image_when_p_and_t_are_given(tmp_path, 
         assert fake_pypi == []
 
 
+# The Dockerfile of #683: line 9's `<< EOF` is a heredoc to docker/dockerfile 1.16, and isn't one to 1.4.
+_OLD_SYNTAX_HEREDOC = (
+    "# syntax=docker/dockerfile:1.4\n"
+    "FROM python:3.13-slim\n"
+    "WORKDIR /app\n"
+    "COPY requirements.txt .\n"
+    "RUN pip install -r requirements.txt\n"
+    "RUN cat > /etc/motd <<EOF\n"
+    "hello ${HOME}\n"
+    "EOF\n"
+    "RUN cat > /etc/x << EOF\n"
+    "hi\n"
+    "EOF\n"
+)
+_OLD_SYNTAX_REASON = (
+    "# syntax=docker/dockerfile:1.4 may read the heredocs in 'RUN cat > /etc/x << EOF' differently from "
+    "docker/dockerfile 1.16 and later, which wheelgap follows"
+)
+
+
+@pytest.mark.parametrize("flags", [[], ["-p", "3.13"], ["-t", "linux-x86_64"], ["-p", "3.13", "-t", "linux-x86_64"]])
+def test_cli_dockerfile_inputs_old_syntax_heredoc_error_names_the_line_and_what_helps(
+    tmp_path, capsys, fake_pypi, flags
+):
+    path = _context(tmp_path, _OLD_SYNTAX_HEREDOC)
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", *flags]) == 2
+    err = capsys.readouterr().err
+    # -p and -t don't say which lines are instructions, so they aren't the advice, given or not.
+    assert err == (
+        f"wheelgap: error: {path}:9: {_OLD_SYNTAX_REASON}; drop the # syntax= line, or set it to "
+        "docker/dockerfile:1 (the newest 1.x)\n"
+    )
+    assert "-p/-t" not in err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_old_syntax_heredoc_is_an_image_p_and_t_stand_in_for(tmp_path, capsys, fake_pypi):
+    path = _context(tmp_path, _OLD_SYNTAX_HEREDOC)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = [str(requirements), "--dockerfile", str(path), "--json"]
+    assert main([*argv, "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert [(t["python"], t["platform"]) for t in data["targets"]] == [("3.13", "linux-x86_64")]
+    assert [p["name"] for p in data["packages"]] == ["purewheel"]
+    assert f"wheelgap: note: {path}:9: the final image isn't read ({_OLD_SYNTAX_REASON}), so this run checks" in (
+        captured.err
+    )
+    assert "wheelgap: error" not in captured.err
+    [note] = data["dockerfile_notes"]
+    assert (note["dockerfile"], note["line"], note["kind"]) == (str(path), 9, "image-not-read")
+    # Without both -p and -t it is still an error, with the line, and still says to pass them.
+    for flags in ([], ["-p", "3.13"], ["-t", "linux-x86_64"]):
+        fake_pypi.clear()
+        assert main([*argv, *flags]) == 2
+        captured = capsys.readouterr()
+        assert f"wheelgap: error: {path}:9: {_OLD_SYNTAX_REASON}, pass -p/-t instead\n" in captured.err
+        assert "isn't read" not in captured.err
+        assert fake_pypi == []
+
+
+def test_old_syntax_heredoc_error_names_the_line_of_a_continued_instruction(tmp_path):
+    # The line is where the instruction starts, as for every other instruction.
+    path = _context(
+        tmp_path, "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\n\nRUN cat \\\n  << EOF\nhi\nEOF\n"
+    )
+    with pytest.raises(UnknownImageError, match=rf"^{re.escape(str(path))}:4: # syntax=docker/dockerfile:1\.4 ") as e:
+        read_dockerfile(path)
+    assert e.value.line == 4
+    with pytest.raises(DockerfileError, match=rf"^{re.escape(str(path))}:4: .*; drop the # syntax= line"):
+        dockerfile_requirements(path)
+
+
+def test_cli_dockerfile_old_syntax_heredoc_still_stops_on_a_final_from_scratch(tmp_path, capsys, fake_pypi):
+    # -p and -t stand in only for how the heredoc is read: a final FROM scratch, read as 1.16 reads the file, still
+    # stops the run.
+    text = (
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13 AS build\nRUN cat > /x << EOF\nhi\nEOF\n"
+        "FROM scratch\nCOPY --from=build /x /x\n"
+    )
+    path = _context(tmp_path, text)
+    requirements = tmp_path / "requirements.txt"
+    assert main([str(requirements), "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    err = capsys.readouterr().err
+    assert f"wheelgap: error: {path}:6: FROM scratch: the image starts empty" in err
+    assert "isn't read" not in err
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Under 1.4 `<< EOF` is no heredoc, so this builds; read as 1.16 reads it, the heredoc is never closed.
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN echo hi << EOF\n",
+        "# syntax=docker/dockerfile:1.4\nFROM python:3.13-slim\nRUN echo hi << EOF\nRUN cat <<END\nhi\n",
+    ],
+)
+def test_cli_dockerfile_old_syntax_heredoc_is_not_called_unterminated(tmp_path, capsys, fake_pypi, text):
+    # How the old frontend reads the lines after the heredoc isn't known, so an unterminated heredoc in 1.16's reading
+    # isn't said to be BuildKit's answer: the refusal stands, and -p and -t stand in for the image as usual.
+    path = _context(tmp_path, text)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("purewheel==3.1\n", encoding="utf-8")
+    argv = [str(requirements), "--dockerfile", str(path)]
+    reason = (
+        "# syntax=docker/dockerfile:1.4 may read the heredocs in 'RUN echo hi << EOF' differently from "
+        "docker/dockerfile 1.16 and later, which wheelgap follows"
+    )
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"wheelgap: error: {path}:3: {reason}, pass -p/-t instead\n" in err
+    assert "unterminated" not in err
+    assert fake_pypi == []
+    assert main([*argv, "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert f"wheelgap: note: {path}:3: the final image isn't read ({reason}), so this run checks" in captured.err
+    assert "unterminated" not in captured.err
+    [note] = json.loads(captured.out)["dockerfile_notes"]
+    assert (note["line"], note["kind"]) == (3, "image-not-read")
+
+
+def test_cli_dockerfile_old_syntax_heredoc_keeps_the_alpine_note(tmp_path, capsys, fake_pypi):
+    # The tag is still read as 1.16 reads the file, so an Alpine final image still gets the musl note.
+    path = _context(tmp_path, "# syntax=docker/dockerfile:1.4\nFROM python:3.13-alpine\nRUN cat > /x << EOF\nhi\nEOF\n")
+    requirements = tmp_path / "requirements.txt"
+    argv = [str(requirements), "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--json"]
+    assert main(argv) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [n["kind"] for n in data["dockerfile_notes"]] == ["image-not-read", "image-libc"]
+
+
 def test_cli_dockerfile_reads_any_image_when_p_and_t_are_given(tmp_path, capsys, fake_pypi):
     path = _context(tmp_path, "FROM ubuntu:24.04\nRUN anything at all\n")
     assert main(["purewheel", "--dockerfile", str(path), "-p", "3.13", "-t", "linux-x86_64", "--glibc", "2.39"]) == 0
@@ -3233,11 +3689,12 @@ _INSTALL = "RUN pip install -r requirements.txt\n"
         ),
         ("RUN apk add --no-cache build-base && adduser -D app\n" + _INSTALL, {"system-packages": [4]}),
         (
-            "RUN curl -fsSL https://example.test/x.tgz | tar xz -C /opt && npm ci && npm run build\n" + _INSTALL,
+            "RUN curl -fsSL https://example.test/x.tgz | tar xz -C /opt && npm ci --ignore-scripts\n" + _INSTALL,
             {"programs": [4], "shell": [4]},
         ),
         (
-            "RUN git clone https://example.test/r.git /src && cd /src && cmake . && echo done > /tmp/log\n" + _INSTALL,
+            "RUN git clone https://example.test/r.git /src && cd /src && cmake -E make_directory b && echo x > /tmp/l\n"
+            + _INSTALL,
             {"programs": [4], "shell": [4]},
         ),
         (
@@ -3296,11 +3753,11 @@ def test_dockerfile_requirements_passes_over_runs_that_install_nothing(tmp_path,
 
 def test_dockerfile_requirements_names_the_programs_and_tools_it_passed_over(tmp_path):
     body = (
-        "RUN curl -O https://example.test/a && npm ci && curl -O https://example.test/b\nRUN pip install -U pip wheel\n"
+        "RUN curl -O https://example.test/a && git clone x && curl -O https://example.test/b\nRUN pip install -U pip\n"
     )
     _, report = _inputs(tmp_path, body + _INSTALL)
-    assert report.programs == ["curl", "npm"]
-    assert report.tools == ["pip", "wheel"]
+    assert report.programs == ["curl", "git"]
+    assert report.tools == ["pip"]
 
 
 @pytest.mark.parametrize(
@@ -3331,6 +3788,239 @@ def test_dockerfile_requirements_warns_about_runs_it_cant_see_into(tmp_path, run
     [(line, text)] = report.warnings
     assert line == 5
     assert what in text
+
+
+# #684: commands that run the project's own code, one row per spelling, and the spelling wheelgap names it by: a named
+# script, a package's bin or a script file, then (_PROJECT_BUILDS) package.json lifecycle scripts (`postinstall`,
+# `prepare`, `prepack`), build.rs and a project's build files.
+_PROJECT_SCRIPTS = [
+    ("npm run setup", "npm run"),
+    ("npm run-script setup", "npm run-script"),
+    ("npm start", "npm start"),
+    ("npm test", "npm test"),
+    ("npm exec some-tool", "npm exec"),
+    ("npm --prefix web run build", "npm run"),
+    ("npm explore some-pkg", "npm explore"),
+    ("npm init some-starter", "npm init"),
+    ("npx some-tool", "npx"),
+    ("yarn build", "yarn build"),
+    ("yarn run build", "yarn run"),
+    ("yarn --cwd web build", "yarn build"),
+    ("pnpm run build", "pnpm run"),
+    ("pnpm exec some-tool", "pnpm exec"),
+    ("pnpm dlx some-tool", "pnpm dlx"),
+    ("pnpm build", "pnpm build"),
+    ("pnpm --filter web build", "pnpm build"),
+    ("pnpm -C web build", "pnpm build"),
+    ("bun run build", "bun run"),
+    ("bun scripts/setup.ts", "bun scripts/setup.ts"),
+    ("bun --cwd web dev", "bun dev"),
+    ("deno run -A setup.ts", "deno run"),
+    ("deno task setup", "deno task"),
+    ("node scripts/setup.js", "node"),
+    ("node -r ./setup.js -e 1", "node"),
+    ("go run ./cmd/setup", "go run"),
+    ("cargo run --release", "cargo run"),
+    ("cmake -P setup.cmake", "cmake -P"),
+    ("corepack yarn build", "yarn build"),
+]
+_PROJECT_BUILDS = [
+    ("npm ci", "npm ci"),
+    ("npm install --omit=dev", "npm install"),
+    ("npm it", "npm it"),
+    ("npm pack", "npm pack"),
+    ("npm version patch", "npm version"),
+    ("npm rebuild", "npm rebuild"),
+    ("yarn install --frozen-lockfile", "yarn install"),
+    ("yarn", "yarn"),
+    ("yarn --frozen-lockfile", "yarn"),
+    ("yarn --cwd web", "yarn"),
+    ("pnpm install --frozen-lockfile", "pnpm install"),
+    ("bun install", "bun install"),
+    ("bun pm pack", "bun pm"),
+    ("cargo build --release", "cargo build"),
+    ("cargo check", "cargo check"),
+    ("cargo install --path tools/gen", "cargo install"),
+    ("cmake -S native -B build", "cmake"),
+    ("cmake --build build", "cmake --build"),
+    ("ninja -C build", "ninja"),
+    ("mvn -B package", "mvn"),
+    ("gradle build", "gradle"),
+    ("dotnet build", "dotnet"),
+    ("dotnet run --project tools", "dotnet"),
+    ("ruby setup.rb", "ruby"),
+    ("php setup.php", "php"),
+    ("java -jar tool.jar", "java"),
+    ("bundle install", "bundle"),
+    ("bundle exec rake setup", "bundle"),
+    ("composer install", "composer"),
+    # The script comes from a redirect or a pipe (the redirect's file is the project's).
+    ("node < scripts/setup.js", "node"),
+    ("cat scripts/setup.js | node", "node"),
+    ("ruby < setup.rb", "ruby"),
+]
+
+
+@pytest.mark.parametrize(("run", "spelling"), _PROJECT_SCRIPTS + _PROJECT_BUILDS)
+def test_dockerfile_requirements_warns_about_project_code_after_the_last_install(tmp_path, run, spelling):
+    lines, report = _inputs(tmp_path, f"{_INSTALL}RUN {run}\n")
+    assert lines == [4]  # the answer is still given
+    shown = run.rpartition("| ")[2].partition(" <")[0]  # the command of the line, without its redirect
+    assert report.warnings == [(5, f"`{shown}`, which runs scripts wheelgap can't see into")]
+    assert [spelling for _, spelling, *_ in report.scripts] == [spelling]
+    assert "programs" not in report.passed_over
+
+
+@pytest.mark.parametrize(("run", "spelling"), _PROJECT_SCRIPTS + _PROJECT_BUILDS)
+def test_dockerfile_requirements_warns_about_project_code_before_an_install(tmp_path, run, spelling):
+    # It may pip-install packages wheelgap never sees, or rewrite the requirements or pip's settings, so the answer
+    # isn't complete. It still answers, as #657 decided: stopping would refuse most full-stack Dockerfiles.
+    lines, report = _inputs(tmp_path, f"RUN {run}\n{_INSTALL}")
+    assert lines == [5]
+    shown = run.rpartition("| ")[2].partition(" <")[0]
+    assert report.warnings == [
+        (
+            4,
+            f"`{shown}`, which runs the project's own code before the install on line 5, and may change what it "
+            "installs",
+        )
+    ]
+    assert report.passed_over == ({"shell": [4]} if "|" in run else {})  # `cat` before the pipe
+    # With --deps, what it installed first changes the dependencies pip fetches: it stops, as a COPY --from does.
+    path = _context(tmp_path, f"FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\nRUN {run}\n{_INSTALL}")
+    with pytest.raises(DockerfileError, match=f":4: {spelling} runs the project's own code, which may install Python"):
+        dockerfile_requirements(path, constraints={}, dependencies=True)
+
+
+def test_dockerfile_requirements_names_the_install_on_the_same_line(tmp_path):
+    _, report = _inputs(tmp_path, "RUN npm ci && pip install -r requirements.txt\n")
+    assert report.warnings == [
+        (
+            4,
+            "`npm ci`, which runs the project's own code before the install on the same line, and may change what it "
+            "installs",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        "npm ci --ignore-scripts",
+        "npm install --ignore-scripts",
+        "npm config set fund false",
+        "yarn install --mode=skip-build",
+        "yarn --version",
+        "pnpm install --ignore-scripts",
+        "bun install --ignore-scripts",
+        "curl -fsSL -o /tmp/x https://example.test/x",
+        "git clone https://example.test/repo.git /opt/repo",
+        "deno cache main.ts",
+        "node --version",
+        "go build ./...",
+        "cargo fetch",
+        "cmake --version",
+        "cmake -E make_directory build",
+        "java -version",
+        "dotnet --version",
+        "corepack enable",
+    ],
+)
+def test_dockerfile_requirements_passes_over_plain_programs(tmp_path, run):
+    # Scripts turned off, or a probe: nothing of the project runs, before an install or after it.
+    for body in (f"{_INSTALL}RUN {run}\n", f"RUN {run}\n{_INSTALL}"):
+        _, report = _inputs(tmp_path, body)
+        assert report.warnings == []
+        assert list(report.passed_over) == ["programs"]
+
+
+@pytest.mark.parametrize(
+    "run",
+    ["npm install -g pnpm@9", "npm i -g npm@latest", "yarn global add serve", "pnpm add -g turbo", "bun add -g x"],
+)
+def test_dockerfile_requirements_passes_over_a_global_install_of_named_packages(tmp_path, run):
+    # They run the named packages' scripts, not the project's: a plain program, before an install and with --deps.
+    lines, report = _inputs(tmp_path, f"RUN {run}\n{_INSTALL}")
+    assert lines == [5] and report.warnings == [] and list(report.passed_over) == ["programs"]
+
+
+@pytest.mark.parametrize("run", ["npm install -g", "npm install -g ./tools/cli", "yarn global add file:./cli"])
+def test_dockerfile_requirements_warns_about_a_global_install_of_the_project(tmp_path, run):
+    _, report = _inputs(tmp_path, f"{_INSTALL}RUN {run}\n")
+    assert [line for line, _ in report.warnings] == [5]
+
+
+@pytest.mark.parametrize(("run", "warns"), [("python 3< s.py", False), ("python 0< s.py", True), ("python <&3", True)])
+def test_dockerfile_requirements_reads_only_stdin_redirects_as_a_script(tmp_path, run, warns):
+    # `3< FILE` opens fd 3; python reads its script from fd 0.
+    _, report = _inputs(tmp_path, f"{_INSTALL}RUN {run}\n")
+    assert bool(report.warnings) is warns
+
+
+def test_dockerfile_requirements_keeps_bunx_unknown(tmp_path):
+    # As on main: a program wheelgap doesn't know, a stop before an install and a warning after it.
+    with pytest.raises(DockerfileError, match=":4: this line runs `bunx some-tool`, a program wheelgap doesn't know"):
+        _inputs(tmp_path, f"RUN bunx some-tool\n{_INSTALL}")
+    _, report = _inputs(tmp_path, f"{_INSTALL}RUN bunx some-tool\n")
+    assert report.warnings == [(5, "`bunx some-tool`, a program wheelgap doesn't know")]
+
+
+@pytest.mark.parametrize(
+    "run", ["python < scripts/install.py", "python3 < scripts/install.py", "cat scripts/install.py | python3"]
+)
+def test_dockerfile_requirements_reads_a_python_script_from_its_input_as_a_script(tmp_path, run):
+    # As `python scripts/install.py`: it may pip-install, so it stops before an install and warns after one.
+    with pytest.raises(DockerfileError, match=":4: this line runs `python3?`, a Python script from its input"):
+        _inputs(tmp_path, f"RUN {run}\n{_INSTALL}")
+    _, report = _inputs(tmp_path, f"{_INSTALL}RUN {run}\n")
+    [(line, what)] = report.warnings
+    assert line == 5 and what.endswith("a Python script from its input, which wheelgap doesn't look into")
+
+
+def test_dockerfile_requirements_places_a_project_script_warning_in_line_order(tmp_path):
+    _, report = _inputs(tmp_path, f"RUN npm ci && npm run build\n{_INSTALL}RUN npm run setup && make x\nRUN npx a\n")
+    assert report.passed_over == {}
+    assert [line for line, _ in report.warnings] == [4, 4, 6, 6, 7]
+    assert [what.partition(",")[0] for _, what in report.warnings] == [
+        "`npm ci`",
+        "`npm run build`",
+        "`npm run setup`",
+        "`make x`",
+        "`npx a`",
+    ]
+
+
+def test_cli_dockerfile_inputs_warns_about_a_project_script_after_the_install(tmp_path, capsys, fake_pypi):
+    # The issue's Dockerfile: `npm run setup` may pip-install psycopg2 from source.
+    dockerfile = (
+        "FROM python:3.13-slim\nWORKDIR /app\nCOPY . .\nRUN npm ci && npm run build\n"
+        "RUN pip install -r requirements.txt\n"
+        "RUN npm run setup\nRUN npx some-tool\nRUN cmake -P setup.cmake\nRUN node scripts/setup.js\nRUN curl -O x\n"
+    )
+    path = _context(tmp_path, dockerfile)
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs"]) == 0  # the exit code is unchanged
+    captured = capsys.readouterr()
+    assert "✓" not in captured.out
+    assert (
+        "! The 1 package wheelgap read has a wheel for 1 target; lines 4, 6, 7, 8, 9 weren't seen into." in captured.out
+    )
+    assert (
+        f"wheelgap: warning: {path}:4: this line runs `npm ci`, which runs the project's own code before the install "
+        "on line 5, and may change what it installs" in captured.err
+    )
+    assert (
+        f"wheelgap: warning: {path}:6: this line runs `npm run setup`, which runs scripts wheelgap can't see into"
+        in captured.err
+    )
+    assert "trusted not to install" not in captured.err
+    assert f"wheelgap: note: {path}: not read, since they install no Python packages with pip or uv: other " in (
+        captured.err
+    )
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["summary"]["complete"] is False
+    assert [entry["line"] for entry in data["dockerfile_warnings"]] == [4, 4, 6, 7, 8, 9]
+    assert not [entry for entry in data["dockerfile_notes"] if entry["kind"] == "passed-over:project-scripts"]
 
 
 @pytest.mark.parametrize(
@@ -4586,7 +5276,7 @@ def test_dockerfile_requirements_stops_on_update_alternatives_over_the_python_ch
         "RUN ln -s /usr/local/bin/python3 /opt/python\n" + _INSTALL,
         "RUN cp /usr/local/bin/pip /tmp/pip-backup\n" + _INSTALL,
         "RUN echo x > /usr/local/bin/myscript && chmod +x /usr/local/bin/myscript\n" + _INSTALL,
-        "RUN node -e \"console.log('hi')\" && git -c core.x=1 status\n" + _INSTALL,
+        "RUN node --version && git -c core.x=1 status\n" + _INSTALL,
         "RUN echo 'run pip install -r requirements.txt' > /tmp/README\n" + _INSTALL,
         # BuildKit expands an ENV value with the values before it: the usual venv recipe reads.
         'ENV VIRTUAL_ENV=/opt/venv\nRUN python -m venv $VIRTUAL_ENV\nENV PATH="$VIRTUAL_ENV/bin:$PATH"\n'
@@ -4923,5 +5613,5 @@ def test_dockerfile_requirements_reads_exact_case_copy_paths(tmp_path):
         encoding="utf-8",
     )
 
-    inputs = dockerfile_requirements(dockerfile)
+    inputs = dockerfile_requirements(dockerfile, line_files={})
     assert [req_path.name for _, req_path in inputs] == ["requirements.txt", "base.txt"]

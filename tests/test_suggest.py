@@ -163,7 +163,9 @@ def test_a_release_must_keep_the_wheels_the_row_has():
     assert suggest.suggest(releases, "1.0", [win]) == suggest.Suggestion({win: "1.1"})  # nothing to keep
     # 1.1 has a Windows wheel, but drops Linux's; 1.2 drops Linux's Python.
     releases = {"1.1": [win_wheel], "1.2": [{**linux_wheel, "requires_python": ">=3.14"}, win_wheel]}
-    assert suggest.suggest(releases, "1.0", [win], keep=[linux]) == suggest.Suggestion({}, (win,))
+    # The nearest of them, and what it drops, for --fix to name.
+    dropped = suggest.Suggestion({}, (win,), drops={win: ("1.1", (linux,))})
+    assert suggest.suggest(releases, "1.0", [win], keep=[linux]) == dropped
     assert suggest.suggest({}, "1.0", [win], keep=[linux]) == suggest.Suggestion({})  # none has a wheel at all
 
 
@@ -408,7 +410,8 @@ def test_last_older_release_only_when_no_newer_one_has_a_wheel():
     linux_wheel, win_wheel = wheel("1.0", "cp313-cp313-manylinux_2_17_x86_64"), wheel("1.0", "cp313-cp313-win_amd64")
     releases = {"0.9": [win_wheel], "1.0": [linux_wheel], "1.1": [win_wheel]}
     # 1.1 has a Windows wheel but drops Linux's: "without losing one elsewhere", not an older release.
-    assert suggest.suggest(releases, "1.0", [win], keep=[linux]) == suggest.Suggestion({}, (win,))
+    dropped = suggest.Suggestion({}, (win,), drops={win: ("1.1", (linux,))})
+    assert suggest.suggest(releases, "1.0", [win], keep=[linux]) == dropped
     assert suggest.suggest(releases, "1.0", [win]) == suggest.Suggestion({win: "1.1"})
 
 

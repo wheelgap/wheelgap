@@ -19,13 +19,13 @@ Or install it: `pip install wheelgap`. wheelgap needs Python 3.11 or later, and 
 
 Run it in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`,
 `requirements.txt`, `requirements.lock` or `pixi.lock` on its own, and reads the first of those it
-finds. Without one of them (after 0.13.0) it checks the direct dependencies in `pyproject.toml`, or the one
+finds. Without one of them it checks the direct dependencies in `pyproject.toml`, or the one
 requirements file it finds under another name or in a subfolder, and a note says which file that was; when there are
 several to choose from it lists them as commands instead of picking one. You can also pass a file,
 a directory, or package names. [Inputs](inputs.md#which-file-is-read) has the details.
 
 `uvx wheelgap` can reuse an older copy that uv installed or cached. Run `uvx wheelgap@latest` for the newest release,
-or pin one (`uvx wheelgap@0.13.0`) when the result must not change between runs.
+or pin one (`uvx wheelgap@0.14.0`) when the result must not change between runs.
 
 ## Pick your Python and platforms
 

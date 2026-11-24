@@ -20,7 +20,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge, gapwheels, origin, piwheels
+from . import __version__, cache, condaforge, fix, gapwheels, origin, piwheels
 from . import notes as tracker
 from . import suggest as release_suggest
 from .api import explain_issues_urls, running_python
@@ -47,8 +47,10 @@ from .codequality import write_codequality
 from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
 from .dockerfile import (
+    _PIP_PYLOCK_NAME_RE,
     PASSED_OVER,
     DockerfileError,
+    HeredocSyntaxError,
     ImageTarget,
     InputsReport,
     UnknownImageError,
@@ -89,6 +91,7 @@ from .sources import (
     check_report_targets,
     load_inputs,
     parse_dist,
+    parse_named_requirements,
     pyproject_group_names,
     pythons_outside_lock,
     requirement_to_package,
@@ -349,9 +352,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fix",
         action="store_true",
-        help="also say which gaps a wheel on wheelgap's gap wheel index fills, and how to install from it (reads "
-        "the index's list from wheelgap.github.io, which sends no package names, and keeps it in the 1-hour cache; "
-        "not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror)",
+        help="also say how to fix each gap: upgrade to the nearest newer release with the wheel (looks the PyPI "
+        "packages with gaps up on pypi.org, as --suggest does), else an unofficial wheel from wheelgap's gap wheel "
+        "index (reads its list from wheelgap.github.io, which sends no package names, and keeps it in the 1-hour "
+        "cache); not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror",
     )
     p.add_argument(
         "--print-gap-wheel-snippet",
@@ -858,11 +862,13 @@ def render_explain(
     issues_urls: dict[int, str | None] | None = None,
     published_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    upgrades: dict[tuple[int, Target], str] | None = None,
 ) -> list[str]:
     """`conda_forge`: --conda-forge hints, `piwheels`: --piwheels hints, `build_info`: --build-info answers and
     `suggestions`: --suggest's, by id() of the row's package. `notes` and `builds` (the tracker's build lab results):
     --notes, by id() of the row. `published_wheels`: --fix's fills (from the gap wheel list, which may come from the
-    1-hour cache), shown once per release under its first filled target."""
+    1-hour cache), shown once per release under its first filled target. `upgrades`: --fix's, the release to move to by
+    (id(row), target), shown first under each target it fixes."""
     multi_py = len({t.python for t in targets}) > 1
     filled: dict[int, list[gapwheels.Fill]] = {}
     for fill in published_wheels or []:
@@ -903,8 +909,13 @@ def render_explain(
             if ask:
                 out.append(f"  ask for a wheel: {ask}")
                 ask = None
+            if (upgrade := (upgrades or {}).get((id(r), t))) is not None:
+                out.append(
+                    f"  upgrade: {r.package.name} {upgrade} has the wheel (an official release; see the --fix section)"
+                )
             if gap_wheel and any(f.target == t for f in gap_wheel):
-                out += [f"  {line}" for line in gapwheels.explain_lines(gap_wheel, multi_py)]
+                fallback = any((id(r), f.target) in (upgrades or {}) for f in gap_wheel)
+                out += [f"  {line}" for line in gapwheels.explain_lines(gap_wheel, multi_py, fallback)]
                 gap_wheel = None
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
@@ -1025,6 +1036,7 @@ def report_json(
     issues_urls: dict[int, str | None] | None = None,
     gap_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    fix_cells: list[fix.Cell] | None = None,
     dockerfile_inputs: list[dict[str, str | int | list[str]]] | None = None,
     dockerfile_notes: list[dict[str, object]] | None = None,
     dockerfile_warnings: list[dict[str, object]] | None = None,
@@ -1043,6 +1055,8 @@ def report_json(
             "error": r.package.error,
             "results": {t.label(multi_py): r.results[t].value for t in targets},
         }
+        if fix_cells is not None:  # --fix: by gap target, its way out (an upgrade, a gap wheel or none)
+            out["fix"] = {c.target.label(multi_py): fix.to_json(c) for c in fix_cells if c.row is r}
         if pyodide_lock and Status.BUNDLED in r.results.values():
             out["bundled"] = pyodide_lock.packages[r.package.key]
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
@@ -1144,6 +1158,8 @@ def report_json(
         report["blocking_newer_python"] = blocking.names
     if gap_wheels is not None:  # --fix: one entry per gap cell a wheel on the gap wheel index fills
         report["gap_wheels"] = gapwheels.to_json(gap_wheels, multi_py)
+    if fix_cells is not None:  # --fix: how many gap cells an upgrade, a gap wheel or nothing fixes
+        report["fix_summary"] = fix.counts(fix_cells)
     if dockerfile_inputs is not None:
         report["dockerfile_inputs"] = dockerfile_inputs
     if dockerfile_notes:
@@ -1461,9 +1477,6 @@ def target_lines(
 
 
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
-# PEP 751 lock names (packaging.pylock.is_valid_pylock_path): pip 26.1 and later install `pip install -r pylock.toml`
-# (or pylock.NAME.toml) as that lock, not as a requirements file.
-_PIP_PYLOCK_NAME_RE = re.compile(r"pylock(?:\.[^.]+)?\.toml")
 
 
 def _md(text: str) -> str:
@@ -1771,6 +1784,44 @@ def note_unpinned_requirements(sources: list[Source]) -> None:
         )
 
 
+def note_prefer_binary(sources: list[Source]) -> None:
+    """A requirements file with --prefer-binary and an unpinned requirement: pip may take an older release that has a
+    wheel than the newest, which is the one checked. A pin isn't affected."""
+    for source in sources:
+        fc = source.format_control
+        if fc is not None and fc.prefer_binary and unpinned_requirement_names(source):
+            print(
+                f"wheelgap: note: {fc.prefer_binary} sets --prefer-binary: for an unpinned requirement pip may take "
+                "an older release that has a wheel, and wheelgap checked the newest",
+                file=sys.stderr,
+            )
+
+
+def _option_list(options: list[str]) -> str:
+    return options[0] if len(options) == 1 else f"{', '.join(options[:-1])} and {options[-1]}"
+
+
+def note_index_options(sources: list[Source]) -> None:
+    """One note per requirements file that sets an index option pip reads and wheelgap doesn't (Source.index_options):
+    by the option's name only, since its value may hold credentials. Another -r file of the same pip install line
+    that sets one gets a note for this file too, naming the file that sets it."""
+    for source in sources:
+        for setter, options in source.line_index_options:
+            print(
+                f"wheelgap: note: {setter} sets {_option_list(options)} for the install that reads {source.label} "
+                f"too, which wheelgap doesn't read: {source.label}'s packages were checked on PyPI only, so a package "
+                "pip finds elsewhere may install differently",
+                file=sys.stderr,
+            )
+        if not source.index_options:
+            continue
+        print(
+            f"wheelgap: note: {source.label} sets {_option_list(source.index_options)}, which wheelgap doesn't read: "
+            "its packages were checked on PyPI only, so a package pip finds elsewhere may install differently",
+            file=sys.stderr,
+        )
+
+
 def _names(names: list[str]) -> str:
     return ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
 
@@ -1873,18 +1924,38 @@ def version_suggestions(
     """--suggest: look the pinned gap packages' releases up on PyPI, one request per name, and return what to move to,
     by id() of the package. Only names that are positively PyPI's are looked up, by the rule --conda-forge follows
     (origin.known_pypi), and nothing in a run that uses another index; notes on stderr say which weren't, and why."""
+    return release_lookups(gaps, targets, sources, index_url, quiet)[0]
+
+
+PRIVATE_WHY = "wheelgap can't tell they come from PyPI, so their names stay private (see how-it-works.md#pypi-origin)"
+
+
+def release_lookups(
+    gaps: list[Row],
+    targets: list[Target],
+    sources: list[Source],
+    index_url: str | None,
+    quiet: bool,
+    flag: str = "--suggest",
+) -> tuple[Suggestions, dict[int, str]]:
+    """version_suggestions' lookups, for --suggest and --fix (`flag`, which the notes name), plus why the releases of
+    the other pinned gap packages weren't looked up (or couldn't be), by id() of the package. For --fix, the notes on
+    stderr about another index and about names kept private are left out: its own section says so, in one line."""
     other = origin.other_index(index_url)
+    notes = flag == "--suggest"
     if other is not None:
-        if not quiet:
+        if notes and not quiet:
             print(
                 f"wheelgap: note: --suggest looks nothing up when packages come from another index ({other})",
                 file=sys.stderr,
             )
-        return {}
+        why = f"packages may come from another index ({other}), so no names went to pypi.org"
+        return {}, {id(r.package): why for r in gaps if r.package.version and not r.package.no_binary}
     elsewhere = origin.private_names(sources, simple_index=index_url)
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     asked: dict[str, list[Row]] = {}  # by canonical name: one lookup per package, however many rows it has
     kept_in: dict[str, str] = {}
+    skipped: dict[int, str] = {}
     for r in gaps:
         # Under --no-binary, pip uses no release's wheels, so a newer one with wheels wouldn't close the gap.
         if r.package.version and not r.package.no_binary and gap_targets(r, targets):
@@ -1892,7 +1963,10 @@ def version_suggestions(
                 asked.setdefault(r.package.key, []).append(r)
             else:
                 kept_in.setdefault(r.package.key, r.package.name)
-    if kept_in and not quiet:
+                skipped[id(r.package)] = PRIVATE_WHY
+        elif not r.package.version:
+            skipped[id(r.package)] = "they have no pinned version"
+    if kept_in and notes and not quiet:
         private = list(kept_in.values())
         print(
             f"wheelgap: note: --suggest didn't look up {len(private)} package{'s' * (len(private) != 1)} "
@@ -1913,16 +1987,22 @@ def version_suggestions(
         n = len(failed)
         which = _names([f"{asked[key][0].package.name} ({why})" for key, why in failed.items()])
         print(
-            f"wheelgap: note: --suggest couldn't look up {n} package{'s' * (n != 1)}: {which}; "
+            f"wheelgap: note: {flag} couldn't look up {n} package{'s' * (n != 1)}: {which}; "
             "no suggestion doesn't mean no newer release has wheels",
             file=sys.stderr,
         )
-    return {
+    for key, why in failed.items():
+        for r in asked[key]:
+            skipped[id(r.package)] = f"the lookup failed ({why})"
+    suggestions = {
         id(r.package): s for key, rows in asked.items() if key in found for r, s in zip(rows, found[key], strict=True)
     }
+    return suggestions, skipped
 
 
-FIX_HINT = "Run with --fix to see whether wheelgap's gap wheel index has a wheel for these."
+FIX_HINT = (
+    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap wheel index."
+)
 
 
 def gap_wheel_candidates(
@@ -2010,7 +2090,7 @@ def gap_wheel_fills(
                 )
                 return []
             # Even with -q: without it, a run that couldn't look would read as "no gap wheel fits".
-            print("wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions", file=sys.stderr)
+            print("wheelgap: note: couldn't read the gap wheel list, so --fix suggests no gap wheels", file=sys.stderr)
             return []
         fills = gapwheels.fillable(wanted, targets, source_of, live_wheels, private, index_url)
         if not fills and not quiet:
@@ -2203,6 +2283,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         config_inputs = args.inputs
     docker_includes: dict[tuple[int, Path], tuple[Path, ...]] = {}
     docker_constraints: dict[Path, tuple[Path, ...]] = {}
+    docker_line_files: dict[Path, tuple[Path, ...]] = {}  # each file's -r files of its pip install line, in order
     uv_installs: set[tuple[int, Path]] = set()
     image: ImageTarget | None = None
     unknown_image: UnknownImageError | None = None
@@ -2219,6 +2300,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         nonlocal image, unknown_image
         try:
             image = read_dockerfile(Path(args.dockerfile), build_args)
+        except HeredocSyntaxError as e:
+            if args.dockerfile_inputs:
+                # -p and -t don't help --dockerfile-inputs here: say what does, with the line.
+                raise DockerfileError(f"{args.dockerfile}:{e.line}: {e.for_inputs()}") from None
+            if not (args.python and args.target):
+                raise
+            unknown_image = e
         except UnknownImageError as e:
             if not (args.python and args.target):
                 raise
@@ -2246,6 +2334,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 context=context,
                 includes=docker_includes,
                 constraints=docker_constraints,
+                line_files=docker_line_files,
                 dependencies=args.deps,
                 uv_installs=uv_installs,
                 report=inputs_report,
@@ -2283,7 +2372,12 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # -p and -t are both given, so nothing is taken from the image. What that leaves unknown is said
                 # every time, --quiet or not: the answer is for the targets given, not for an image wheelgap read.
                 libc = "" if args.glibc or args.musl else " (pass --glibc or --musl if it isn't wheelgap's default)"
-                reason = str(unknown_image).removeprefix(f"{args.dockerfile}: ").removesuffix(", pass -p/-t instead")
+                if isinstance(unknown_image, HeredocSyntaxError):
+                    reason = unknown_image.reason
+                else:
+                    reason = (
+                        str(unknown_image).removeprefix(f"{args.dockerfile}: ").removesuffix(", pass -p/-t instead")
+                    )
                 message = (
                     f"the final image isn't read ({reason}), so this run checks the -p and -t given. Not known from "
                     "the Dockerfile: which Python the image's pip installs for and which pip version it has, its "
@@ -2466,15 +2560,22 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         args.environment,
                         requirements_constraints=docker_constraints,
                         file_kinds=docker_kinds,
+                        requirements_line_files=docker_line_files,
                     )
                     if args.inputs
                     else []
                 )
-                for named_line, named_texts, by_uv in inputs_report.named:
-                    named = Source(f"{args.dockerfile}:{named_line}", pypi_only=True)
-                    for text in named_texts:
-                        named.packages.append(requirement_to_package(text, named.label))
-                        named.specs.append(text)
+                for (named_line, named_texts, by_uv), line_files in zip(
+                    inputs_report.named, inputs_report.named_files, strict=True
+                ):
+                    named_label = f"{args.dockerfile}:{named_line}"
+                    if line_files:  # the line's -r files set options for the names too, as pip reads them
+                        named = parse_named_requirements(named_label, named_texts, line_files)
+                    else:
+                        named = Source(named_label, pypi_only=True)
+                        for text in named_texts:
+                            named.packages.append(requirement_to_package(text, named.label))
+                            named.specs.append(text)
                     sources.append(named)
                     if by_uv:
                         uv_named.add(id(named))
@@ -2620,9 +2721,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     "index-url in [tool.wheelgap]) doesn't have"
                 )
             for source in dependency_sources:
-                # A command-line name is PyPI's by definition; a file may point pip elsewhere, where --deps
-                # can't see, so it refuses rather than answer for the wrong index.
-                if not (source.requirements or source.pyproject_extras is not None):
+                # A command-line name is PyPI's by definition, unless the -r files of its Dockerfile install line
+                # set an index option; a file may point pip elsewhere, where --deps can't see, so it refuses rather
+                # than answer for the wrong index.
+                if not (source.requirements or source.pyproject_extras is not None or not source.pypi_only):
                     continue
                 instead = (
                     ", so check its lock (uv lock --script) instead"
@@ -2735,6 +2837,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             )
     if not quiet:
         note_unpinned_requirements(sources)
+        note_prefer_binary(sources)
+        if origin.other_index(index_url) is None:  # with --index-url or a mirror, the run doesn't check PyPI only
+            note_index_options(sources)
         for source in sources:
             if source.poetry_extras_unsure is not None:
                 print(f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}", file=sys.stderr)
@@ -2974,7 +3079,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
     pi_wheels = piwheels_hints(gaps, targets, sources, index_url, quiet, cached) if args.piwheels else {}
     # None: not asked for. Like the hints above, it never changes a status or the exit code.
-    suggestions = version_suggestions(gaps, targets, sources, index_url, quiet) if args.suggest else None
+    suggestions: Suggestions | None = None
+    unlooked: dict[int, str] = {}  # --fix: why a pinned gap package's releases weren't looked up, by id() of it
+    if args.suggest:
+        suggestions, unlooked = release_lookups(gaps, targets, sources, index_url, quiet)
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
     fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
@@ -3063,6 +3171,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if args.fix
         else None
     )
+    # --fix: each gap cell's way out, an upgrade first (the releases --suggest looks up, looked up once for both).
+    fix_cells: list[fix.Cell] | None = None
+    if args.fix:
+        upgrades = suggestions
+        if upgrades is None:
+            upgrades, unlooked = release_lookups(gaps, targets, sources, index_url, quiet, flag="--fix")
+        source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+        fix_cells = fix.plan(gaps, targets, source_of, upgrades, fills or [], unlooked)
     # The hint never makes a request: it reads only the list a --fix run left in the cache (kept for
     # cache.GAP_WHEELS_MAX_AGE), and only when a gap could use it. No hint when that list fills nothing; that is
     # silence, not "nothing fits": --fix itself fetches the list again before it says so (gap_wheel_fills).
@@ -3074,7 +3190,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if wheels is None:
                 fix_hint = FIX_HINT
             elif count := len(gapwheels.fillable(hint_rows, targets, source_of, wheels, private, index_url)):
-                fix_hint = f"Run with --fix: wheelgap's gap wheel index has a wheel for {count} of these gaps."
+                fix_hint = (
+                    "Run with --fix for a way out: an upgrade where a newer release has the wheel, else wheelgap's gap "
+                    f"wheel index, which has a wheel for {count} of these gaps."
+                )
 
     if args.print_gap_wheel_snippet:  # one input of gapwheels.SNIPPET_KINDS, checked when it was read
         multi_py = len({t.python for t in targets}) > 1
@@ -3083,6 +3202,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         return code
 
     issues_urls = explain_issues_urls(rows, sources, index_url) if args.explain else None
+    # --fix names the issue tracker of a gap with no fix; it's read from the lookups already made, never fetched.
+    fix_issues = (issues_urls or explain_issues_urls(gaps, sources, index_url)) if fix_cells else {}
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
@@ -3181,6 +3302,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             fills,
             installed_by=installed_by,
             installed_through=installed_through,
+            fix_cells=fix_cells,
         ):
             write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
         for level, file, at_line, message in dockerfile_results(dockerfile_notes, dockerfile_warnings):
@@ -3209,6 +3331,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 dropped,
                 issues_urls=issues_urls,
                 gap_wheels=fills,
+                fix_cells=fix_cells,
                 pi_wheels=pi_wheels,
                 # As the Dockerfile's COPY names it: relative to the build context, with /, whatever the OS, the
                 # working directory or the way the context was given.
@@ -3273,7 +3396,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         fix_hint=fix_hint,
                         not_covered=not_covered,
                     ),
-                    *gapwheels.markdown_lines(fills or [], multi_py),
+                    *fix.markdown_lines(fix_cells or [], multi_py, unlooked, fix_issues),
+                    *gapwheels.markdown_lines(
+                        fills or [], multi_py, fix.alternatives(fix_cells or []), fix.any_upgrade(fix_cells or [])
+                    ),
                     *(["", f"> **Warning:** {unseen_line}"] if unseen_line else []),
                     *dockerfile_markdown(dockerfile_results(dockerfile_notes)),
                 ]
@@ -3282,7 +3408,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         return code
 
     style = Style(use_color(args.color))
-    fix_lines = gapwheels.text_lines(fills or [], multi_py)  # nothing unless a gap wheel fills a gap
+    # Nothing without --fix or without a gap: the summary, upgrades and gaps with no fix, then the gap wheels.
+    fix_lines = [
+        *fix.text_lines(fix_cells or [], multi_py, unlooked, fix_issues),
+        *gapwheels.text_lines(
+            fills or [], multi_py, fix.alternatives(fix_cells or []), fix.any_upgrade(fix_cells or [])
+        ),
+    ]
     total_pkgs = len(_group_rows(rows))
     if quiet:
         if gaps:
@@ -3342,6 +3474,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 issues_urls=issues_urls,
                 published_wheels=fills,
                 pi_wheels=pi_wheels,
+                upgrades={
+                    (id(c.row), c.target): c.version for c in fix_cells or [] if c.kind == fix.UPGRADE and c.version
+                },
             ):
                 print(ln)
 

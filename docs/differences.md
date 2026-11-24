@@ -12,7 +12,7 @@ This page summarizes each difference, what wheelgap assumes, what installers do,
 
 ## Version ranges
 
-- **What wheelgap assumes:** A version range or bare name in a requirements file is evaluated at the newest matching release published on the index, picked by pip's rule (see [Version ranges](how-it-works.md#version-ranges)). With `--deps`, wheelgap's small resolver doesn't backtrack: where pip would go back to an older release, it stops with an error rather than guess (see [`--deps`](cli.md#deps)).
+- **What wheelgap assumes:** A version range or bare name in a requirements file is evaluated at the newest matching release published on the index, picked by pip's rule (see [Version ranges](how-it-works.md#version-ranges)). With `--deps`, wheelgap's small resolver doesn't backtrack: where pip would go back to an older release, it stops with an error rather than guess (see [`--deps`](cli.md#deps)). With `--dockerfile-inputs --deps`, each `-r` file of a `pip install -r a.txt -r b.txt` line is resolved on its own (with the line's options and constraints), where pip resolves the files together, so one file's requirements can't move the release picked for a dependency of the other.
 - **What pip and uv do:** Their resolvers solve the whole set of requirements together and backtrack when two requirements conflict, so another requirement's bound can make them pick an older release than the newest one that matches.
 - **When it changes the answer:** When a resolver settles on an older release, its files can differ from the newest release's in either direction: an older release without the wheel the newest has (wheelgap says `wheel`, the install builds or fails), or the reverse. Pin the versions you install to check exactly those.
 - **Tracking:** Backtracking is by design; documented in [How it works](how-it-works.md#version-ranges). uv's rule for picking a release for one range also differs from pip's (it ignores a `Requires-Python` upper bound, for example), which is why `--dockerfile-inputs` refuses an unpinned requirement under `uv pip install`; reading those ranges the way uv does is [#643](https://github.com/wheelgap/wheelgap/issues/643).
@@ -33,24 +33,24 @@ This page summarizes each difference, what wheelgap assumes, what installers do,
 
 ## Requirements file hashes
 
-- **What wheelgap assumes:** A requirement's `--hash=sha256:…` options limit which of its release's files are checked (after 0.13.0), by the `sha256` digests PyPI's JSON API gives, and a range takes the newest release that has a listed file. A file the index gives no `sha256` for (some mirrors behind `WHEELGAP_INDEX_URL`) is kept. Not read yet, so the answer is the one without them: `sha384` and `sha512` hashes, `--hash` on a line of a constraints file, and the lookups of `--index-url`.
+- **What wheelgap assumes:** A requirement's `--hash=sha256:…` options limit which of its release's files are checked, by the `sha256` digests PyPI's JSON API gives, and a range takes the newest release that has a listed file. A file the index gives no `sha256` for (some mirrors behind `WHEELGAP_INDEX_URL`) is kept. Not read yet, so the answer is the one without them: `sha384` and `sha512` hashes, `--hash` on a line of a constraints file, and the lookups of `--index-url`.
 - **What pip and uv do:** They install only a file whose hash is listed: with only the sdist's hash, they build from source even when a matching wheel exists on PyPI. A file whose hash the index doesn't give is downloaded and refused if its hash isn't listed. pip also hash-checks the whole install once any requirement has a `--hash`, and refuses it when another requirement has none.
 - **When it changes the answer:** With only `sha384`/`sha512` hashes, a `--hash` in a constraints file, or `--index-url`, wheelgap can say `wheel` where pip and uv build the sdist or refuse the download. On an index without digests it can say `wheel` where pip downloads a wheel whose hash isn't listed and stops. wheelgap doesn't refuse a file in which one requirement has a `--hash` and another has none, which pip refuses.
 - **Tracking:** [#633](https://github.com/wheelgap/wheelgap/issues/633) made `--hash=sha256` count; the cases above aren't tracked yet.
 
 ## Additional index URLs
 
-- **What wheelgap assumes:** `--index-url`, `--extra-index-url`, and `--find-links` options inside requirements files are not read; packages are checked against PyPI (or the `--index-url` passed to wheelgap).
+- **What wheelgap assumes:** `--index-url`, `--extra-index-url`, `--find-links` and `--no-index` options inside requirements files are not read; packages are checked against PyPI (or the `--index-url` passed to wheelgap). A note on stderr says so for each requirements file that has one (`requirements.txt sets --extra-index-url, which wheelgap doesn't read: its packages were checked on PyPI only, …`); the statuses don't change.
 - **What pip and uv do:** `pip` and `uv` query the indexes and find-links locations the file names, finding prebuilt wheels published on external or private repositories (such as PyTorch or CUDA package indexes).
 - **When it changes the answer:** A package's files on the other index can differ from PyPI's: a wheel published only there is not seen, and a private package with a namesake on PyPI is judged by the PyPI project's files.
-- **Tracking:** Tracked in [#632](https://github.com/wheelgap/wheelgap/issues/632).
+- **Tracking:** [#632](https://github.com/wheelgap/wheelgap/issues/632) added the note; reading the other index isn't tracked yet.
 
 ## Pre-releases and prefer-binary
 
-- **What wheelgap assumes:** `--pre` and `--prefer-binary` lines in requirements files are skipped, so an unpinned requirement is checked at the newest stable release (a pre-release counts only when no stable release matches).
-- **What pip does:** With `--pre`, pip takes the newest release including alphas, betas and release candidates; with `--prefer-binary`, it takes an older release that has a wheel over a newer one that only has an sdist. uv ignores both lines with a warning.
-- **When it changes the answer:** pip installs a different release from the one wheelgap checked, so any status can be off in either direction: for example the stable release has a wheel (`wheel`) but the pre-release pip installs under `--pre` has none.
-- **Tracking:** Tracked in [#634](https://github.com/wheelgap/wheelgap/issues/634).
+- **What wheelgap assumes:** `--pre`, `--all-releases` and `--only-final` lines in requirements files are read as pip reads them, so an unpinned requirement is checked at the release pip picks, pre-releases included where they're allowed. `--prefer-binary` is read but not followed: an unpinned requirement is still checked at the newest matching release, with a note on stderr that says so. `--deps` refuses a file with any of these options.
+- **What pip does:** With `--prefer-binary`, pip takes an older release that has a wheel over a newer one that only has an sdist. uv ignores `--pre` and `--prefer-binary` lines with a warning (a `uv pip install` line in a Dockerfile that reads such a file is an error).
+- **When it changes the answer:** Under `--prefer-binary`, for an unpinned requirement whose newest release has no wheel for a target, wheelgap says `source` where pip installs an older release's wheel. Pinned requirements aren't affected.
+- **Tracking:** [#634](https://github.com/wheelgap/wheelgap/issues/634) made `--pre` count and added the `--prefer-binary` note; picking the release `--prefer-binary` picks isn't tracked yet.
 
 ## User and system configuration
 
@@ -61,14 +61,14 @@ This page summarizes each difference, what wheelgap assumes, what installers do,
 
 ## uv.lock Requires-Python bounds
 
-- **What wheelgap assumes:** `uv.lock` is evaluated following `uv sync`, with and without `--online` (after 0.13.0; 0.13.0 followed pip with `--online`), which checks only the lower bound of `Requires-Python`. A file excluded only by an upper bound (such as `<3.15` or `!=3.15.*`) still counts. With `--online`, the report also says where pip would refuse such a file; without it the lock doesn't record each file's `Requires-Python`, so wheelgap can't tell.
+- **What wheelgap assumes:** `uv.lock` is evaluated following `uv sync`, with and without `--online` (0.13.0 followed pip with `--online`), which checks only the lower bound of `Requires-Python`. A file excluded only by an upper bound (such as `<3.15` or `!=3.15.*`) still counts. With `--online`, the report also says where pip would refuse such a file; without it the lock doesn't record each file's `Requires-Python`, so wheelgap can't tell.
 - **What pip and uv do:** `uv sync` installs the locked release ignoring upper bounds; `pip install` (from a requirements file exported from the lock, for example) enforces both lower and upper bounds of `Requires-Python`.
 - **When it changes the answer:** A locked package whose `Requires-Python` specifies `<3.15` will install under `uv sync` on Python 3.15, but pip would refuse to install it.
 - **Tracking:** Documented in [uv.lock](inputs.md#uvlock); the rule was settled in [#544](https://github.com/wheelgap/wheelgap/issues/544).
 
 ## File-name casing
 
-- **What wheelgap assumes:** A file a requirements file names with `-r` or `-c` is found as the host's file system finds it. `--dockerfile-inputs` matches `COPY` paths, and the `-r` and `-c` files the copied files name, with exact case on every host (after 0.13.0).
+- **What wheelgap assumes:** A file a requirements file names with `-r` or `-c` is found as the host's file system finds it. `--dockerfile-inputs` matches `COPY` paths, and the `-r` and `-c` files the copied files name, with exact case on every host.
 - **What pip and uv do:** On a case-sensitive file system (such as Linux, and a Linux Docker build), a name that differs only in case (`Base.txt` vs `base.txt`) is not found.
 - **When it changes the answer:** Running `wheelgap requirements.txt` on macOS or Windows can follow `-r Base.txt` to `base.txt`, where pip on Linux stops with an error.
 - **Tracking:** Not tracked yet; [#635](https://github.com/wheelgap/wheelgap/issues/635) fixed the `--dockerfile-inputs` case.
@@ -82,7 +82,7 @@ This page summarizes each difference, what wheelgap assumes, what installers do,
 
 ## Constraints files
 
-- **What wheelgap assumes:** A requirement is checked against the constraints in its `-c` files (after 0.13.0), with versions matched as pip matches them (`==1.9` and `==1.9.0` agree, `==1.0` with `==1.0+cpu` is `1.0+cpu`), and a conflict is an error that makes the package `unknown`: a pin that a constraint leaves out (`idna==3.6` with `idna==3.7` or `idna>=3.7`), or an exact constraint that the requirement's range or another constraint leaves out (`idna>=3.8` with `idna==3.7`). Not followed yet: a constraint with an environment marker that leaves out a pinned requirement makes the package `unknown` on every target; two ranges with nothing in common (`idna>=3.8` with `idna<3`) are reported as `no release matches` rather than as a conflict; a constraint with extras (`idna[socks]==3.7`) is read as `idna==3.7`; and a URL or path constraint makes the package `unknown`.
+- **What wheelgap assumes:** A requirement is checked against the constraints in its `-c` files, with versions matched as pip matches them (`==1.9` and `==1.9.0` agree, `==1.0` with `==1.0+cpu` is `1.0+cpu`), and a conflict is an error that makes the package `unknown`: a pin that a constraint leaves out (`idna==3.6` with `idna==3.7` or `idna>=3.7`), or an exact constraint that the requirement's range or another constraint leaves out (`idna>=3.8` with `idna==3.7`). Not followed yet: a constraint with an environment marker that leaves out a pinned requirement makes the package `unknown` on every target; two ranges with nothing in common (`idna>=3.8` with `idna<3`) are reported as `no release matches` rather than as a conflict; a constraint with extras (`idna[socks]==3.7`) is read as `idna==3.7`; and a URL or path constraint makes the package `unknown`.
 - **What pip and uv do:** `pip install` and `uv pip install` apply the constraints to the requirement and refuse the install when they conflict, and a constraint with a marker counts only where its marker holds. pip refuses any constraint with extras ("Constraints cannot have extras"), which uv accepts. Both install from a URL constraint whose version the requirement allows.
 - **When it changes the answer:** wheelgap says `unknown` where pip installs (a marked constraint whose marker doesn't hold on the target, a URL or path constraint that fits the requirement), and checks a constraint with extras that pip refuses.
 - **Tracking:** Conflicts were [#631](https://github.com/wheelgap/wheelgap/issues/631); the cases above aren't tracked yet.

@@ -17,6 +17,7 @@ from .sources import Package, Source
 # UV_INDEX_* variable counts (UV_INDEX_<NAME>_USERNAME names an index configured somewhere).
 INDEX_ENV = (
     "PIP_INDEX_URL",
+    "PIP_PYPI_URL",  # pip's other name for --index-url
     "PIP_EXTRA_INDEX_URL",
     "PIP_FIND_LINKS",
     "PIP_NO_INDEX",

@@ -76,6 +76,16 @@ def _has_wheel(releases: dict, text: str, target: Target, seen: _Seen) -> bool:
     return live is not None and status_for(live[0], target, live[1]) is Status.WHEEL
 
 
+def _admits(releases: dict, text: str, target: Target) -> bool:
+    """Whether some live file of the release admits the target's Python by its Requires-Python (any file kind)."""
+    try:
+        entries = _files(releases[text])
+    except ValueError:
+        return True  # unreadable: don't claim it leaves the Python out
+    python = f"{target.major}.{target.minor}"
+    return any(not e.get("yanked") and _supports_python(e, python) for e in entries)
+
+
 def nearest_with_wheel(releases: dict, pinned: str, target: Target) -> str | None:
     """Return the lowest newer release with a non-yanked, compatible wheel.
 
@@ -97,6 +107,11 @@ class Suggestion:
     last: dict[Target, str] = field(default_factory=dict)
     # targets of `last` whose release has no wheel for one the row has a wheel for (--write-constraints leaves it out)
     last_loses: tuple[Target, ...] = ()
+    # targets of `loses` -> the nearest newer release with a wheel for it, and the targets of `keep` it has none for
+    drops: dict[Target, tuple[str, tuple[Target, ...]]] = field(default_factory=dict)
+    # targets of `drops` whose release leaves out each dropped target's Python, an older one, by Requires-Python: no
+    # file of it admits that Python (so a lock that forks per Python, as uv's may, could keep the old release there)
+    python_drops: tuple[Target, ...] = ()
 
 
 def suggest(releases: dict, pinned: str, targets: Iterable[Target], keep: Iterable[Target] = ()) -> Suggestion:
@@ -117,6 +132,8 @@ def suggest(releases: dict, pinned: str, targets: Iterable[Target], keep: Iterab
 
     nearest: dict[Target, int] = {}
     loses = []
+    drops: dict[Target, tuple[str, tuple[Target, ...]]] = {}
+    python_drops: list[Target] = []
     last: dict[Target, str] = {}
     older: list[str] | None = None
     for t in targets:
@@ -125,6 +142,12 @@ def suggest(releases: dict, pinned: str, targets: Iterable[Target], keep: Iterab
             nearest[t] = i
         elif with_wheel:
             loses.append(t)
+            nearest_drop = candidates[with_wheel[0]]
+            dropped = tuple(k for k in keep if not _has_wheel(releases, nearest_drop, k, seen))
+            drops[t] = nearest_drop, dropped
+            if dropped and all((k.major, k.minor) < (t.major, t.minor) for k in dropped):
+                if not any(_admits(releases, nearest_drop, k) for k in dropped):
+                    python_drops.append(t)
         else:
             older = _older(releases, pinned) if older is None else older
             if (v := next((v for v in older if _has_wheel(releases, v, t, seen)), None)) is not None:
@@ -134,8 +157,9 @@ def suggest(releases: dict, pinned: str, targets: Iterable[Target], keep: Iterab
         # A release with a wheel for every target that has one at all is no lower than the highest of the nearest.
         for v in candidates[max(nearest.values()) :]:
             if keeps(v) and all(_has_wheel(releases, v, t, seen) for t in nearest):
-                return Suggestion(dict.fromkeys(nearest, v), tuple(loses), last, last_loses)
-    return Suggestion({t: candidates[i] for t, i in nearest.items()}, tuple(loses), last, last_loses)
+                return Suggestion(dict.fromkeys(nearest, v), tuple(loses), last, last_loses, drops, tuple(python_drops))
+    found = {t: candidates[i] for t, i in nearest.items()}
+    return Suggestion(found, tuple(loses), last, last_loses, drops, tuple(python_drops))
 
 
 Wanted = dict[str, Sequence[tuple[str, Sequence[Target], Sequence[Target]]]]

@@ -22,6 +22,9 @@ FAKE_INDEX = {
             "newpylag-1.0.tar.gz",
         ]
     },
+    # The newest release is a pre-release with only an sdist; the newest final one has a wheel. --pre in a
+    # requirements file makes pip 26.3 take 2.0rc1 (#634). 1.0 is last, so it's PyPI's "latest".
+    "prelib": {"2.0rc1": ["prelib-2.0rc1.tar.gz"], "1.0": ["prelib-1.0-py3-none-any.whl", "prelib-1.0.tar.gz"]},
     "cp314only": {"1.0": ["cp314only-1.0-cp314-cp314-manylinux_2_17_x86_64.whl"]},  # no sdist: missing on 3.15
     "forked": {"0.9": ["forked-0.9.tar.gz"], "1.0": ["forked-1.0.tar.gz"]},
     "ranged": {
@@ -114,6 +117,34 @@ FAKE_INDEX = {
             "distpkg-1.0-cp313-cp313-win_arm64.whl",
             "distpkg-1.0.tar.gz",
         ],
+    },
+    # --fix, upgrade first: on 3.14t, 1.0 builds from source; 1.1's wheel is yanked, 1.2's Requires-Python leaves 3.14
+    # out and 2.0rc1 is a pre-release, so none of those counts; 1.3 adds a Windows on ARM wheel, 1.4 Windows x64 too.
+    "fixme": {
+        "1.0": ["fixme-1.0.tar.gz"],
+        "1.1": [{"filename": "fixme-1.1-py3-none-any.whl", "yanked": True}, "fixme-1.1.tar.gz"],
+        "1.2": [{"filename": "fixme-1.2-py3-none-any.whl", "requires_python": "<3.14"}, "fixme-1.2.tar.gz"],
+        "1.3": ["fixme-1.3-cp314-cp314t-win_arm64.whl", "fixme-1.3.tar.gz"],
+        "2.0rc1": ["fixme-2.0rc1-py3-none-any.whl", "fixme-2.0rc1.tar.gz"],
+        "1.4": [
+            "fixme-1.4-cp314-cp314t-win_arm64.whl",
+            "fixme-1.4-cp314-cp314t-win_amd64.whl",
+            "fixme-1.4.tar.gz",
+        ],
+    },
+    # 2.0 has the CPython 3.14 Linux wheel 1.0 lacks, but none for 3.13 (its Requires-Python leaves 3.13 out): pip
+    # can't take it on 3.13, while uv may lock 1.0 for 3.13 and 2.0 for 3.14 (a fork per Python).
+    "pyfork": {
+        "1.0": ["pyfork-1.0-cp313-cp313-manylinux_2_17_x86_64.whl", "pyfork-1.0.tar.gz"],
+        "2.0": [
+            {"filename": "pyfork-2.0-cp314-cp314-manylinux_2_17_x86_64.whl", "requires_python": ">=3.14"},
+            {"filename": "pyfork-2.0.tar.gz", "requires_python": ">=3.14"},
+        ],
+    },
+    # Only an abi3 wheel for Windows on ARM: no use on free-threaded Python (--fix's "no fix yet" says so).
+    "abi3only": {
+        "1.0": ["abi3only-1.0-cp312-abi3-win_arm64.whl", "abi3only-1.0.tar.gz"],
+        "_project_urls": {"Issues": "https://github.com/example/abi3only/issues"},
     },
     "gapwithissues": {
         "1.0": ["gapwithissues-1.0.tar.gz"],

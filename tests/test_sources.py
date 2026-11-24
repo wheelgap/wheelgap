@@ -2542,6 +2542,105 @@ def test_conda_env_pip_list_ignored_option_note(tmp_path):
     assert source.ignored_options == ["environment.yml: pip ignores -f after a requirement"]
 
 
+def _release_control(tmp_path, files):
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    source = parse_requirements(tmp_path / "requirements.txt")
+    return source, {p.key: p.prereleases for p in source.packages}
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        # pip 26.3 applies --pre to the whole install, wherever its line is: before or after the requirement, in an
+        # included -r file or a -c file (#634). It never changes a package with no release control.
+        ({"requirements.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        ({"requirements.txt": "--pre\nfastlib>=2\n"}, {"fastlib": True}),
+        ({"requirements.txt": "fastlib>=2\n--pre\n"}, {"fastlib": True}),
+        ({"requirements.txt": "--trusted-host x --pre\nfastlib>=2\n"}, {"fastlib": True}),  # after another option
+        ({"requirements.txt": "-r base.txt\nfastlib>=2\n", "base.txt": "--pre\n"}, {"fastlib": True}),
+        ({"requirements.txt": "-c c.txt\nfastlib>=2\n", "c.txt": "--pre\n"}, {"fastlib": True}),
+        # On a line with -r or -c, pip reads the file and never applies --pre (handle_option_line isn't called for
+        # it): `--pre -r inc.txt` installs demo 1.0, not 2.0rc1.
+        ({"requirements.txt": "--pre -r base.txt\n", "base.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        ({"requirements.txt": "-r base.txt --pre\n", "base.txt": "fastlib>=2\n"}, {"fastlib": None}),
+        # After a requirement pip ignores --pre too (and wheelgap notes that).
+        ({"requirements.txt": "fastlib>=2 --pre\n"}, {"fastlib": None}),
+        # --all-releases and --only-final count on any line pip parses, a -r line and a requirement's too: their
+        # parser callbacks set them. A package named wins over :all:, in either set.
+        ({"requirements.txt": "--all-releases fastlib -r base.txt\n", "base.txt": "fastlib>=2\n"}, {"fastlib": True}),
+        ({"requirements.txt": "fastlib>=2 --all-releases fastlib\nranged\n"}, {"fastlib": True, "ranged": None}),
+        ({"requirements.txt": "--all :all:\nfastlib>=2\n"}, {"fastlib": True}),  # an abbreviation
+        ({"requirements.txt": "--only-final :all:\nfastlib>=2\n"}, {"fastlib": False}),
+        ({"requirements.txt": "--only-final fastlib\n--pre\nfastlib>=2\nranged\n"}, {"fastlib": False, "ranged": True}),
+        ({"requirements.txt": "--pre\n--only-final fastlib\nfastlib\n"}, {"fastlib": False}),
+        ({"requirements.txt": "--all-releases :all:,fastlib\n--only-final fastlib\nfastlib\n"}, {"fastlib": False}),
+        (
+            {"requirements.txt": "--only-final :all:,:none:,ranged\nranged\nfastlib\n"},
+            {"ranged": False, "fastlib": None},
+        ),
+        ({"requirements.txt": "--only-final :all:\n--all-releases :all:\nfastlib\n"}, {"fastlib": True}),
+    ],
+)
+def test_requirements_release_control_as_pip_reads_it(tmp_path, files, expected):
+    # Each case's answer is what pip 26.3 installs for the same lines (pip install --dry-run against local wheels).
+    _, prereleases = _release_control(tmp_path, files)
+    assert prereleases == expected
+
+
+@pytest.mark.parametrize(
+    ("files", "where"),
+    [
+        ({"requirements.txt": "--prefer-binary\nfastlib>=2\n"}, "requirements.txt:1"),
+        ({"requirements.txt": "fastlib>=2\n--pref\n"}, "requirements.txt:2"),
+        ({"requirements.txt": "-r base.txt\n", "base.txt": "fastlib>=2\n--prefer-binary\n"}, "base.txt:2"),
+        # pip ignores it on a -r line and after a requirement.
+        ({"requirements.txt": "--prefer-binary -r base.txt\n", "base.txt": "fastlib>=2\n"}, None),
+        ({"requirements.txt": "fastlib>=2 --prefer-binary\n"}, None),
+    ],
+)
+def test_requirements_prefer_binary_is_recorded(tmp_path, files, where):
+    source, _ = _release_control(tmp_path, files)
+    assert source.format_control.prefer_binary == where
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        # pip 26.3 refuses both lines: "--all-releases option requires 1 argument", and from ReleaseControl,
+        # "--all-releases / --only-final option requires 1 argument."
+        ("--only-final", "requirements.txt:1: pip refuses this line: --only-final option requires 1 argument"),
+        ("--only-final --pre", "requirements.txt:1: pip refuses this line: --all-releases / --only-final option"),
+    ],
+)
+def test_requirements_release_option_line_pip_refuses(tmp_path, line, message):
+    with pytest.raises(SourceError, match=re.escape(message)):
+        _release_control(tmp_path, {"requirements.txt": f"{line}\nfastlib>=2\n"})
+
+
+def test_requirements_only_final_refuses_a_pinned_pre_release(tmp_path):
+    # pip 26.3 with `--only-final :all:` and `demo==2.0rc1`: "Could not find a final version that satisfies".
+    source, _ = _release_control(tmp_path, {"requirements.txt": "--only-final :all:\nprelib==2.0rc1\nfastlib==2.0.0\n"})
+    errors = {p.key: p.error for p in source.packages}
+    assert errors["prelib"] == (
+        "pip installs only final releases of prelib here (--only-final), so it finds no 2.0rc1 (pip refuses this)"
+    )
+    assert errors["fastlib"] is None
+
+
+@pytest.mark.parametrize(
+    ("files", "blocker"),
+    [
+        ({"requirements.txt": "-r base.txt\n", "base.txt": "--pre\nfastlib>=2\n"}, "base.txt:1 sets --pre"),
+        ({"requirements.txt": "fastlib>=2 --only-final fastlib\n"}, "requirements.txt:1 sets --only-final"),
+        ({"requirements.txt": "--prefer-binary\nfastlib>=2\n"}, "requirements.txt:1 sets --prefer-binary"),
+    ],
+)
+def test_requirements_release_options_block_deps(tmp_path, files, blocker):
+    source, _ = _release_control(tmp_path, files)
+    assert source.deps_blockers == [f"{blocker}, which changes the releases pip picks for dependencies"]
+
+
 @pytest.mark.parametrize(
     "line, message",
     [
@@ -2581,10 +2680,9 @@ def test_conda_env_pip_list_ignored_option_note(tmp_path):
             "fastlib>=2 --editable=.",
             "requirements.txt:2: pip reads --editable after a requirement as making that requirement",
         ),
-        # pip applies these to the whole install (their parser callbacks change its release settings), and
-        # wheelgap doesn't read them.
-        ("fastlib>=2 --only-final :all:", "requirements.txt:2: pip applies --only-final after a requirement to the"),
-        ("fastlib>=2 --all fastlib", "requirements.txt:2: pip applies --all-releases after a requirement to the"),
+        # pip's ReleaseControl callback refuses a value that starts with "-" (pip 26.3 ran).
+        ("fastlib>=2 --only-final --pre", "requirements.txt:2: pip refuses this line: --all-releases / --only-final"),
+        ("fastlib>=2 --all-releases", "requirements.txt:2: pip refuses this line: --all-releases option requires 1"),
     ],
 )
 def test_requirements_other_options_after_a_requirement_are_refused(tmp_path, line, message):
@@ -2662,7 +2760,7 @@ def test_requirements_binary_format_control_reapplied_on_repeated_includes(tmp_p
         ("--only-b :all:", (False, True)),
         ("--o=:all:", (False, True)),
         ("--no- :all:", (False, False)),  # --no-index too: pip refuses it
-        ("--only-final", (False, False)),
+        ("--only-final :all:", (False, False)),  # not --only-binary (a bare --only-final is refused, as pip does)
     ],
 )
 def test_requirements_binary_options_abbreviated(tmp_path, line, expected):

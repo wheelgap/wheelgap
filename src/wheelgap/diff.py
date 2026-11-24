@@ -36,6 +36,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,7 @@ from .api import Result, _check_lockfile, check_packages, make_targets, running_
 from .check import CELL, Row, Status, applies, lock_environments_note, narrow_to_lock_environments, reachable
 from .cli import find_pyproject, libc_versions, load_config, load_uv_targets, project_dir, read_python_version
 from .logsafe import guarded_output
+from .pypi import check_index_url
 from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock
 from .targets import (
     DEFAULT_ANDROID_API,
@@ -431,6 +433,50 @@ def lock_default_targets(paths: list[Path], targets: list[Target]) -> tuple[list
     return narrowed, lock_environments_note(sources, left_out, narrowed, "default targets") if left_out else None
 
 
+# The main command's way to a simple index, which diff doesn't have.
+_SIMPLE_ADVICE = "To use a simple index, pass --index-url instead."
+
+
+def _check_index_url() -> None:
+    """pypi.check_index_url's error, with advice diff can follow: it has no --index-url."""
+    try:
+        check_index_url()
+    except SourceError as e:
+        raise SourceError(
+            str(e).replace(
+                _SIMPLE_ADVICE,
+                "wheelgap diff can't use a simple index (it has no --index-url): check each lockfile with "
+                "wheelgap --index-url instead.",
+            )
+        ) from None
+
+
+def _refuse_index_url(table: dict, where: str) -> None:
+    """diff looks packages up on PyPI (or a WHEELGAP_INDEX_URL mirror) only, so the simple index the main command
+    would use for `index-url` in [tool.wheelgap] would be ignored without a word: refuse it instead."""
+    if table.get("index-url") is not None:  # set at all, as the main command reads it (an empty value is its error)
+        raise SourceError(
+            f"{where} sets index-url in [tool.wheelgap], which wheelgap diff doesn't read yet, so it would check "
+            "PyPI instead of that index; check each lockfile with wheelgap instead, which uses it"
+        )
+
+
+def _input_index_url(path: str, label: str) -> None:
+    """Refuse `index-url` in the pyproject.toml the main command would read for this input (for a REF:PATH, the
+    copy from that ref). Only that key is read: diff takes its other settings from the NEW input's project."""
+    pyproject = find_pyproject([path])
+    if pyproject is None:
+        return
+    try:
+        table = tomllib.loads(pyproject.read_text(encoding="utf-8-sig")).get("tool", {}).get("wheelgap", {})
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise SourceError(
+            f"the pyproject.toml beside {label} can't be read, so its index-url isn't known: {e}"
+        ) from None
+    if isinstance(table, dict):
+        _refuse_index_url(table, f"the pyproject.toml beside {label}")
+
+
 def _main(argv: list[str] | None, prog: str) -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__.splitlines()[0])
     p.add_argument(
@@ -474,9 +520,13 @@ def _main(argv: list[str] | None, prog: str) -> int:
     )
     args = p.parse_args(argv)
     try:
+        # As in the main command, before any lookup: a /simple URL there would make every package `unknown`.
+        _check_index_url()
         config_inputs = _config_inputs(args.new, deps=args.deps)
         pyproject = find_pyproject(config_inputs)
         config = load_config(pyproject) if pyproject else {}
+        if pyproject:
+            _refuse_index_url(config, str(pyproject))
         glibc, musl = libc_versions(args, config)
         pythons = args.python or config.get("python") or read_python_version(project_dir(config_inputs)) or None
         platforms = args.target or config.get("targets", [])
@@ -534,6 +584,8 @@ def _main(argv: list[str] | None, prog: str) -> int:
                 for path in (args.old, args.new):
                     ref = git_ref_input(path)
                     read.append((read_git_ref(*ref, Path(tmp)) if ref is not None else path, ref))
+                for (path, _), label in zip(read, (args.old, args.new), strict=True):
+                    _input_index_url(path, label)  # before any lookup, for either side
                 if not platforms:
                     targets, narrowed = lock_default_targets([Path(path) for path, _ in read], targets)
                     if narrowed is not None:

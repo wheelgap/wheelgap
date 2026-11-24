@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
 
-from .dockerfile import DockerfileError, ImageTarget, final_from, parse_image, read_dockerfile
+from .dockerfile import DockerfileError, HeredocSyntaxError, ImageTarget, final_from, parse_image, read_dockerfile
 from .targets import DISTROS, PLATFORMS
 
 
@@ -1530,6 +1530,9 @@ def read_docker(path: Path, name: str, out: Suggestions) -> None:
     try:
         image = read_dockerfile(path)
         base, platform, line = final_from(path.read_bytes().decode("utf-8-sig"))
+    except HeredocSyntaxError as e:  # its message starts with path:line:, so take the line and the bare reason
+        out.unreadable.append(Unreadable(name, e.line, e.reason))
+        return
     except DockerfileError as e:
         reason = str(e).removeprefix(f"{path}: ").removesuffix(", pass -p/-t instead")  # no -p/-t here
         out.unreadable.append(Unreadable(name, None, reason))

@@ -190,16 +190,21 @@ _FIX_HELP = (
     "With fix: true, as --fix does, also says which gaps a wheel on wheelgap's gap wheel index fills: 'gap_wheels' "
     "has one entry per filled gap cell (name, version, target, wheel, url, sha256; [] when none fits), "
     "'gap_wheel_index' is the index to install from and 'gap_wheel_about' the page on how the wheels are built. "
-    "It costs one request to wheelgap.github.io that names no package. The wheels are unofficial: built by wheelgap "
+    "Each gap also gets 'fix', by target: kind 'upgrade' (a newer release has the wheel: version, how), 'gap_wheel' "
+    "or 'none' (reason), and 'fix_summary' counts them; an upgrade comes first, and wheelgap doesn't resolve, so the "
+    "rest of the dependencies must allow it. "
+    "It costs one request to wheelgap.github.io that names no package, plus one to pypi.org per gap package "
+    "positively from PyPI for its release list, as --suggest does. The wheels are unofficial: built by wheelgap "
     "from the PyPI sdist, not by the package's maintainers, so tell the user that and ask before adding the index "
     "to project files. It's off with another index (index-url or WHEELGAP_INDEX_URL: a note says so), and packages "
     "wheelgap can't tell are PyPI's are never looked for. "
 )
 _FIX_PROP = {
     "type": "boolean",
-    "description": "Also return gap_wheels: the gaps a wheel on wheelgap's gap wheel index fills, as --fix does "
-    "(one request to wheelgap.github.io that names no package; the wheels are unofficial builds by wheelgap, so "
-    "ask the user before adding the index). Default: false.",
+    "description": "Also return each gap's fix (a newer release with the wheel first, then a gap wheel) and "
+    "gap_wheels: the gaps a wheel on wheelgap's gap wheel index fills, as --fix does (one request to "
+    "wheelgap.github.io that names no package, and one to pypi.org per gap package positively from PyPI; the wheels "
+    "are unofficial builds by wheelgap, so ask the user before adding the index). Default: false.",
 }
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 
@@ -369,9 +374,10 @@ TOOLS: list[dict[str, Any]] = [
             "wheelgap can't read the way Docker does is a tool error saying what to pass "
             "instead. With inputs: true, as --dockerfile-inputs does, it checks the requirements files the "
             "Dockerfile's final stage installs with RUN pip install -r FILE instead of a lockfile (so: will this "
-            "image build without compiling anything?); 'path' is then the build context, and notes name each file "
-            "read and its line. Only a strict subset of Dockerfiles is read that way: a line that may install "
-            "anything else is a tool error naming the line, never a guess. A line wheelgap can't see into (a script, "
+            "image build without compiling anything?); 'path' is then the build context, and notes (and "
+            "'dockerfile_inputs') name each file read and its line. Only a strict subset of Dockerfiles is read "
+            "that way: a line that may install anything else is a tool error naming the line, never a guess. A line "
+            "wheelgap can't see into (a script, "
             "make) after the last install it reads is listed in 'dockerfile_warnings', with summary.complete false: "
             "the packages it installs are not in the answer, so say so rather than calling the image fine. "
             + _FIX_HELP
@@ -471,7 +477,9 @@ TOOLS: list[dict[str, Any]] = [
             "Pass the old lockfile as 'old' under its own file name, since the name says how to read it: e.g. `mkdir -p"
             " /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock` (this works after the upgrade too, until it's "
             "committed). Unlike `wheelgap diff`, the project's [tool.wheelgap] settings don't apply: pass python, "
-            "targets and any version floors that differ from the defaults. " + _STATUS_HELP
+            "targets and any version floors that differ from the defaults. As in `wheelgap diff`, an index-url in "
+            "the [tool.wheelgap] beside either lockfile is a tool error, before any lookup: this tool checks PyPI "
+            "only, so check each lockfile with check_lockfile, which uses that index. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -943,6 +951,13 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
     pypi.check_index_url(
         simple_index_hint="Set WHEELGAP_INDEX_URL to the JSON API of the index you want to compare against."
     )
+    for path in paths:
+        # As `wheelgap diff` (#705), before any lookup: an index-url in [tool.wheelgap] beside either side would be
+        # ignored, and PyPI's answer given for a project that installs from that index (#710). The URL isn't named.
+        try:
+            diff._input_index_url(str(path), str(path))
+        except SourceError as e:
+            raise ToolError(_translate_cli_message(str(e))) from e
     if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
         targets = diff.lock_default_targets(paths, targets)[0]
     sides = []
@@ -1057,6 +1072,12 @@ _CLI_ADVICE = {
     "To use a simple index, pass --index-url instead.": (
         "To use a simple index, set index-url in [tool.wheelgap] (a URL without credentials) for the tools that "
         "check a project's files."
+    ),
+    # wheelgap diff's refusal of [tool.wheelgap] index-url (diff._refuse_index_url), which diff_lockfiles shares.
+    "which wheelgap diff doesn't read yet, so it would check PyPI instead of that index; check each lockfile with "
+    "wheelgap instead, which uses it": (
+        "which diff_lockfiles doesn't read yet, so it would check PyPI instead of that index; check each lockfile "
+        "with check_lockfile instead, which uses it"
     ),
     "select targets with -t": "pass targets explicitly",
     "add it to -t as well": "include it in targets as well",
@@ -1186,10 +1207,11 @@ def _run_cli(
         for line in err.getvalue().splitlines()
         if line.strip()
     ]
-    notes = [m.removeprefix("note: ") for m in messages if m.startswith("note: ")]
+    # A warning qualifies the answer (--dockerfile-inputs: a line wheelgap can't see into), so it is kept, marked.
+    notes = [m.removeprefix("note: ") for m in messages if m.startswith(("note: ", "warning: "))]
     # SystemExit is a BaseException: without the handler above it would end the server, not just this call.
     if code not in (0, 1):
-        errors = [m.removeprefix("error: ") for m in messages if not m.startswith("note: ")]
+        errors = [m.removeprefix("error: ") for m in messages if not m.startswith(("note: ", "warning: "))]
         # An indented line continues the error above it (the files a directory leaves to choose from): it stays a
         # line of its own.
         text = "".join(("\n" if m.startswith(" ") else "; ") + m for m in errors).removeprefix("; ")
@@ -1215,7 +1237,7 @@ def _run_cli(
             # Apply the same label mapping to dependency paths, not just status cells.
             context = {
                 key: {label.get(t, t): value for t, value in package[key].items()}
-                for key in ("via", "direct")
+                for key in ("via", "direct", "fix")
                 if key in package
             }
             # --explain's other keys (rejected wheels, tracker notes, build needs...) keep the CLI's short labels and
@@ -1240,6 +1262,9 @@ def _run_cli(
         # The command line's verdict: gaps on advisory targets (and, with fail-on = "missing", source builds) don't
         # fail it, so this can be true while ok is false.
         "passes": code == 0,
+        # --dockerfile-inputs: whether the answer covers every line, next to the verdict it qualifies, so an agent
+        # reading passes sees it.
+        **({"summary": {"complete": data["summary"]["complete"]}} if "complete" in data["summary"] else {}),
         "advisory": advisory,
         "unknown": sum(1 for g in gaps if Status.UNKNOWN.value in g["results"].values()),
         "bundled_version_differs": [
@@ -1251,6 +1276,10 @@ def _run_cli(
         "ignored_targets": data["ignored_targets"],
         "notes": notes,
     } | ({"blocking_newer_python": data["blocking_newer_python"]} if "blocking_newer_python" in data else {})
+    # --dockerfile-inputs: the files each RUN line read and the lines wheelgap couldn't see into, as --json gives them.
+    for key in ("dockerfile_inputs", "dockerfile_warnings"):
+        if key in data:
+            result[key] = data[key]
     # --dist: targets the previous release had a wheel for that this one drops, labelled like results.
     if "dropped" in data:
         result["dropped"] = {label[k]: v for k, v in data["dropped"].items()}
@@ -1259,6 +1288,8 @@ def _run_cli(
         result["gap_wheels"] = [wheel | {"target": label[wheel["target"]]} for wheel in data["gap_wheels"]]
         result["gap_wheel_index"] = gapwheels.INDEX
         result["gap_wheel_about"] = gapwheels.ABOUT
+    if "fix_summary" in data:  # --fix: how many gap cells an upgrade, a gap wheel or nothing fixes
+        result["fix_summary"] = data["fix_summary"]
     return result
 
 

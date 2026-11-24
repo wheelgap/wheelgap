@@ -478,6 +478,7 @@ def test_an_index_in_the_environment_keeps_found_names_private(capsys, fake_pypi
 def test_index_env_is_the_agreed_list():
     assert origin.INDEX_ENV == (
         "PIP_INDEX_URL",
+        "PIP_PYPI_URL",
         "PIP_EXTRA_INDEX_URL",
         "PIP_FIND_LINKS",
         "PIP_NO_INDEX",

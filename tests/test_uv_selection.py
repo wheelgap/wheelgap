@@ -2184,6 +2184,74 @@ def test_script_lock_diff(tmp_path, capsys, fake_pypi):
     assert fake_pypi == []
 
 
+@pytest.mark.parametrize("name", ["forked.py.lock", "uv.lock"])
+def test_script_lock_forks_apply_where_uv_installs_them(fixtures, tmp_path, capsys, fake_pypi, name):
+    # `uv lock --script forked.py` (uv 0.13.9) forks numpy per Python and packaging per platform. `uv export --script`
+    # installs numpy 2.4.6 on < 3.12 and 2.5.5 on >= 3.12, packaging 26.4 on Linux and 23.2 elsewhere: each entry is
+    # n/a where uv takes the other, instead of a false `source` gap (#703). The same lock renamed to uv.lock is read
+    # the same way: uv picks a manifest requirement's fork by the package's resolution-markers in any lock.
+    lock = tmp_path / name
+    shutil.copyfile(fixtures / "uvscript" / "forked.py.lock", lock)
+    assert main([str(lock), "-p", "3.11,3.15", "-t", "linux-x86_64,macos-arm64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    linux_11, mac_11, linux_15, mac_15 = (
+        "3.11 linux-x86_64",
+        "3.11 macos-arm64",
+        "3.15 linux-x86_64",
+        "3.15 macos-arm64",
+    )
+    assert {(p["name"], p["version"]): p["results"] for p in packages} == {
+        ("numpy", "2.4.6"): {linux_11: "wheel", mac_11: "wheel", linux_15: "n/a", mac_15: "n/a"},
+        ("numpy", "2.5.5"): {linux_11: "n/a", mac_11: "n/a", linux_15: "wheel", mac_15: "wheel"},
+        ("packaging", "23.2"): {linux_11: "n/a", mac_11: "wheel", linux_15: "n/a", mac_15: "wheel"},
+        ("packaging", "26.4"): {linux_11: "wheel", mac_11: "n/a", linux_15: "wheel", mac_15: "n/a"},
+    }
+    assert fake_pypi == []
+
+
+def test_virtual_workspace_group_forks_apply_where_uv_installs_them(fixtures, capsys, fake_pypi):
+    # A virtual workspace root (`[tool.uv.workspace] members = []`, `[dependency-groups] dev = ["numpy>=1.26"]`, `uv
+    # lock --python 3.11` with uv 0.13.9) has only the manifest's group edges, which name numpy without a version.
+    # `uv sync --frozen` installs 2.4.6 on 3.11 and 2.5.5 on 3.12 and later, so neither is a gap on the other Python.
+    assert main([str(fixtures / "uvvirtualfork"), "-p", "3.11,3.13", "-t", "linux-x86_64", "--json"]) == 0
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    assert {(p["name"], p["version"]): p["results"] for p in packages} == {
+        ("numpy", "2.4.6"): {"3.11 linux-x86_64": "wheel", "3.13 linux-x86_64": "n/a"},
+        ("numpy", "2.5.5"): {"3.11 linux-x86_64": "n/a", "3.13 linux-x86_64": "wheel"},
+    }
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("markers", "expected"),
+    [
+        # A marker the target can't decide counts as holding, so the entry is still checked.
+        (("platform_release >= '6'", "platform_release < '6'"), {"3.1", "3.2"}),
+        # No entry's markers hold (uv fails: MissingRootPackage): every entry is checked, as before.
+        (("sys_platform == 'win32'", "sys_platform == 'darwin'"), {"3.1", "3.2"}),
+        # An entry without resolution-markers fits anywhere.
+        (("sys_platform == 'darwin'", None), {"3.2"}),
+    ],
+)
+def test_script_lock_fork_markers_never_hide_an_entry(tmp_path, markers, expected):
+    entries = []
+    for version, marker in zip(("3.1", "3.2"), markers, strict=True):
+        forks = f'resolution-markers = ["{marker}"]\n' if marker else ""
+        entries.append(
+            f'[[package]]\nname = "purewheel"\nversion = "{version}"\nsource = {{ registry = "{_PYPI}" }}\n{forks}'
+            f'wheels = [{{ url = "{_FILES}/purewheel-{version}-py3-none-any.whl", hash = "sha256:00" }}]\n'
+        )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(
+        'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n'
+        '[manifest]\nrequirements = [{ name = "purewheel" }]\n\n' + "\n".join(entries),
+        encoding="utf-8",
+    )
+    sources = load_inputs([str(lock)])
+    results = check(sources, build_targets(["3.13"], ["linux-x86_64"]))
+    assert {r.package.version for r in results if r.needed} == expected
+
+
 @pytest.mark.parametrize("setting", ['no-binary-package = ["purewheel"]', "no-build = true"])
 def test_script_lock_refused_when_its_script_sets_build_restrictions(tmp_path, capsys, fake_pypi, setting):
     (tmp_path / "example.py").write_text(

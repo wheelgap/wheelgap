@@ -43,6 +43,7 @@ uv run --group dev pytest
 | `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`, `--piwheels`, `--notes`); never for private-index names |
 | `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names `origin.known_pypi` accepts (from `uv.lock` and `pylock.toml` for a registry), never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror |
 | `gapwheels.py` | `--fix`: which gaps a wheel on wheelgap's gap wheel index fills (the list from `pypi.fetch_gap_wheels`, each entry checked and dropped whole if malformed), and how to install from the index; only for names `origin.known_pypi` accepts, never with `--offline`, `--index-url` or a mirror |
+| `fix.py` | `--fix`: each gap cell's way out, an upgrade first (the releases `--suggest` looks up, through `cli.release_lookups`), else a gap wheel (`gapwheels.py`), else none with the reason; the summary, and what to run or change per input |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `logsafe.py` | Keeps input text from running as a GitHub Actions workflow command: the CLI's and `diff`'s stdout and stderr go through `CommandGuard` |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
