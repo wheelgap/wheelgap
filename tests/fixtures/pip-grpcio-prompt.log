@@ -1,0 +1,6 @@
+# Trimmed from https://github.com/grpc/grpc/issues/40311: the command at a shell prompt, then the end of pip's output.
+(venv) ~/grpcio-test > pip install 'grpcio ==1.73.1'
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for grpcio
+Failed to build grpcio
+ERROR: Failed to build installable wheels for some pyproject.toml based projects (grpcio)

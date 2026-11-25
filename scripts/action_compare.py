@@ -9,10 +9,12 @@ The Action runs this with the runner's own Python, not wheelgap's, so it uses on
 doesn't import wheelgap.
 
 - `report` writes the Markdown report (for $GITHUB_STEP_SUMMARY) and, with --payload, the JSON body for GitHub's
-  comment API: the same report under a hidden marker that names the lockfile. Its exit code is the step's result:
-  0 only when `wheelgap diff` exited 0 with a valid report listing nothing, 1 when it exited 1 with a valid
-  report listing something, and 2 for anything else (no report, an error, or an exit code that disagrees with the
-  report), so the step never passes on a guess.
+  comment API: the same report under a hidden marker that names the lockfile (--comment-markdown writes that body as
+  Markdown too). When `wheelgap diff --fix` gave a `fix` for a cell, the table has a Fix column (an upgrade, an
+  unofficial gap wheel, or none and why) and a "How to fix" list after it with the `how` of each upgrade. Its exit
+  code is the step's result: 0 only when `wheelgap diff` exited 0 with a valid report listing nothing, 1 when it
+  exited 1 with a valid report listing something, and 2 for anything else (no report, an error, or an exit code that
+  disagrees with the report), so the step never passes on a guess.
 - `pick` prints the id of this lockfile's comment from `gh api --paginate` output: the first one by `--login`
   (the token's own identity) whose body starts with the marker. Anyone else's comment is never edited.
 - `log` copies wheelgap's stderr to stdout with anything the Actions runner would run as a workflow command
@@ -47,6 +49,18 @@ MAX_MESSAGE = 2_000  # characters of an escaped error message
 MAX_COMMENT = 65_536  # GitHub refuses longer comments
 MAX_UNCHECKED = 20  # names listed as unchecked
 MARKER = "<!-- wheelgap-compare lockfile={} -->"
+# fix.REASON_TEXT and fix.RESOLVE_NOTE, as --fix words them (a test keeps them in step).
+FIX_REASONS = {
+    "no_newer_release": "no newer release has a wheel",
+    "loses_wheel": "every newer release with a wheel drops one it has elsewhere",
+    "uv_may_fork": "every newer release with a wheel drops one it has on another Python",
+    "no_binary": "--no-binary, so pip uses no wheel for it",
+}
+RESOLVE_NOTE = "wheelgap doesn't resolve dependencies: the rest of them must allow these releases."
+GAP_WHEEL_NOTE = (
+    "Gap wheels are unofficial: built by wheelgap from the PyPI sdist, not by the package's maintainers "
+    '(<a href="https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index">how to use them</a>).'
+)
 SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
 
@@ -98,28 +112,92 @@ def name_cell(pkg: dict, target: str) -> str:
     return name
 
 
-def rows(data: dict, *, suggestions: bool = False) -> list[str]:
-    """One table row per package and target that got worse, then the new packages' gaps."""
+def fix_cell(fix: object) -> str:
+    """One cell's way out, from `wheelgap diff --fix --json`'s `fix` (fix.to_json), in --fix's words."""
+    if not isinstance(fix, dict):
+        return ""  # an unknown or skipped cell: --fix has no answer for it
+    kind = fix.get("kind")
+    if kind == "upgrade":
+        text = f"upgrade to {code(fix.get('version'))}"
+        c = fix.get("constraint")
+        if isinstance(c, dict) and c.get("allows") is False and isinstance(c.get("requirements"), list):
+            reqs = ", ".join(code(r) for r in c["requirements"])
+            if c.get("via") == "constraint":
+                text += f" (needs {reqs} in the -c constraints of {code(c.get('file'))} relaxed)"
+            else:
+                text += f" (needs {code(c.get('file'))}'s {reqs} relaxed)"
+        if isinstance(fix.get("gap_wheel"), dict):
+            text += "; if you can't, an unofficial gap wheel"
+        return text
+    if kind == "gap_wheel":
+        return f"an unofficial gap wheel: {code(fix.get('wheel'))}"
+    if kind == "none":
+        reason = fix.get("reason")
+        if reason == "not_looked_up":
+            return "newer releases weren't looked up (the log says why)"
+        text = f"no fix yet: {esc(FIX_REASONS[reason]) if reason in FIX_REASONS else code(reason)}"
+        if fix.get("abi3_only") is True:
+            text += "; only abi3 wheels, which free-threaded Python can't use"
+        return text
+    return code(kind)
+
+
+def has_fixes(data: dict) -> bool:
+    """Whether `wheelgap diff --fix` gave a way out for any cell, so the table gets its Fix column."""
+    return any(
+        isinstance(side.get("fix"), dict) for pkg in data["worse"] + data["new"] for side in pkg["targets"].values()
+    )
+
+
+def how_lines(data: dict) -> list[str]:
+    """After the table: what to run or change for each upgrade (--fix's `how`, once each), and the notes --fix adds."""
+    hows: list[str] = []
+    gap_wheels = False
+    for pkg in data["worse"] + data["new"]:
+        for side in pkg["targets"].values():
+            fix = side.get("fix")
+            if not isinstance(fix, dict):
+                continue
+            how = fix.get("how")
+            if fix.get("kind") == "upgrade" and isinstance(how, str) and how not in hows:
+                hows.append(how)
+            gap_wheels = gap_wheels or fix.get("kind") == "gap_wheel" or isinstance(fix.get("gap_wheel"), dict)
+    items = [f"<li>{code(how, MAX_MESSAGE)}</li>" for how in hows]
+    if hows:
+        items.append(f"<li>{esc(RESOLVE_NOTE)}</li>")
+    if gap_wheels:
+        items.append(f"<li>{GAP_WHEEL_NOTE}</li>")
+    return ["", "<p>How to fix:</p>", "<ul>", *items, "</ul>"] if items else []
+
+
+def rows(data: dict, *, suggestions: bool = False, fixes: bool = False) -> list[str]:
+    """One table row per package and target that got worse, then the new packages' gaps; with `fixes`, each row
+    ends with its Fix cell."""
     out = []
+    span = 4 if fixes else 3
+
+    def fixed(side: dict) -> str:
+        return f"<td>{fix_cell(side.get('fix'))}</td>" if fixes else ""
+
     for pkg in data["worse"]:
         old, new = versions(pkg.get("old_versions", [])), versions(pkg.get("new_versions", []))
         version = new if old == new else f"{old} → {new}"
         for target, side in pkg["targets"].items():
             out.append(
                 f"<tr><td>{name_cell(pkg, target)}</td><td>{version}</td><td>{code(target)}</td>"
-                f"<td>{cell(side, 'old_')} → {cell(side, 'new_')}</td></tr>"
+                f"<td>{cell(side, 'old_')} → {cell(side, 'new_')}</td>{fixed(side)}</tr>"
             )
         lines = pkg.get("suggestions") if suggestions else None
         if isinstance(lines, list):
             hint = "; ".join(line for line in lines if isinstance(line, str))
             if hint:
-                out.append(f'<tr><td></td><td colspan="3">{code(hint, MAX_MESSAGE)}</td></tr>')
+                out.append(f'<tr><td></td><td colspan="{span}">{code(hint, MAX_MESSAGE)}</td></tr>')
     for pkg in data["new"]:
         version = f"(new) {versions(pkg.get('versions', []))}"
         for target, side in pkg["targets"].items():
             out.append(
                 f"<tr><td>{name_cell(pkg, target)}</td><td>{version}</td><td>{code(target)}</td>"
-                f"<td>(new) → {cell(side)}</td></tr>"
+                f"<td>(new) → {cell(side)}</td>{fixed(side)}</tr>"
             )
     return out
 
@@ -178,8 +256,10 @@ def report(
     budget: int = MAX_COMMENT,
     *,
     suggestions: bool = False,
+    comment: bool = False,
 ) -> str:
-    """The Markdown report, at most `budget` characters."""
+    """The Markdown report, at most `budget` characters. `comment`: the pull request comment's wording, which only
+    replaces an earlier comment when nothing got worse, so it says the gaps are resolved."""
     at = f" at {code(head)}" if head else ""
     if base_branch:
         with_ = f"the base branch ({code(base)})" if base else "the base branch"
@@ -189,7 +269,9 @@ def report(
     header = ["### wheelgap diff", ""]
     if data is None:
         return "\n".join([*header, f"<p>{compared} The check couldn't run: {problem}</p>", ""])
-    header.append(f"<p>{compared} {counts(len(data['worse']), len(data['new']))}</p>")
+    listed = bool(data["worse"] or data["new"])
+    resolved = "<b>Resolved.</b> " if comment and not listed else ""
+    header.append(f"<p>{resolved}{compared} {counts(len(data['worse']), len(data['new']))}</p>")
     footer = [""]
     unchecked = data.get("unchecked", [])
     if unchecked:
@@ -197,11 +279,13 @@ def report(
         if len(unchecked) > MAX_UNCHECKED:
             names += f" and {len(unchecked) - MAX_UNCHECKED} more"
         footer = ["", f"<p>Couldn't check at the same version on either side: {names}</p>", ""]
-    table = rows(data)
+    fixes = has_fixes(data)
+    table = rows(data, fixes=fixes)
     if not table:
         return "\n".join(header + footer)
-    head_rows = ["", "<table>", "<tr><th>Package</th><th>Version</th><th>Target</th><th>Status</th></tr>"]
-    more_row = '<tr><td colspan="4">and {} more rows</td></tr>'
+    fix_th = "<th>Fix</th>" if fixes else ""
+    head_rows = ["", "<table>", f"<tr><th>Package</th><th>Version</th><th>Target</th><th>Status</th>{fix_th}</tr>"]
+    more_row = f'<tr><td colspan="{5 if fixes else 4}">and {{}} more rows</td></tr>'
     # Room for the joins, the closing tag and the "more rows" line, whose count has at most 7 digits.
     size = sum(len(line) + 1 for line in header + head_rows + footer) + len("</table>") + len(more_row) + 10
     shown = []
@@ -210,15 +294,21 @@ def report(
             break
         shown.append(row)
         size += len(row) + 1
+    after: list[str] = []
     if len(shown) < len(table):
         shown.append(more_row.format(len(table) - len(shown)))
-    elif suggestions:
-        with_hints = rows(data, suggestions=True)
-        # Keep every comparison row that fit before adding optional hints.
-        extra = sum(len(row) + 1 for row in with_hints) - sum(len(row) + 1 for row in table)
-        if size + extra <= budget:
-            shown = with_hints
-    return "\n".join(header + head_rows + shown + ["</table>"] + footer)
+    else:
+        # Every comparison row fit: then how to fix them, then the optional release hints, each only if it fits.
+        how = how_lines(data) if fixes else []
+        if size + sum(len(line) + 1 for line in how) <= budget:
+            after = how
+            size += sum(len(line) + 1 for line in how)
+        if suggestions:
+            with_hints = rows(data, suggestions=True, fixes=fixes)
+            extra = sum(len(row) + 1 for row in with_hints) - sum(len(row) + 1 for row in table)
+            if size + extra <= budget:
+                shown = with_hints
+    return "\n".join(header + head_rows + shown + ["</table>"] + after + footer)
 
 
 def marker(lockfile: str) -> str:
@@ -289,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--head", default="", help="the commit checked, shown in the report")
     r.add_argument("--markdown", required=True, help="write the report here")
     r.add_argument("--payload", help="also write the comment API's JSON body here")
+    r.add_argument("--comment-markdown", help="also write the comment's body here, as Markdown")
     k = sub.add_parser("pick", help="print the id of this lockfile's comment, if there is one")
     k.add_argument("--comments", required=True, help="what `gh api --paginate` printed")
     k.add_argument("--login", required=True, help="the token's identity: only its comments are edited")
@@ -328,10 +419,17 @@ def run(args: argparse.Namespace) -> int:
     text = report(data, problem, args.lockfile, args.base, args.base_branch, head[:7], budget)
     with open(args.markdown, "w", encoding="utf-8") as f:
         f.write(text)
-    if args.payload:
-        body = report(data, problem, args.lockfile, args.base, args.base_branch, head[:7], budget, suggestions=True)
-        with open(args.payload, "w", encoding="utf-8") as f:
-            json.dump({"body": f"{marker(args.lockfile)}\n{body}"}, f)
+    if args.payload or args.comment_markdown:
+        body = report(
+            data, problem, args.lockfile, args.base, args.base_branch, head[:7], budget, suggestions=True, comment=True
+        )
+        body = f"{marker(args.lockfile)}\n{body}"
+        if args.payload:
+            with open(args.payload, "w", encoding="utf-8") as f:
+                json.dump({"body": body}, f)
+        if args.comment_markdown:
+            with open(args.comment_markdown, "w", encoding="utf-8") as f:
+                f.write(body)
     # Counts only: names and versions in the log could be read as workflow commands.
     if data is None:
         print("wheelgap: couldn't compare the lockfiles; the job summary and the log above say why.")

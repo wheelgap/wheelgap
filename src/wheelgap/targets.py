@@ -307,16 +307,25 @@ def next_python_note(pythons: Iterable[str]) -> str | None:
 _VERSION_EXAMPLES = {"glibc": "2.36", "musl": "1.2", "macOS": "14.0", "iOS": "13.0"}
 
 
+_LIBC_MAJORS = {"glibc": 2, "musl": 1}
+
+
 def parse_version_pair(spec: str, what: str) -> tuple[int, int]:
     example = _VERSION_EXAMPLES.get(what, "2.36")
+    parts = spec.strip().split(".")
     try:
-        parts = spec.strip().split(".")
         major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0  # "15" means 15.0
     except ValueError:
         raise TargetError(f"can't parse {what} version {spec!r} (expected e.g. {example})") from None
+    if what in _LIBC_MAJORS and len(parts) < 2:
+        raise TargetError(f"{what} version {spec!r} needs a minor version too (expected e.g. {example})")
     # Tags are generated for every version below this one, so absurd values would never finish.
     if not (0 <= major <= 99 and 0 <= minor <= 99):
         raise TargetError(f"{what} version {spec!r} is out of range (expected e.g. {example})")
+    if (expected_major := _LIBC_MAJORS.get(what)) is not None and major != expected_major:
+        raise TargetError(
+            f"{what} version {spec!r} doesn't exist: {what} versions are {expected_major}.x (expected e.g. {example})"
+        )
     return major, minor
 
 

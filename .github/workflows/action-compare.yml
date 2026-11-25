@@ -1,11 +1,13 @@
 name: Action compare-to
 
-# Runs the GitHub Action's compare-to mode (#201) against the two fixture lockfiles in tests/fixtures/actioncompare
-# and checks the report it writes to the job summary. The fixtures are uv.lock files that list every wheel, for a
-# Python inside their requires-python, so wheelgap diff looks nothing up (tests/test_action_compare.py checks that);
-# diff has no --offline flag to enforce it. The Action itself still installs wheelgap with pipx.
+# Runs the GitHub Action's compare-to mode (#201) against the fixture lockfiles in tests/fixtures/actioncompare and
+# checks the report it writes to the job summary and the comment body it would post. The fixtures are uv.lock files
+# that list every wheel, for a Python inside their requires-python, so wheelgap diff looks nothing up
+# (tests/test_action_compare.py checks that); diff has no --offline flag to enforce it. The steps with made-up packages
+# turn fix off, so nothing is looked up at all; the pyyaml steps keep it on (the default), so --fix looks pyyaml up on
+# PyPI and reads wheelgap's gap wheel list. The Action itself still installs wheelgap with pipx.
 # The token stays read-only, so this never posts a comment: tests/test_action_step.py runs the step's comment logic
-# against a stub gh.
+# against a stub gh, and the comment output here is the body it would post.
 
 on:
   push:
@@ -64,6 +66,7 @@ jobs:
         with:
           args: action-compare-test/uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
           compare-to: ${{ steps.base.outputs.sha }}
+          fix: "false"
 
       - name: Check that it failed and what the summary says
         shell: bash
@@ -86,6 +89,7 @@ jobs:
         with:
           args: action-compare-test/uv.lock -p 3.13 -t linux-x86_64,musl-aarch64
           compare-to: ${{ steps.base.outputs.sha }}
+          fix: "false"
 
       - name: Check the summary
         shell: bash
@@ -96,3 +100,65 @@ jobs:
           cat "$REPORT"
           grep -qF 'Nothing got worse.' "$REPORT"
           if grep -qF '<table>' "$REPORT"; then echo "::error::expected no table"; exit 1; fi
+
+      # The gate with fix on (the default), on real uv.lock files: the pull request adds pyyaml 6.0.3, which has no
+      # wheel for Python 3.15, and 6.0.4 has them. The checks grep only for what can't change: 6.0.4 is out, and the
+      # gap wheel index may add a wheel for 6.0.3 later, which would only add a fallback.
+      - name: Commit the pyyaml base fixture
+        id: pyyaml
+        shell: bash
+        run: |
+          cp tests/fixtures/actioncompare/pyyaml-base/uv.lock action-compare-test/uv.lock
+          git add action-compare-test/uv.lock
+          git -c user.name=ci -c user.email=ci@example.invalid commit --quiet --no-verify -m "pyyaml base fixture"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cp tests/fixtures/actioncompare/pyyaml-head/uv.lock action-compare-test/uv.lock
+
+      - name: A pull request that adds a package with a gap
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          args: action-compare-test/uv.lock -p 3.15 -t linux-x86_64,win-arm64
+          compare-to: ${{ steps.pyyaml.outputs.sha }}
+
+      - name: Check that it failed and that the comment has the fix
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          REPORT: ${{ steps.gate.outputs.report }}
+          COMMENT: ${{ steps.gate.outputs.comment }}
+        run: |
+          set -eu
+          cat "$COMMENT"
+          [ "$OUTCOME" = failure ] || { echo "::error::expected the step to fail, got $OUTCOME"; exit 1; }
+          [ "$(head -n 1 "$COMMENT")" = '<!-- wheelgap-compare lockfile=action%2Dcompare%2Dtest/uv.lock -->' ]
+          # The summary is the comment without its marker.
+          [ "$(tail -n +2 "$COMMENT")" = "$(cat "$REPORT")" ]
+          grep -qF '1 new package has gaps.' "$COMMENT"
+          grep -qF '<th>Status</th><th>Fix</th></tr>' "$COMMENT"
+          for target in 'linux-x86&#95;64' 'win-arm64'; do
+            grep -qF "<td><code>pyyaml</code></td><td>(new) <code>6&#46;0&#46;3</code></td><td><code>$target</code></td><td>(new) → ● source</td><td>upgrade to <code>6&#46;0&#46;4</code>" "$COMMENT"
+          done
+          grep -qF '<p>How to fix:</p>' "$COMMENT"
+          grep -qF 'run uv lock --upgrade-package pyyaml&#44; then uv sync' "$COMMENT"
+          [ "$(grep -c '^<tr><td>' "$COMMENT")" = 2 ]
+          cp tests/fixtures/actioncompare/pyyaml-base/uv.lock action-compare-test/uv.lock
+
+      - name: The pull request drops it again
+        id: resolved
+        uses: ./
+        with:
+          args: action-compare-test/uv.lock -p 3.15 -t linux-x86_64,win-arm64
+          compare-to: ${{ steps.pyyaml.outputs.sha }}
+
+      - name: Check that the comment would say resolved
+        shell: bash
+        env:
+          REPORT: ${{ steps.resolved.outputs.report }}
+          COMMENT: ${{ steps.resolved.outputs.comment }}
+        run: |
+          set -eu
+          cat "$COMMENT"
+          grep -qF '<p><b>Resolved.</b> Compared ' "$COMMENT" && grep -qF 'Nothing got worse.' "$COMMENT"
+          if grep -qF 'Resolved' "$REPORT"; then echo "::error::the summary shouldn't say resolved"; exit 1; fi

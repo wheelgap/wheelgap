@@ -394,6 +394,13 @@ and `linux-armv7l` it doesn't compare `platform_machine`, since a matching machi
 `aarch64` there. To check several targets, make a report on each and check each against its own target.
 `check_lockfile()` refuses the same way.
 
+musl and glibc Linux record the same environment, but pip resolves a different set on each — pip on musl accepts
+`musllinux` wheels and not `manylinux` ones. A wheel only one libc's pip accepts is proof the resolution isn't one
+the other's pip makes, so a report with a `manylinux` wheel in its downloads is refused on `musl-*` targets, one
+with a `musllinux` wheel on the glibc `linux-*` ones, and one with both (pip run with two `--platform` values) on
+the two families. A report with neither is taken at face value on both families, though it may not be a resolution both make: it may be pure Python,
+or an Alpine report that pinned an older sdist where glibc pip would have taken a newer manylinux-only release.
+
 ## Requirements files
 
 `requirements.txt`, `requirements.lock` and other requirements files are looked up on the index. Feed wheelgap a

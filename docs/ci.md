@@ -22,12 +22,14 @@ drops ARM wheels. The gap table also goes to the run's summary page.
 | `summary` | `"true"` | also write the gap table to the job summary page (skipped when `args` include `--json`); `"false"` turns it off |
 | `compare-to` | `""` | `base`, or a git ref such as `origin/main`, to fail only when the pull request makes the lockfile worse; see [below](#compare-to) |
 | `comment` | `"false"` | with `compare-to`: also post one pull request comment when something got worse, and edit it on later runs |
+| `fix` | `"true"` | with `compare-to` (**after 0.14.0**): say how to fix each gap that got worse, as [`--fix`](cli.md#fix) does; `"false"` looks nothing up; see [below](#pr-gate) |
 | `github-token` | `${{ github.token }}` | the token for the pull request comment |
 | `comment-author` | `""` | the login the token comments as, such as `my-app[bot]`, for a GitHub App's token |
 | `dist` | `""` | a folder like `dist` with the release about to be uploaded, run as `--dist` instead of a lockfile check; see [below](#before-a-release) |
 
 The Action also has a `report` output: with `compare-to`, the path of the Markdown report that went to the job
-summary.
+summary. **After 0.14.0**, a `comment` output is the path of the pull request comment's Markdown body, written whether
+or not `comment: true` posts it.
 
 The step's result is wheelgap's exit code: [`--fail-on missing`](cli.md#fail-on), [`--ignore`](cli.md#ignore) and
 [`--exit-zero`](cli.md#exit-zero) in `args` work as they do on the command line.
@@ -70,7 +72,8 @@ jobs:
   that merge commit (`GITHUB_SHA`), such as the pull request's head commit, exits 2; then give a git ref instead, such
   as `compare-to: origin/main` (fetch it first), or the merge base of the two.
 - The report goes to the job summary: a table of each package and target that got worse (`armlib 1.4.0 → 1.5.0`,
-  `musl-aarch64`, `✓ → ● source`) and each new package's gaps. The action's `report` output is the path of the same
+  `musl-aarch64`, `✓ → ● source`) and each new package's gaps. **After 0.14.0**, each row also says how to fix it
+  ([below](#pr-gate)). The action's `report` output is the path of the same
   Markdown file. wheelgap's own messages go to the log with anything the runner would read as a [workflow
   command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands) defused, since they can
   quote the lockfile.
@@ -84,14 +87,15 @@ jobs:
   were. The token is only sent to the `https://` host in `GITHUB_SERVER_URL` (GitHub Enterprise Server included); if
   that isn't an `https://` URL, no comment is posted and the step warns. Package names and versions come from the pull
   request, so they're escaped and can't add links, @mentions or Markdown to the comment.
-- **Release suggestions.** The comment also includes the [release suggestions](output.md#suggest) for packages that got worse:
+- **Release suggestions.** With `fix: false` (**after 0.14.0**; before it, always), the comment also includes the [release suggestions](output.md#suggest) for packages that got worse:
   the nearest newer version that restores the wheels, or the last older version that had them. Lookups are limited to
   packages known to come from PyPI. If a lookup fails, the comment still reports the gap and the check's result is unchanged.
 - **Permissions.** Commenting needs `pull-requests: write` for the token (`github-token`, by default the workflow's
   `GITHUB_TOKEN`). Under `pull_request`, pull requests from forks get a read-only token (unless a private repository's
   settings send write tokens to them), and Dependabot's pull requests get one by default too, unless the workflow's
   `permissions:` asks for more as above. When the comment can't be posted, the step warns (naming the missing permission
-  on HTTP 403) and the job summary still has the report; the result is the same either way. So for Dependabot and fork
+  on HTTP 403; **after 0.14.0**, a pull request from a fork gets a notice instead, since that's expected) and the job
+  summary still has the report; the result is the same either way. So for Dependabot and fork
   pull requests, the summary-only setup (`comment: false`, the default, with `contents: read`) is enough.
 - **Don't read the pull request's lockfile in a workflow that has a write token or secrets.** `pull_request_target` and
   `workflow_run` run the base branch's workflow with them, so a pull request's files there must be treated as hostile:
@@ -113,6 +117,91 @@ summary for the comparison, and can comment on the pull request.
     args: diff origin/${{ github.base_ref }}:uv.lock uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
     summary: "false"
 ```
+
+### A low-noise pull request gate {#pr-gate}
+
+**After 0.14.0.** With `compare-to: base` and `comment: true`, the Action is a pull request gate that stays quiet
+until a pull request makes something worse, and then says how to fix it. That's mostly a dependency bump from
+Renovate or Dependabot that drops a wheel the old version had, or a new package that would build from source:
+
+```yaml
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write  # for the comment; without it, the job summary still has everything
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The fix input needs the release after 0.14.0: until then, pin a commit of main by its full SHA.
+      - uses: wheelgap/wheelgap@v0.14.0
+        with:
+          args: uv.lock -p 3.13 -p 3.15 -t linux-x86_64,linux-aarch64,win-arm64
+          compare-to: base
+          comment: true
+```
+
+On each run of a pull request:
+
+- **It fails only on what got worse.** The rule is [`wheelgap diff`'s](diff.md#what-counts-as-worse): a target whose
+  status got worse (`✓ → ● source`), or a new package with a gap. Gaps the base branch already has don't fail it and
+  aren't listed. A package that couldn't be checked (`unknown`) on both sides counts as worse when its version changed,
+  since the new version was never checked.
+- **It says how to fix each one.** `fix: true` (the default) runs `wheelgap diff --fix`, which works out each listed
+  gap's way out exactly as [`wheelgap uv.lock --fix`](cli.md#fix) would for the pull request's lockfile: an upgrade to
+  the nearest newer official release with the wheel first (with what to run, and whether your own requirement allows
+  it), else an unofficial wheel from wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/), else none and
+  why. It looks only the listed packages up on PyPI, judging names as `--fix` does for the pull request's lockfile
+  ([which names leave the run](how-it-works.md#pypi-origin)), and reads the gap wheel list in one request that names
+  no package. A lookup that fails says so in the log and leaves the result alone; `fix: false` looks nothing up.
+  The comment's older release hints ([above](#compare-to)) are left out when `fix` is on, since the Fix column says
+  the same.
+- **One comment, edited in place.** The first run that finds something worse posts one comment; every later run edits
+  that comment, never posting another. When a later push fixes it, the comment is edited to say
+  **Resolved.** When nothing got worse and there's no comment yet, nothing is posted.
+
+For a pull request that adds `pyyaml==6.0.3` to a `uv.lock`, checked on Python 3.15 (from
+`tests/fixtures/actioncompare` in this repository, with made-up commits), the comment reads:
+
+> **wheelgap diff**
+>
+> Compared `action-compare-test/uv.lock` at `9f8e7d6` with the base branch (`1a2b3c4`). 1 new package has gaps.
+>
+> | Package | Version | Target | Status | Fix |
+> | --- | --- | --- | --- | --- |
+> | `pyyaml` | (new) `6.0.3` | `linux-x86_64` | (new) → ● source | upgrade to `6.0.4` (needs `pyproject.toml`'s `pyyaml==6.0.3` relaxed); if you can't, an unofficial gap wheel |
+> | `pyyaml` | (new) `6.0.3` | `win-arm64` | (new) → ● source | upgrade to `6.0.4` (needs `pyproject.toml`'s `pyyaml==6.0.3` relaxed) |
+>
+> How to fix:
+>
+> - `In action-compare-test, run uv lock --upgrade-package pyyaml, then uv sync: uv moves each to the newest release your constraints allow, so check that it's at least pyyaml==6.0.4, then run wheelgap again.`
+> - wheelgap doesn't resolve dependencies: the rest of them must allow these releases.
+> - Gap wheels are unofficial: built by wheelgap from the PyPI sdist, not by the package's maintainers ([how to use them](recipes.md#installing-from-the-gap-wheel-index)).
+
+The job summary has the same report, so a run that can't comment still shows it.
+
+**Package names are attacker-controlled.** A pull request can put any text in its lockfile, so everything the comment
+quotes from it (names, versions, paths, the fix's commands) is escaped into `<code>` and can't add links, @mentions,
+images or Markdown; the [Action compare-to](https://github.com/wheelgap/wheelgap/blob/main/.github/workflows/action-compare.yml)
+workflow runs the gate on a fixture pull request and checks the comment body.
+
+**Permissions.** The comment needs `pull-requests: write`; `contents: read` is enough for everything else. The Action
+never runs the pull request's code: it reads the two lockfiles with wheelgap and git.
+
+**Pull requests from forks.** Under `pull_request`, GitHub gives a fork's run a read-only token, so it can't comment.
+The step then writes a notice (not a warning) and the job summary has the report and the fixes; the result is the same.
+Use that, and don't move the gate to `pull_request_target`, or to a `workflow_run` job that comments on the fork's
+behalf: those run with a write token, a fork's `pull_request` run can change the workflow and so anything it uploads
+for that job to post, and the pull request number it would comment on would come from that upload too. So the Action
+refuses `comment: true` on `pull_request_target` and `workflow_run`, and the summary is the safe place for a fork's
+report. Dependabot's pull requests get a read-only token too unless the workflow's `permissions:` asks for
+`pull-requests: write`, as above; Renovate's come from a branch of the repository, so they can comment.
+
+The `comment` output is the path of the comment's Markdown body, written on every run, if you want to post it some
+other way.
 
 ### Annotations {#annotations}
 

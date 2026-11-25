@@ -186,6 +186,10 @@ Each flag then adds its own limits:
   releases weren't looked up, and why. The settings it can't read matter more here: pip treats every
   index alike, so with a private index in `pip.conf` a private package with the same name and version as one on the
   gap wheel index could install the gap wheel. Don't follow its pip advice in that setup.
+  **After 0.14.0**, `wheelgap diff --fix` (and so the Action's `compare-to`) judges names as `wheelgap NEW --fix` does,
+  by the NEW input alone: the OLD input is an earlier copy of the same file, not another input of the run. A NEW
+  given as git's `REF:PATH` can place a name on PyPI only by a recorded index (a `uv.lock` registry, say), so a
+  requirements file read that way sends none.
 - **`--build-info`** is off for the whole run when an environment variable above is set, as well as with
   `--offline`. When the lock records an sdist URL (`uv.lock`, `pylock.toml`), it downloads from that URL only if it's
   on `files.pythonhosted.org` and names that release's sdist, checked against the lock's sha256; otherwise there's no

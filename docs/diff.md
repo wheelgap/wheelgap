@@ -49,6 +49,7 @@ it couldn't read is `unknown`, as in a lockfile.
 | `--android-api N` | minimum Android API level for `android-*` targets (default: 24) |
 | `--json` | print one JSON object instead of the text report |
 | `--deps` | `OLD` and `NEW` are pinned releases: resolve and compare their whole trees ([above](#comparing-two-package-versions)) |
+| `--fix` | **after 0.14.0**: also say how to fix each listed gap, as the main command's [`--fix`](cli.md#fix) does ([below](#fix)); not with `--deps` |
 
 The same `-p` and `-t` apply to both lockfiles. `wheelgap diff` reads `[tool.wheelgap]` (`python`, `targets`, `glibc`,
 `musl`, `distro`, `macos`, `ios`, `android-api`), `[tool.uv] required-environments` and `.python-version` from the
@@ -79,6 +80,22 @@ or `(via mcp +1)` when more than one does. The Action's PR comment shows the sam
 A requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) is matched by its path, so it shows up
 as a new package rather than as the one it replaced.
 
+## Fixes {#fix}
+
+**After 0.14.0**, `--fix` adds each listed gap's way out: what [`wheelgap NEW --fix`](cli.md#fix) says for that
+package and target, an upgrade to the nearest newer official release with the wheel first, else an unofficial gap
+wheel, else none and why. Only the packages the report lists are looked up, on PyPI, so an unchanged gap costs
+nothing, and names are judged as `wheelgap NEW --fix` judges them, by the NEW input
+([which names leave the run](how-it-works.md#pypi-origin)); a NEW given as `REF:PATH` sends a name only when its lock
+records the PyPI index (a `uv.lock`, say), so a requirements file read that way is never looked up. The text
+report ends with `--fix`'s section for those gaps, and `--json` adds a `fix` to each `source` or `missing` cell in
+`worse` and `new`, and a `fix_summary`, both as the main command's `--json --fix` has them. Like the main command's,
+it never changes the exit code. The GitHub Action's [pull request gate](ci.md#pr-gate) puts these fixes in its comment.
+
+```bash
+wheelgap diff origin/main:uv.lock uv.lock -p 3.15 -t linux-x86_64,win-arm64 --fix
+```
+
 ## Git refs
 
 Either input can be a git `REF:PATH` (`origin/main:uv.lock`, `HEAD~1:poetry.lock`) when no file or folder of that name
@@ -102,7 +119,11 @@ it at that ref, if any), so its format is detected and read as usual. `PATH` is 
   package in; absent for a direct dependency or an input without a dependency graph;
 - `unchecked`: the names of packages that were `unknown` on both sides of a target at the same version, so neither
   side could be checked there;
-- `summary`: the `worse` and `new` counts.
+- `summary`: the `worse` and `new` counts;
+- `fix` (on each target of `worse` and `new`, with `--fix`, **after 0.14.0**): that gap's way out, as `fix` in the
+  main command's [`--json`](output.md#json) has it (`kind` `upgrade`, `gap_wheel` or `none`); absent for an `unknown`
+  or skipped cell, which `--fix` has no answer for;
+- `fix_summary` (with `--fix`): the counts of the listed gaps, as the main command's.
 
 A skipped cell has the status `skipped` and a reason: `skip_reason` in `new`, and `old_skip_reason` or
 `new_skip_reason` in `worse` (`git`, `url`, `private index`, ...). Versions are lists: empty when the input gives no

@@ -1,0 +1,21 @@
+# Trimmed from https://github.com/yaml/pyyaml/issues/724: PyYAML 5.4's sdist fails with Cython 3, before pip builds a wheel.
+Collecting pyyaml==5.4
+  Using cached PyYAML-5.4.tar.gz (174 kB)
+  Installing build dependencies ... done
+  Getting requirements to build wheel ... error
+  error: subprocess-exited-with-error
+  
+  × Getting requirements to build wheel did not run successfully.
+  │ exit code: 1
+  ╰─> [68 lines of output]
+      AttributeError: cython_sources
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: subprocess-exited-with-error
+
+× Getting requirements to build wheel did not run successfully.
+│ exit code: 1
+╰─> See above for output.
+
+note: This error originates from a subprocess, and is likely not a problem with pip.

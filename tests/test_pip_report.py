@@ -228,6 +228,113 @@ def test_api_refuses_a_report_on_another_target(tmp_path, fake_pypi):
     assert result.name == "fastlib"
 
 
+MUSL_WHEEL = "https://files.pythonhosted.org/packages/ab/cd/fastlib-2.0.0-cp313-cp313-musllinux_1_2_x86_64.whl"
+MANYLINUX_WHEEL = "https://files.pythonhosted.org/packages/ab/cd/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+PURE_WHEEL = "https://files.pythonhosted.org/packages/ab/cd/fastlib-2.0.0-py3-none-any.whl"
+SDIST = "https://files.pythonhosted.org/packages/ab/cd/fastlib-2.0.0.tar.gz"
+
+
+def test_report_without_libc_evidence_is_taken_at_face_value(tmp_path, capsys, fake_pypi):
+    """Pure-Python projects, and Alpine reports where pip built binary dependencies from sdists, carry no libc
+    evidence either way: musl and glibc targets alike are checked."""
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=PURE_WHEEL)], LINUX_313)
+    code = main([str(path), "-p", "3.13", "-t", "musl-x86_64", "--json"])
+    captured = capsys.readouterr()
+    # Exit 1, not 2: the musl target is checked (and fastlib builds from source there), not refused.
+    assert code == 1
+    assert [p["name"] for p in json.loads(captured.out)["packages"]] == ["fastlib"]
+    (source,) = load_inputs([str(path)])
+    assert not source.pip_report_musl and not source.pip_report_glibc
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64,musl-x86_64"))
+
+
+def test_report_built_from_an_sdist_is_no_libc_evidence(tmp_path):
+    """An Alpine report where pip built the binary dependency from its sdist downloaded no wheel: no evidence."""
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=SDIST), install("puredep", url=PURE_WHEEL)], LINUX_313)
+    (source,) = load_inputs([str(path)])
+    assert not source.pip_report_musl and not source.pip_report_glibc
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64,musl-x86_64"))
+
+
+def test_report_with_a_manylinux_wheel_refuses_musl(tmp_path, capsys, fake_pypi):
+    """A manylinux wheel pip downloaded is one pip on musl doesn't accept: the resolution isn't one musl pip
+    makes, so musl targets are refused. This is what keeps the glibc-made report of #720 off musl."""
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=MANYLINUX_WHEEL)], LINUX_313)
+    (source,) = load_inputs([str(path)])
+    assert source.pip_report_glibc and not source.pip_report_musl
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64"))
+    with pytest.raises(SourceError, match="pip on musl doesn't"):
+        check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="musl-x86_64"))
+
+
+def test_report_with_a_musllinux_wheel_is_checked_on_musl_and_refused_on_glibc(tmp_path):
+    """A musllinux wheel in the downloads is one pip on glibc doesn't accept: the resolution isn't one glibc pip
+    makes, so musl targets fit it and glibc ones are refused."""
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=MUSL_WHEEL), install("puredep", url=PURE_WHEEL)], LINUX_313)
+    (source,) = load_inputs([str(path)])
+    assert source.pip_report_musl and not source.pip_report_glibc
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="musl-x86_64"))
+    with pytest.raises(SourceError, match="pip on glibc doesn't"):
+        check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64"))
+
+
+def test_report_with_evidence_for_both_libcs_is_refused_on_both(tmp_path):
+    """pip run with two `--platform` values can download a musllinux-only wheel and a manylinux-only one into one
+    report: it isn't a resolution either libc's pip makes, so both families are refused."""
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=MUSL_WHEEL), install("glibclib", url=MANYLINUX_WHEEL)], LINUX_313)
+    (source,) = load_inputs([str(path)])
+    assert source.pip_report_musl and source.pip_report_glibc
+    # One refusal names every Linux target and points at a report per libc, rather than steering the user to
+    # the other family, which would be refused next.
+    for platforms in ("musl-x86_64", "linux-x86_64"):
+        with pytest.raises(SourceError, match="make one report on glibc and one on musl"):
+            check_report_targets(source, wheelgap.make_targets(python="3.13", platforms=platforms))
+    with pytest.raises(SourceError, match="checked on 3.13 linux-x86_64, 3.13 musl-x86_64"):
+        check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64,musl-x86_64"))
+
+
+def test_report_musl_refusal_names_only_the_musl_targets(tmp_path, capsys, fake_pypi):
+    path = tmp_path / "report.json"
+    make_report(path, [install("fastlib", url=MANYLINUX_WHEEL)], LINUX_313)
+    code = main([str(path), "-p", "3.13", "-t", "linux-x86_64,musl-x86_64", "--json"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "checked on 3.13 musl-x86_64" in captured.err
+    assert "linux-x86_64" not in captured.err.split("checked on")[1]
+    assert fake_pypi == []
+
+
+def test_report_a_package_named_like_a_musllinux_tag_is_no_evidence(tmp_path):
+    """The wheel filename's platform tag is the evidence, not any `musllinux` text in a package's name."""
+    path = tmp_path / "report.json"
+    url = "https://files.pythonhosted.org/packages/ab/cd/musllinux_utils-2.0.0-py3-none-any.whl"
+    make_report(path, [install("musllinux-utils", url=url)], LINUX_313)
+    (source,) = load_inputs([str(path)])
+    assert not source.pip_report_musl and not source.pip_report_glibc
+    check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64,musl-x86_64"))
+
+
+def test_report_a_wheel_tagged_for_both_libcs_is_no_evidence(tmp_path):
+    """A wheel the other libc's pip could also accept — tagged for both families, or plain linux_ — proves
+    nothing either way."""
+    for tags in (
+        "musllinux_1_2_x86_64.manylinux_2_17_x86_64",
+        "musllinux_1_2_x86_64.linux_x86_64",
+        "manylinux_2_17_x86_64.linux_x86_64",
+    ):
+        path = tmp_path / "report.json"
+        url = f"https://files.pythonhosted.org/packages/ab/cd/fastlib-2.0.0-cp313-cp313-{tags}.whl"
+        make_report(path, [install("fastlib", url=url)], LINUX_313)
+        (source,) = load_inputs([str(path)])
+        assert not source.pip_report_musl and not source.pip_report_glibc, tags
+        check_report_targets(source, wheelgap.make_targets(python="3.13", platforms="linux-x86_64,musl-x86_64"))
+
+
 def test_missing_report_file_is_an_input_error(tmp_path, capsys):
     code = main([str(tmp_path / "report.json"), "--json"])
     assert code == 2

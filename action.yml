@@ -31,6 +31,14 @@ inputs:
       workflow_run events; see the README.
     required: false
     default: "false"
+  fix:
+    description: >
+      With compare-to, say how to fix each gap that got worse, in the job summary and the comment, as --fix does: an
+      upgrade to a newer official release first, else an unofficial gap wheel, else none and why (true or false).
+      It looks the gap packages up on PyPI (only those positively from PyPI) and reads wheelgap's gap wheel list;
+      it never changes the result.
+    required: false
+    default: "true"
   github-token:
     description: The token for the pull request comment.
     required: false
@@ -54,6 +62,11 @@ outputs:
   report:
     description: With compare-to, the path of the Markdown report that went to the job summary.
     value: ${{ steps.compare.outputs.report }}
+  comment:
+    description: >
+      With compare-to, the path of the pull request comment's Markdown body: what comment: true posts or edits,
+      written whether or not it does.
+    value: ${{ steps.compare.outputs.comment }}
 
 runs:
   using: composite
@@ -109,12 +122,14 @@ runs:
         WHEELGAP_SUMMARY: ${{ inputs.summary }}
         WHEELGAP_COMPARE_TO: ${{ inputs.compare-to }}
         WHEELGAP_COMMENT: ${{ inputs.comment }}
+        WHEELGAP_FIX: ${{ inputs.fix }}
         WHEELGAP_TOKEN: ${{ inputs.comment == 'true' && inputs.github-token || '' }}
         WHEELGAP_COMMENT_AUTHOR: ${{ inputs.comment-author }}
         # From the event, through env only: never interpolated into the script.
         WHEELGAP_EVENT: ${{ github.event_name }}
         WHEELGAP_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         WHEELGAP_PR: ${{ github.event.pull_request.number }}
+        WHEELGAP_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
         set +e -f  # no globbing when args are split below
         token=$WHEELGAP_TOKEN
@@ -127,6 +142,12 @@ runs:
         case "$comment" in
           true | false) ;;
           *) fail "comment must be true or false" ;;
+        esac
+        fix=$(printf '%s' "$WHEELGAP_FIX" | tr '[:upper:]' '[:lower:]')
+        case "$fix" in
+          true) fix=(--fix) ;;
+          false) fix=() ;;
+          *) fail "fix must be true or false" ;;
         esac
         author=$WHEELGAP_COMMENT_AUTHOR
         [ -z "$author" ] || [[ "$author" =~ ^[A-Za-z0-9_-]+(\[bot\])?$ ]] \
@@ -161,7 +182,7 @@ runs:
 
         write_report() {
           "$py" "$helper" report --lockfile "$lockfile" "${base[@]}" --head "$head" --markdown "$dir/report.md" \
-            --payload "$dir/comment.json" "$@"
+            --payload "$dir/comment.json" --comment-markdown "$dir/comment.md" "$@"
         }
 
         comment_on() {
@@ -182,7 +203,12 @@ runs:
           gh_() { GH_HOST=$server GH_TOKEN=$token GH_ENTERPRISE_TOKEN=$token gh "$@" 2>> "$dir/gh.err"; }
           warn() {
             status=$(grep -oE 'HTTP [0-9]{3}' "$dir/gh.err" 2>/dev/null | tail -n 1)
-            if [ "$status" = "HTTP 403" ]; then
+            head_repo=$(printf '%s' "${WHEELGAP_HEAD_REPO:-}" | tr '[:upper:]' '[:lower:]')
+            this_repo=$(printf '%s' "${GITHUB_REPOSITORY:-}" | tr '[:upper:]' '[:lower:]')
+            if [ "$status" = "HTTP 403" ] && [ -n "$head_repo" ] && [ "$head_repo" != "$this_repo" ]; then
+              # Expected, so not a warning: GitHub gives a fork's pull_request run a read-only token.
+              echo "::notice::wheelgap: no comment, as expected for a pull request from a fork: its token is read-only. The job summary has the report and the fixes."
+            elif [ "$status" = "HTTP 403" ]; then
               echo "::warning::wheelgap: couldn't $1 (HTTP 403). The token needs pull-requests: write, which pull requests from forks don't get, and Dependabot's only when the workflow asks for it. The job summary has the report."
             else
               echo "::warning::wheelgap: couldn't $1${status:+ ($status)}. The job summary has the report."
@@ -214,6 +240,7 @@ runs:
           result=$1
           [ -f "$dir/report.md" ] || fail "the compare-to report couldn't be written"
           echo "report=$dir/report.md" >> "$GITHUB_OUTPUT"
+          [ -f "$dir/comment.md" ] && echo "comment=$dir/comment.md" >> "$GITHUB_OUTPUT"
           if [ "$WHEELGAP_SUMMARY" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             cat "$dir/report.md" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -264,7 +291,7 @@ runs:
         # wheelgap's stderr quotes the lockfiles (and git's messages), so it reaches the log only with anything the
         # runner would read as a workflow command defused.
         _WHEELGAP_ACTION_SUGGEST=$suggestions pipx run --spec "$GITHUB_ACTION_PATH" wheelgap diff \
-          "$old" "$lockfile" "$@" --json > "$dir/diff.json" 2> "$dir/diff.err"
+          "$old" "$lockfile" "$@" "${fix[@]}" --json > "$dir/diff.json" 2> "$dir/diff.err"
         code=$?
         "$py" "$helper" log "$dir/diff.err" || echo "::error::wheelgap: couldn't show wheelgap's messages"
         # The helper's exit code is the result: 0 or 1 only when diff's exit code and report agree, else 2.
