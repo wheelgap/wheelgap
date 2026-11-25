@@ -4810,6 +4810,24 @@ def test_dockerfile_requirements_passes_over_a_global_install_of_named_packages(
     assert lines == [5] and report.warnings == [] and list(report.passed_over) == ["programs"]
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["bundle config set --local path vendor/bundle", "bundle config set without development"],
+)
+@pytest.mark.parametrize("before", [True, False])
+@pytest.mark.parametrize("dependencies", [True, False])
+def test_dockerfile_requirements_passes_over_bundle_config(tmp_path, command, before, dependencies):
+    head = "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"
+    config = f"RUN {command}\n"
+    path = _context(tmp_path, head + (config + _INSTALL if before else _INSTALL + config))
+    report = InputsReport()
+    found = dockerfile_requirements(path, report=report, constraints={}, dependencies=dependencies)
+    assert [line for line, _ in found] == [5 if before else 4]
+    assert report.warnings == []
+    assert report.scripts == []
+    assert report.passed_over == {"programs": [4 if before else 5]}
+
+
 # npm runs the root package.json's lifecycle scripts only for an install with no package named (#725), so a
 # local install of named packages is a plain program too.
 @pytest.mark.parametrize("run", ["npm install left-pad --no-save", "npm i left-pad", "npm add left-pad@1"])
