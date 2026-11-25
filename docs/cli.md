@@ -617,9 +617,25 @@ pyproject.toml based projects` with the names on the `╰─> NAME` line after i
 the indented `Collecting` lines of the pip that installs build dependencies don't count), in the same pip run: a
 column-0 `Successfully installed` ends a run, so a later run's failure without its own `Collecting` line is an error.
 pip doesn't mark where a run starts, so give `--from-log` the log of one pip run. uv's log doesn't name the index it
-used, so a uv failure is checked on PyPI (or the index wheelgap is given). It's an error rather than a guess when the
-log doesn't name a version (`pip install .` logs `Processing` instead, and `pip install -q` hides `Collecting`: check
-`NAME==VERSION` directly then), when it names more than one or pip backtracked (`INFO: pip is looking at multiple
+used, so a uv failure is checked on PyPI (or the index wheelgap is given).
+
+**After 0.14.0:** pip's failures before it builds a wheel are read too: `× Getting requirements to build wheel did not
+run successfully`, `× Preparing metadata (pyproject.toml) did not run successfully` and `error:
+metadata-generation-failed` name no package, so the failed one is the sdist (`NAME-VERSION.tar.gz` or `.zip`) that the
+`Downloading` or `Using cached` lines after the last column-0 `Collecting` line name for that package (PyYAML 5.4's
+Cython 3 break is one); without such an sdist it's an error. When pip's lines don't name the version (`pip install -q`
+hides `Collecting`, or the log's start was cut off), an exact pin on a `pip install`, `uv pip install` or `RUN pip
+install` line in the log gives it (`pip install 'grpcio ==1.73.1'` at a shell prompt, a Dockerfile's `RUN pip install
+tokenizers==0.20.0`); with no version anywhere, the latest release is checked, with a note (`the log doesn't name the
+version of NAME that failed to build; checked NAME X, the latest release`). It's still an error when pip's `Processing`
+or `Obtaining` line says the package may be a local project (`pip install .`), whose name PyPI may give another
+project; check `NAME==VERSION` directly then. Docker BuildKit's output works too: its `#12 28.56 ` prefix
+(`--progress=plain`) and the `28.56 ` prefix of the failed step's excerpt are skipped, as GitHub Actions timestamps
+are. A failure inside the pip that installs build dependencies (`× pip subprocess to install build dependencies did
+not run successfully`) isn't read.
+
+It's an error rather than a guess when the log's install commands pin more than one version, when it names more than
+one or pip backtracked (`INFO: pip is looking at multiple
 versions of ...`), when it collects the package again without a version after naming one, when the package came from a
 URL or a path, when pip's `Looking in indexes:` names another index than https://pypi.org/simple or the log has `Looking
 in links:` (`--find-links`, with or without `--no-index`) and wheelgap isn't given an index too (`--index-url`,

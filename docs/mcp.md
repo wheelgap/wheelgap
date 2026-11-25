@@ -86,7 +86,12 @@ the command line. `list_targets` and `suggest_targets` contact nothing. Like whe
   uv's ``Failed to build `NAME==VERSION` ``, Poetry's build-backend note (normal
   or `-v` output) and `pdm install -v` output. PDM's normal output is refused,
   since it doesn't say which index a package came from; colour codes and GitHub
-  Actions timestamps are fine. Each package that failed to build (at most 50)
+  Actions timestamps are fine. **After 0.14.0:** Docker BuildKit output (`#12 28.56 `
+  and `28.56 ` prefixes) is fine too; pip's `Getting requirements to build wheel` and
+  `Preparing metadata` failures count, for the sdist collected last; a version
+  pip's lines don't name comes from an exact pin on a `pip install` line in the
+  log; and with no version anywhere the latest release is checked, with a `notes`
+  entry saying so, instead of a tool error. Each package that failed to build (at most 50)
   is checked at the version the log names, as `check_package` does with
   `explain: true`. Pass `python` and `targets` for the machine the install ran
   on: the log doesn't say, so without them the server's Python and the default

@@ -1,0 +1,14 @@
+# Trimmed from https://github.com/huggingface/tokenizers/issues/1639: the Dockerfile, then the failed step's excerpt
+# that `docker build` prints, each line prefixed with BuildKit's seconds.
+FROM python:3.13-rc-bookworm
+RUN pip install tokenizers==0.20.0
+
+28.56       error: could not compile `tokenizers-python` (lib) due to 2 previous errors
+28.56       💥 maturin failed
+28.56         Caused by: Failed to build a native library through cargo
+28.56       [end of output]
+28.56   
+28.56   note: This error originates from a subprocess, and is likely not a problem with pip.
+28.56   ERROR: Failed building wheel for tokenizers
+28.56 Failed to build tokenizers
+28.67 ERROR: ERROR: Failed to build installable wheels for some pyproject.toml based projects (tokenizers)

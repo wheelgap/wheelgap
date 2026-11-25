@@ -62,7 +62,7 @@ from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
-from .install_log import FIND_LINKS, NO_FAILURE, OTHER_INDEX, LogError, failed_builds
+from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .suggest_targets import suggest, to_json
@@ -510,9 +510,12 @@ TOOLS: list[dict[str, Any]] = [
             "wheelgap --from-log reads it: pip's 'Failed to build' summary, with each version from its Collecting, "
             "Downloading and Using cached lines; uv's 'Failed to build `NAME==VERSION`'; Poetry's build-backend "
             "note, normal or -v output; and pdm install -v output (PDM's normal output doesn't say which index a "
-            "package came from, so it's refused). Colour codes and GitHub Actions timestamps are fine. Each "
-            "package that failed to build (at most 50) is checked at the version the log names, as check_package "
-            "does with explain: true. Returns targets, ok (true only if every failed package installs without "
+            "package came from, so it's refused); pip's 'Getting requirements to build wheel' and 'Preparing "
+            "metadata' failures count, for the sdist collected last. Colour codes, GitHub Actions timestamps and "
+            "Docker BuildKit prefixes are fine. Each package that failed to build (at most 50) is checked at the "
+            "version the log names (pip's lines, else an exact pin on a pip install line in the log; with no version "
+            "anywhere, the latest release, with a note saying so), as check_package does with explain: true. "
+            "Returns targets, ok (true only if every failed package installs without "
             "building on every target), packages (one entry per failed package, in the order the log names them, "
             "in check_package's shape: name, version, results, gaps, ok, rejected, rejected_omitted, via, direct, "
             "issues_url, and suggest and last_with_wheel when a gap's releases were looked up), assumes and notes "
@@ -1335,7 +1338,10 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
             f"the log doesn't say which Python and platform the install ran on, so this checked {' and '.join(assumed)}"
             ": pass python and targets for the machine the install ran on"
         )
+    unversioned = {canonicalize_name(name) for name, version in failures if version is None}
     for r in results:
+        if canonicalize_name(r.name) in unversioned and r.version:
+            notes.append(LATEST_NOTE.format(name=r.name, version=r.version))
         out: dict[str, Any] = r.to_dict(explain=True)
         _cap_rejected(out)
         out["ok"] = r.ok

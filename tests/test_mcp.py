@@ -3046,13 +3046,27 @@ def test_explain_install_failure_log_with_no_failure_is_an_error(fake_pypi):
 
 
 def test_explain_install_failure_refusal_gives_the_tools_advice(fake_pypi):
-    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    result = explain_failure(log=install_log("pip-unclear-version.log"), python="3.13", targets=["win-amd64"])
     assert result["isError"] is True
     text = result["content"][0]["text"]
-    assert text.startswith("the log doesn't say which version of nowheels failed to build")
-    assert "(call check_package for nowheels with the version)" in text
+    assert text.startswith("the log collects forked again without a version")
+    assert "(call check_package for forked with the version)" in text
     assert "--from-log" not in text and "==VERSION" not in text
     assert fake_pypi == []
+
+
+def test_explain_install_failure_without_a_version_checks_the_latest(fake_pypi):
+    # #736: an agent gets an answer, not an error, when the log names no version.
+    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    assert result["isError"] is False
+    (pkg,) = result["structuredContent"]["packages"]
+    assert (pkg["name"], pkg["version"], pkg["gaps"]) == ("nowheels", "0.9", ["3.13 win-amd64"])
+    assert any(
+        n.startswith(
+            "the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9, the latest"
+        )
+        for n in result["structuredContent"]["notes"]
+    )
 
 
 @pytest.mark.parametrize(

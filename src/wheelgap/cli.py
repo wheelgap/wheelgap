@@ -58,7 +58,7 @@ from .dockerfile import (
     read_dockerfile,
 )
 from .github import github_annotations, relative_path, workflow_command
-from .install_log import failed_builds, log_source, read_log
+from .install_log import LATEST_NOTE, failed_builds, log_source, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -2597,7 +2597,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         if args.from_log is not None:
             failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
-            listed = ", ".join(f"{name} {version}" for name, version in failures)
+            listed = ", ".join(
+                f"{name} {version}" if version else f"{name} (the log doesn't name the version)"
+                for name, version in failures
+            )
             print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
             sources = [log_source(failures)]
         else:
@@ -3105,7 +3108,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     gaps = [r for r in rows if not r.ok]
     if args.from_log is not None:
         multi_py = len({t.python for t in targets}) > 1
+        unversioned = {canonicalize_name(name) for name, version in failures if version is None}
         for r in rows:
+            if canonicalize_name(r.package.name) in unversioned and r.package.version:
+                print(
+                    f"wheelgap: note: {LATEST_NOTE.format(name=r.package.name, version=r.package.version)}",
+                    file=sys.stderr,
+                )
             if fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]:
                 print(
                     f"wheelgap: note: the install log says {r.package.name} failed to build, but "
