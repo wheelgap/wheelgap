@@ -3032,6 +3032,17 @@ def test_explain_install_failure_notes_where_the_log_likely_comes_from(fake_pypi
     ]
 
 
+def test_explain_install_failure_pypy_log_gets_the_cpython_only_note(fake_pypi):
+    data = explain_failure(log=install_log("pip24-pypy.log"), python="3.13", targets=["linux-x86_64"])[
+        "structuredContent"
+    ]
+    assert {p["name"]: p["results"] for p in data["packages"]} == {"fastlib": {"3.13 linux-x86_64": "wheel"}}
+    assert data["notes"] == [
+        "the install log's build ran on PyPy, and wheelgap checks CPython wheels only: the answers are for "
+        "CPython and don't say why the build failed there (PyPy wheels carry pp tags, such as pp311, not cp ones)"
+    ]
+
+
 @pytest.mark.parametrize(
     ("arguments", "assumed"),
     [

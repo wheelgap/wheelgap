@@ -1,0 +1,21 @@
+Collecting fastlib (from -r requirements.txt (line 1))
+  Downloading fastlib-2.0.0.tar.gz (30 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+Building wheels for collected packages: fastlib
+  Building wheel for fastlib (pyproject.toml): started
+  Building wheel for fastlib (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+
+  × Building wheel for fastlib (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [4 lines of output]
+      running bdist_wheel
+      running venv/pypy/bin/pypy3 setup.py bdist_wheel
+      error: the configured PyPy interpreter version (3.11) is lower than PyO3's minimum supported PyPy version (3.12)
+      [end of output]
+
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for fastlib
+Failed to build fastlib
+ERROR: Failed to build installable wheels for some pyproject.toml based projects (fastlib)

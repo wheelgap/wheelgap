@@ -107,7 +107,10 @@ the command line. `list_targets` and `suggest_targets` contact nothing. Like whe
   and `last_with_wheel` when they were looked up, in one lookup for all of
   them); `ok` is true only if every one installs without building on every
   target. A failed package with a wheel for a checked target gets a note that
-  the log likely comes from another platform or Python. A log it can't read
+  the log likely comes from another platform or Python — unless the log's build
+  ran on PyPy (a PyPy interpreter in its paths, or a build error only a PyPy
+  build prints): then the note says wheelgap checks CPython wheels only, so the
+  answers don't say why the build failed there. A log it can't read
   with certainty is a tool error, never a guess: one that names no failed build,
   one where which version failed isn't clear, or one that installed from another
   index than PyPI (pip's `Looking in indexes:`, PDM's build link) or with

@@ -174,6 +174,20 @@ def _decode(f: BinaryIO) -> str:
     return bytes(buf).decode(encoding, "replace").removeprefix("\ufeff")
 
 
+# Evidence the install ran on PyPy rather than CPython: the PyO3 build script's error, which it only prints when
+# building for PyPy (`the configured PyPy interpreter version (3.11) ...`), or a PyPy interpreter executable in a
+# path (`venv/pypy/bin/pypy3`, `/usr/bin/pypy3.11`). Prose that merely mentions PyPy doesn't count: the consequence
+# of a false positive is saying the build ran somewhere it didn't, which is a wrong answer too.
+_PYPY = re.compile(r"the configured PyPy interpreter version|[\\/](pypy3(?:\.\d+)?|pypy)(?:\s|$|[):;])")
+
+
+def ran_on_pypy(text: str) -> bool:
+    """Whether the log's install ran on PyPy: an interpreter path's `pypy`/`pypy3` executable, or a build error only
+    a PyPy build prints. wheelgap checks CPython wheels only, so the caller must not read the log's failures as
+    CPython gaps."""
+    return bool(_PYPY.search(text))
+
+
 def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str | None]]:
     """The (name, version) of each package the log says failed to build, in the order the log names them. The version
     is the one uv names; for pip, the one the `Collecting`, `Downloading` and `Using cached` lines since the package's

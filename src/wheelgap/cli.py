@@ -58,7 +58,7 @@ from .dockerfile import (
     read_dockerfile,
 )
 from .github import github_annotations, relative_path, workflow_command
-from .install_log import LATEST_NOTE, failed_builds, log_source, read_log
+from .install_log import LATEST_NOTE, failed_builds, log_source, ran_on_pypy, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -2599,7 +2599,16 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         if args.from_log is not None:
-            failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
+            log_text = read_log(args.from_log)
+            failures = failed_builds(log_text, other_index=origin.other_index(index_url) is not None)
+            on_pypy = ran_on_pypy(log_text)
+            if on_pypy:
+                print(
+                    "wheelgap: note: the install log's build ran on PyPy, and wheelgap checks CPython wheels "
+                    "only: the answers are for CPython and don't say why the build failed there (PyPy wheels "
+                    "carry pp tags, such as pp311, not cp ones)",
+                    file=sys.stderr,
+                )
             listed = ", ".join(
                 f"{name} {version}" if version else f"{name} (the log doesn't name the version)"
                 for name, version in failures
@@ -3122,7 +3131,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     {"name": r.package.name, "version": r.package.version, "kind": "latest", "message": message}
                 )
                 print(f"wheelgap: note: {message}", file=sys.stderr)
-            if fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]:
+            if not on_pypy and (
+                fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]
+            ):
                 print(
                     f"wheelgap: note: the install log says {r.package.name} failed to build, but "
                     f"{r.package.name} {r.package.version} has a wheel for {', '.join(fits)}: the log likely "

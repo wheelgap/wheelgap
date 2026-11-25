@@ -62,7 +62,7 @@ from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
-from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds
+from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds, ran_on_pypy
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .suggest_targets import suggest, to_json
@@ -1349,6 +1349,12 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
             f"the log doesn't say which Python and platform the install ran on, so this checked {' and '.join(assumed)}"
             ": pass python and targets for the machine the install ran on"
         )
+    on_pypy = ran_on_pypy(log)
+    if on_pypy:
+        notes.append(
+            "the install log's build ran on PyPy, and wheelgap checks CPython wheels only: the answers are for "
+            "CPython and don't say why the build failed there (PyPy wheels carry pp tags, such as pp311, not cp ones)"
+        )
     unversioned = {canonicalize_name(name) for name, version in failures if version is None}
     for r in results:
         if canonicalize_name(r.name) in unversioned and r.version:
@@ -1360,7 +1366,7 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
         if (way := ways.get(id(r))) is not None:
             out.update(_way_out(way))
         packages.append(out)
-        if fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]:
+        if not on_pypy and (fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]):
             # As --from-log's note: a wheel for a checked target means the install didn't run there.
             notes.append(
                 f"the install log says {r.name} failed to build, but {r.name} {r.version} has a wheel for "

@@ -675,7 +675,9 @@ failed`; and a PDM log from a console that can't print Unicode, where PDM writes
 PDM versions whose diagnostics differ are refused too.
 
 A note lists the packages the log says failed, and another says when one has a wheel for a checked target after all:
-then the log likely comes from another platform or Python than `-p` and `-t`. `--no-suggest` turns `--suggest` off.
+then the log likely comes from another platform or Python than `-p` and `-t`. A log whose build ran on PyPy (a PyPy
+interpreter in its paths, or a build error only a PyPy build prints) gets a different note instead: wheelgap checks
+CPython wheels only, so the answers don't say why the build failed there. `--no-suggest` turns `--suggest` off.
 `quiet = true` in `[tool.wheelgap]` doesn't apply to it, as `--no-quiet` overrides it; `--quiet` is an error, as with
 `--explain`, unless the output is `--json` or `--markdown`. It takes no other inputs, and can't be combined with
 `--dist`, `--deps`, `--environment`, `--suggest-targets`, `--list-targets` or `--clear-cache`.

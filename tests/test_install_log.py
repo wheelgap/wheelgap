@@ -15,6 +15,7 @@ from wheelgap.install_log import (
     OTHER_INDEX,
     LogError,
     failed_builds,
+    ran_on_pypy,
     read_log,
 )
 from wheelgap.sources import SourceError
@@ -62,6 +63,31 @@ POETRY_NOTE = (
     "following issues with"
 )
 OTHER_PACKAGE_OUTPUT = ["Failed to build other_package", "  ✖ Install other_package 9.9 failed"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "error: the configured PyPy interpreter version (3.11) is lower than PyO3's minimum supported PyPy version"
+        " (3.12)",
+        "running venv/pypy/bin/pypy3 setup.py bdist_wheel",
+        "  /usr/bin/pypy3.11 -m pip install fastlib",
+    ],
+)
+def test_pypy_evidence_is_detected(line):
+    assert ran_on_pypy(f"Collecting fastlib\n{line}\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "PyPy is mentioned in a build's prose output",
+        "venv/pypy/bin/python -m pip install fastlib",  # a venv folder's name is no evidence of the interpreter
+        "Collecting fastlib",
+    ],
+)
+def test_mere_mentions_of_pypy_are_not_evidence(line):
+    assert not ran_on_pypy(f"Collecting fastlib\n{line}\n")
 
 
 @pytest.mark.parametrize(
@@ -614,6 +640,21 @@ def test_a_failed_package_with_a_wheel_for_the_target_gets_a_note(capsys, fake_p
         "linux-x86_64: the log likely comes from another platform or Python than the one checked (-p, -t)\n"
     ) in err
     assert "says laggard failed to build, but" not in err
+
+
+def test_a_pypy_log_gets_the_cpython_only_note_instead(capsys, fake_pypi):
+    code, out, err = run(capsys, *from_log("pip24-pypy.log", "-t", "linux-x86_64", "--json"))
+    assert code == 0  # fastlib has a CPython wheel for the target; the check itself is unchanged
+    (pkg,) = json.loads(out)["packages"]
+    assert (pkg["name"], pkg["results"]) == ("fastlib", {"linux-x86_64": "wheel"})
+    assert (
+        "wheelgap: note: the install log's build ran on PyPy, and wheelgap checks CPython wheels only: "
+        "the answers are for CPython and don't say why the build failed there (PyPy wheels carry pp tags, "
+        "such as pp311, not cp ones)\n"
+    ) in err
+    # Never the CPython reading: the log doesn't come from another -p/-t, it comes from PyPy.
+    assert "has a wheel" not in err
+    assert "another platform" not in err
 
 
 def test_a_package_named_like_a_folder_is_still_a_pypi_name(capsys, fake_pypi, tmp_path, monkeypatch):
