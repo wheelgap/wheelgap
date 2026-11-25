@@ -30,6 +30,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import cutoff as cutoffs
 from .cutoff import describe, is_duration, parse_cutoff
+from .targets import PLATFORMS
 
 if TYPE_CHECKING:
     from .targets import Target
@@ -271,6 +272,10 @@ class Source:
     found: DirectoryInput | None = None
     # A pip installation report captures one generating environment, not a cross-platform dependency graph.
     pip_report_env: dict[str, str] | None = None
+    # Its downloads include a musllinux-only wheel, which pip on glibc doesn't accept, or a manylinux-only one,
+    # which pip on musl doesn't accept: proof the resolution isn't one the other libc's pip makes.
+    pip_report_musl: bool = False
+    pip_report_glibc: bool = False
     # Requirements for --deps to resolve: package names on the command line, selected pyproject.toml
     # requirements, or a requirements file's requirement lines.
     specs: list[str] = field(default_factory=list)
@@ -606,6 +611,14 @@ def _refuse_script_build_restrictions(path: Path) -> None:
         )
 
 
+def tool_table(data: dict, path: Path | str) -> dict:
+    """Return the [tool] table from parsed TOML, or raise SourceError when tool is not a table."""
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise SourceError(f"{path}: [tool] must be a table")
+    return tool
+
+
 def _uv_build_restrictions(path: Path, source: Source) -> None:
     """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
 
@@ -628,9 +641,7 @@ def _uv_build_restrictions(path: Path, source: Source) -> None:
     except tomllib.TOMLDecodeError as exc:
         raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
     setting_table = "uv.toml" if standalone else "[tool.uv]"
-    tool = data.get("tool", {})
-    if not isinstance(tool, dict):
-        raise SourceError(f"{config_path}: [tool] must be a table")
+    tool = tool_table(data, config_path)
     uv = data if standalone else tool.get("uv", {})
     if not isinstance(uv, dict):
         raise SourceError(f"{config_path}: {setting_table} must be a table")
@@ -3467,6 +3478,22 @@ def parse_pip_report(path: Path) -> Source:
             host = parsed.hostname if parsed else None
         except ValueError as e:
             raise SourceError(f"{path.name}: {name} has invalid download URL") from e
+        if parsed and parsed.path.endswith(".whl"):
+            try:
+                *_, wheel_tags = parse_wheel_filename(unquote(parsed.path.rsplit("/", 1)[-1]))
+            except InvalidWheelFilename:
+                pass
+            else:
+                platforms = {tag.platform for tag in wheel_tags}
+                # Evidence either way only when the other libc's pip couldn't accept the file: a wheel tagged
+                # for both families (or plain linux_, which both accept) is no evidence.
+                musllinux = any(t.startswith("musllinux") for t in platforms)
+                manylinux = any(t.startswith("manylinux") for t in platforms)
+                plain = any(t.startswith("linux") for t in platforms)
+                if musllinux and not manylinux and not plain:
+                    source.pip_report_musl = True
+                if manylinux and not musllinux and not plain:
+                    source.pip_report_glibc = True
         public_file = bool(parsed and parsed.scheme == "https" and host == "files.pythonhosted.org")
         skip = None
         if info.get("vcs_info") is not None:
@@ -3525,6 +3552,32 @@ def check_report_targets(source: Source, targets: Iterable[Target]) -> None:
             f"install other packages, so it can't be checked on {', '.join(other)}: check that target only, "
             "or make a report on each target"
         )
+    # musl and glibc record the same environment, but pip on musl accepts musllinux wheels and not manylinux
+    # ones, so it can install other packages. A wheel only one libc's pip accepts is proof the resolution isn't
+    # one the other's makes, so the other family is refused; a report with no such wheel either way is taken at
+    # face value, and one with both (pip run with two --platform values) is refused for both.
+    if source.pip_report_musl and source.pip_report_glibc:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] in ("manylinux", "musllinux")]:
+            raise SourceError(
+                f"{source.label}: this report downloaded both a musllinux wheel pip on glibc doesn't accept and a "
+                "manylinux wheel pip on musl doesn't accept (pip run with two --platform values?), so it isn't a "
+                f"resolution either libc's pip makes — it can't be checked on {', '.join(wrong)}: make one report "
+                "on glibc and one on musl"
+            )
+    if source.pip_report_musl:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] == "manylinux"]:
+            raise SourceError(
+                f"{source.label}: a download in this report is a musllinux wheel, which pip on glibc doesn't "
+                "accept, so this resolution isn't one glibc pip makes — it can't be checked on "
+                f"{', '.join(wrong)}: check a musl target, or make a report on glibc"
+            )
+    if source.pip_report_glibc:
+        if wrong := [t.label(True) for t in targets if PLATFORMS[t.platform][0] == "musllinux"]:
+            raise SourceError(
+                f"{source.label}: a download in this report is a manylinux wheel, which pip on musl doesn't "
+                "accept, so this resolution isn't one musl pip makes — it can't be checked on "
+                f"{', '.join(wrong)}: check a glibc target, or make a report on musl"
+            )
 
 
 def _conda_package_name(spec: str) -> str:

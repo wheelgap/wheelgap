@@ -59,7 +59,7 @@
                     },
                     "kind": {
                         "type": "string",
-                        "description": "What was left out or assumed: image-not-read, image-libc, passed-over:CLASS, arg-unset, arg-value or system-python-packages."
+                        "description": "What was left out or assumed: image-not-read, image-libc, passed-over:CLASS, arg-unset, arg-value, system-python-packages or kept-version."
                     },
                     "message": {"type": "string", "description": "The note as printed on stderr."},
                     "lines": {

@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 from conftest import FAKE_INDEX
 
-from wheelgap import suggest
+from wheelgap import fix, suggest
 from wheelgap.check import CELL
+from wheelgap.cli import main as cli_main
 from wheelgap.diff import main as diff_main
 from wheelgap.pypi import DEFAULT_INDEX
 
@@ -430,3 +431,270 @@ def test_a_problem_report_when_diff_never_ran(tmp_path, capsys):
     assert ac.main([*argv, "--markdown", str(md)]) == 2
     text = html.unescape(md.read_text(encoding="utf-8"))
     assert "with the base branch. The check couldn't run: couldn't fetch the base commit</p>" in text
+
+
+# The gate's fix (wheelgap diff --fix): what --fix says for the new lockfile, per listed cell.
+GAP_WHEEL = "nativeext-0.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+
+
+@pytest.fixture
+def armlib_upgrade(monkeypatch):
+    """armlib 1.6.0 has both wheels again; nativeext has no newer release on the index."""
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "armlib",
+        {
+            "1.6.0": [
+                "armlib-1.6.0-cp313-cp313-musllinux_1_2_aarch64.whl",
+                "armlib-1.6.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+            ]
+        },
+    )
+    monkeypatch.setitem(FAKE_INDEX, "nativeext", {"0.3": ["nativeext-0.3.tar.gz"]})
+
+
+def test_fix_reasons_and_notes_match_fix():
+    assert ac.FIX_REASONS == fix.REASON_TEXT
+    assert ac.RESOLVE_NOTE == fix.RESOLVE_NOTE
+
+
+def test_diff_fix_is_exactly_what_fix_says_for_the_new_lockfile(fake_pypi, gap_wheels, capsys, armlib_upgrade):
+    gap_wheels.add("nativeext", "0.3", GAP_WHEEL)
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--fix", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert cli_main([new, *ARGS, "--fix", "--json"]) == 1
+    main = {p["name"]: p.get("fix", {}) for p in json.loads(capsys.readouterr().out)["packages"]}
+    armlib = data["worse"][0]["targets"]["musl-aarch64"]["fix"]
+    assert armlib == main["armlib"]["musl-aarch64"]
+    assert armlib["kind"] == "upgrade" and armlib["version"] == "1.6.0"
+    assert "run uv lock --upgrade-package armlib, then uv sync" in armlib["how"]
+    nativeext = data["new"][0]["targets"]
+    assert {t: side["fix"] for t, side in nativeext.items()} == main["nativeext"]
+    assert nativeext["linux-x86_64"]["fix"]["kind"] == "gap_wheel"
+    assert nativeext["musl-aarch64"]["fix"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": False}
+    assert data["fix_summary"] == {
+        "gaps": 3,
+        "upgrade": 1,
+        "gap_wheel": 1,
+        "none": 1,
+        "not_looked_up": 0,
+        "uv_may_fork": 0,
+    }
+
+
+def test_diff_fix_looks_up_only_the_listed_packages(fake_pypi, gap_wheels, capsys, armlib_upgrade, tmp_path):
+    # nativeext's gaps are on both sides, so they're unchanged: no lookup, no fix, no fix_summary entry.
+    base = (FIXTURES / "base" / "uv.lock").read_text(encoding="utf-8")
+    head = (FIXTURES / "head" / "uv.lock").read_text(encoding="utf-8")
+    nativeext = head[head.index('[[package]]\nname = "nativeext"') : head.index('[[package]]\nname = "purewheel"')]
+    old = tmp_path / "old" / "uv.lock"
+    old.parent.mkdir()
+    base = base.replace('[[package]]\nname = "purewheel"', nativeext + '[[package]]\nname = "purewheel"')
+    old.write_text(base.replace('{ name = "armlib" },', '{ name = "armlib" },\n    { name = "nativeext" },'))
+    assert diff_main([str(old), str(FIXTURES / "head" / "uv.lock"), *ARGS, "--fix", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert [p["name"] for p in data["worse"]] == ["armlib"] and data["new"] == []
+    assert fake_pypi == [f"{DEFAULT_INDEX}/armlib/json"]
+    assert data["fix_summary"]["gaps"] == 1
+
+
+def test_diff_fix_nothing_worse_looks_nothing_up(fake_pypi, gap_wheels, capsys):
+    head = str(FIXTURES / "head" / "uv.lock")
+    assert diff_main([head, head, *ARGS, "--fix", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert fake_pypi == [] and gap_wheels.calls == 0
+    assert data["fix_summary"]["gaps"] == 0
+
+
+def test_diff_fix_text_is_the_fix_section(fake_pypi, capsys, armlib_upgrade):
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--fix"]) == 1
+    out = capsys.readouterr().out
+    assert "1 package got worse, 1 new package has gaps.\n\n--fix: 3 gaps (2 packages × their targets): 1 can be" in out
+    assert "  armlib 1.5.0 -> 1.6.0: musl-aarch64\n" in out
+
+
+def test_diff_fix_failure_keeps_the_result(monkeypatch, fake_pypi, capsys):
+    def fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fix, "plan", fail)
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--fix", "--json"]) == 1
+    out, err = capsys.readouterr()
+    data = json.loads(out)
+    assert "--fix couldn't work out the fixes (RuntimeError)" in err
+    assert not ac.has_fixes(data) and data["summary"] == {"worse": 1, "new": 1}
+
+
+def test_diff_fix_refuses_deps(capsys):
+    assert diff_main(["a==1", "a==2", "--deps", "--fix", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["message"] == "--fix works on two lockfiles, not with --deps"
+
+
+def test_the_report_shows_each_fix_and_how(fake_pypi, gap_wheels, capsys, armlib_upgrade):
+    gap_wheels.add("nativeext", "0.3", GAP_WHEEL)
+    old, new = [str(FIXTURES / side / "uv.lock") for side in ("base", "head")]
+    assert diff_main([old, new, *ARGS, "--fix", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    text = ac.report(data, "", "uv.lock", "1a2b3c4", base_branch=True, head="9f8e7d6")
+    lines = text.splitlines()
+    assert lines[5] == "<tr><th>Package</th><th>Version</th><th>Target</th><th>Status</th><th>Fix</th></tr>"
+    assert lines[6].endswith("<td>✓ → ● source</td><td>upgrade to <code>1&#46;6&#46;0</code></td></tr>")
+    assert lines[7].endswith(f"<td>(new) → ● source</td><td>an unofficial gap wheel: {ac.code(GAP_WHEEL)}</td></tr>")
+    assert lines[8].endswith("<td>(new) → ● source</td><td>no fix yet: no newer release has a wheel</td></tr>")
+    how = lines[lines.index("</table>") + 1 :]
+    assert how[:3] == ["", "<p>How to fix:</p>", "<ul>"] and how[-1] == "</ul>"
+    shown = html.unescape(text)
+    assert f"<li><code>{armlib_how(data)}</code></li>" in shown and "run uv lock --upgrade-package armlib" in shown
+    assert f"<li>{fix.RESOLVE_NOTE}</li>" in shown
+    assert "Gap wheels are unofficial" in text
+
+
+def armlib_how(data):
+    return data["worse"][0]["targets"]["musl-aarch64"]["fix"]["how"]
+
+
+@pytest.mark.parametrize(
+    "entry, shown",
+    [
+        ({"kind": "upgrade", "version": "2.0", "how": "x", "constraint": None, "gap_wheel": None}, "upgrade to 2.0"),
+        (
+            {
+                "kind": "upgrade",
+                "version": "2.0",
+                "constraint": {
+                    "file": "pyproject.toml",
+                    "requirements": ["a<2"],
+                    "allows": False,
+                    "via": "requirement",
+                },
+                "gap_wheel": {"wheel": "a.whl"},
+            },
+            "upgrade to 2.0 (needs pyproject.toml's a<2 relaxed); if you can't, an unofficial gap wheel",
+        ),
+        (
+            {
+                "kind": "upgrade",
+                "version": "2.0",
+                "constraint": {"file": "r.txt", "requirements": ["a==1"], "allows": False, "via": "constraint"},
+            },
+            "upgrade to 2.0 (needs a==1 in the -c constraints of r.txt relaxed)",
+        ),
+        ({"kind": "upgrade", "version": "2.0", "constraint": {"allows": True}}, "upgrade to 2.0"),
+        ({"kind": "none", "reason": "loses_wheel"}, "no fix yet: every newer release with a wheel drops one"),
+        ({"kind": "none", "reason": "no_newer_release", "abi3_only": True}, "; only abi3 wheels, which free-threaded"),
+        ({"kind": "none", "reason": "not_looked_up"}, "newer releases weren't looked up (the log says why)"),
+        ({"kind": "none", "reason": "<b>new</b>"}, "no fix yet: <b>new</b>"),
+        ({"kind": "@octocat"}, "@octocat"),
+        (None, ""),
+        ("upgrade", ""),
+    ],
+)
+def test_fix_cell(entry, shown):
+    cell = ac.fix_cell(entry)
+    assert shown in html.unescape(re.sub(r"</?code>", "", cell))
+    assert "<b>" not in cell and "@" not in cell  # anything from the report is escaped, in <code>
+
+
+def test_hostile_fix_text_stays_inert():
+    hostile = "@octocat [x](https://evil.example) </code></td></table>\n\n# hi |"
+    fix_entry = {
+        "kind": "upgrade",
+        "version": hostile,
+        "how": hostile,
+        "constraint": {"file": hostile, "requirements": [hostile], "allows": False, "via": "requirement"},
+        "gap_wheel": None,
+    }
+    worse = worse_entry()
+    worse["targets"]["linux-x86_64"]["fix"] = fix_entry
+    new = new_entry()
+    new["targets"]["linux-x86_64"]["fix"] = {"kind": "gap_wheel", "wheel": hostile}
+    text = ac.report(diff_report(worse=[worse], new=[new]), "", "uv.lock", "main")
+    table = text[text.index("<table>") : text.index("</table>")]
+    assert "" not in table.splitlines()  # a blank line would end the HTML block
+    assert table.count("<td>") == 10 and table.count("<tr>") == 3
+    assert "@" not in text and "|" not in text and "\n#" not in text and "](" not in text
+    assert text.count("</code>") == text.count("<code>")
+    for piece in re.findall(r"<code>(.*?)</code>", text):
+        assert INERT.match(piece)
+
+
+def test_how_to_fix_never_displaces_comparison_rows():
+    worse = worse_entry()
+    worse["targets"]["linux-x86_64"]["fix"] = {"kind": "upgrade", "version": "2.0", "how": "a" * 1500}
+    data = diff_report(worse=[worse], new=[new_entry()])
+    small = ac.report(data, "", "uv.lock", "main", budget=900)
+    assert "<code>nativeext</code>" in small and "How to fix" not in small and len(small) <= 900
+    assert "How to fix" in ac.report(data, "", "uv.lock", "main")
+
+
+def test_the_comment_says_resolved_but_the_summary_does_not(tmp_path, capsys):
+    (tmp_path / "diff.json").write_text(json.dumps(diff_report()), encoding="utf-8")
+    md, body = tmp_path / "report.md", tmp_path / "comment.md"
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", "0", "--lockfile", "uv.lock"]
+    argv += ["--base", "main", "--markdown", str(md), "--payload", str(tmp_path / "c.json")]
+    assert ac.main([*argv, "--comment-markdown", str(body)]) == 0
+    assert "Resolved" not in md.read_text(encoding="utf-8")
+    comment = body.read_text(encoding="utf-8")
+    assert comment.startswith(ac.marker("uv.lock") + "\n### wheelgap diff\n\n<p><b>Resolved.</b> Compared ")
+    assert comment.endswith("Nothing got worse.</p>\n")
+    assert json.loads((tmp_path / "c.json").read_text(encoding="utf-8"))["body"] == comment
+
+
+def test_a_worse_comment_is_the_report(tmp_path, capsys):
+    worse = worse_entry()
+    worse["targets"]["linux-x86_64"]["fix"] = {"kind": "upgrade", "version": "2.0", "how": "Use armlib==2.0 instead."}
+    (tmp_path / "diff.json").write_text(json.dumps(diff_report(worse=[worse])), encoding="utf-8")
+    md, body = tmp_path / "report.md", tmp_path / "comment.md"
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", "1", "--lockfile", "uv.lock"]
+    assert ac.main([*argv, "--base", "main", "--markdown", str(md), "--comment-markdown", str(body)]) == 1
+    assert body.read_text(encoding="utf-8") == f"{ac.marker('uv.lock')}\n{md.read_text(encoding='utf-8')}"
+    assert "Resolved" not in body.read_text(encoding="utf-8")
+
+
+def test_the_workflows_pyyaml_fixtures(monkeypatch, fake_pypi, capsys):
+    """What the Action compare-to workflow's fix step expects, offline: the pull request adds pyyaml 6.0.3, which builds
+    from source on 3.15 (the lockfiles list every file, so that needs no lookup), and --fix names 6.0.4."""
+    old, new = [str(FIXTURES / f"pyyaml-{side}" / "uv.lock") for side in ("base", "head")]
+    args = ["-p", "3.15", "-t", "linux-x86_64,win-arm64", "--json"]
+    assert diff_main([old, new, *args]) == 1
+    assert fake_pypi == []
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"] == [] and [p["name"] for p in data["new"]] == ["pyyaml"]
+    wheels = ["pyyaml-6.0.4-cp315-cp315-manylinux_2_28_x86_64.whl", "pyyaml-6.0.4-cp315-cp315-win_arm64.whl"]
+    monkeypatch.setitem(FAKE_INDEX, "pyyaml", {"6.0.3": ["pyyaml-6.0.3.tar.gz"], "6.0.4": wheels})
+    assert diff_main([old, new, *args, "--fix"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    fixes = [side["fix"] for side in data["new"][0]["targets"].values()]
+    assert [(f["kind"], f["version"]) for f in fixes] == [("upgrade", "6.0.4")] * 2
+    text = ac.report(data, "", "action-compare-test/uv.lock", "1a2b3c4")
+    assert "<td><code>win-arm64</code></td><td>(new) → ● source</td><td>upgrade to <code>6&#46;0&#46;4</code>" in text
+
+
+def test_diff_fix_for_a_bumped_requirements_pin_from_git(fake_pypi, gap_wheels, capsys, monkeypatch, tmp_path):
+    # The Dependabot case: the base copy of requirements.txt comes from git (which can't place a name on PyPI), the
+    # pull request moves an existing pin. The fix is still what `wheelgap requirements.txt --fix` says.
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "armlib",
+        {
+            "1.4.0": ["armlib-1.4.0-cp313-cp313-manylinux_2_17_x86_64.whl"],
+            "1.5.0": ["armlib-1.5.0.tar.gz"],
+            "1.6.0": ["armlib-1.6.0-cp313-cp313-manylinux_2_17_x86_64.whl"],
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q"], check=True)
+    (tmp_path / "requirements.txt").write_text("armlib==1.4.0\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "base"], check=True)
+    (tmp_path / "requirements.txt").write_text("armlib==1.5.0\n")
+    args = ["-p", "3.13", "-t", "linux-x86_64", "--fix", "--json"]
+    assert diff_main(["HEAD:./requirements.txt", "requirements.txt", *args]) == 1
+    got = json.loads(capsys.readouterr().out)["worse"][0]["targets"]["linux-x86_64"]["fix"]
+    assert cli_main(["requirements.txt", *args[:-2], "--fix", "--json"]) == 1
+    main = json.loads(capsys.readouterr().out)["packages"][0]["fix"]["linux-x86_64"]
+    assert got == main and got["kind"] == "upgrade" and got["version"] == "1.6.0"

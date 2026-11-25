@@ -210,7 +210,7 @@ def test_diff_unknown_distro_exits_2(fake_pypi, tmp_path, capsys):
     assert main([old, new, *TARGET, "--distro", "not-a-distro"]) == 2
     out, err = capsys.readouterr()
     assert out == ""
-    assert err.startswith("wheelgap: error: TargetError: ") and "unknown distro 'not-a-distro'" in err
+    assert err.startswith("wheelgap: error: unknown distro 'not-a-distro'")
 
 
 def test_diff_counts_a_package_it_can_no_longer_check_as_worse(fake_pypi, tmp_path, capsys):
@@ -267,7 +267,7 @@ def test_diff_refuses_a_simple_wheelgap_index_url_before_any_lookup(
         "check each lockfile with wheelgap --index-url instead."
     )
     assert error.startswith("WHEELGAP_INDEX_URL points at a simple index") and "JSON API" in error
-    assert err == f"wheelgap: error: SourceError: {message}\n"
+    assert err == f"wheelgap: error: {message}\n"
     if "--json" in flags:
         assert json.loads(out)["error"] == {"message": message, "type": "SourceError"}
     else:
@@ -461,7 +461,7 @@ def test_diff_refuses_index_url_in_either_project_before_any_lookup(fake_pypi, t
     out, err = capsys.readouterr()
     assert fake_pypi == []
     where = str(pyproject) if side == "new" else f"the pyproject.toml beside {old}"
-    assert err == f"wheelgap: error: SourceError: {where} {INDEX_URL_REFUSAL}\n"
+    assert err == f"wheelgap: error: {where} {INDEX_URL_REFUSAL}\n"
     assert "nonexistent" not in err  # the URL may hold credentials
     if flags:
         assert json.loads(out)["error"] == {"message": f"{where} {INDEX_URL_REFUSAL}", "type": "SourceError"}
@@ -509,9 +509,9 @@ def test_worse_on_every_pair(old, new, new_version):
     [
         (["{tmp}/missing.txt", "{new}"], "missing.txt"),
         (["{tmp}/empty", "{new}"], "no lockfile found"),
-        (["{tmp}/notes.md", "{new}"], "SourceError: don't know how to read"),
+        (["{tmp}/notes.md", "{new}"], "don't know how to read"),
         (["{tmp}/pyproject.toml", "{new}"], "pyproject.toml: a pyproject.toml lists direct dependencies only"),
-        (["{new}", "{new}", "-t", "linux-aarch46"], "TargetError: "),
+        (["{new}", "{new}", "-t", "linux-aarch46"], "unknown target 'linux-aarch46'"),
         (["{new}", "{new}", "-p", "three"], "can't parse Python version"),
     ],
 )
@@ -528,6 +528,23 @@ def test_diff_bad_input_exits_2(fake_pypi, tmp_path, capsys, args, message):
     out, err = capsys.readouterr()
     assert out == ""
     assert err.startswith("wheelgap: error: ") and message in err
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+@pytest.mark.parametrize("flags", [[], ["--json"]])
+def test_diff_missing_file_names_it_as_typed(fake_pypi, tmp_path, capsys, monkeypatch, side, flags):
+    # As the main command says it, with the argument as typed: not FileNotFoundError and an absolute path (#728).
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    sides = ["nope.txt", "requirements.txt"] if side == "old" else ["requirements.txt", "nope.txt"]
+    assert main([*sides, *TARGET, *flags]) == 2
+    out, err = capsys.readouterr()
+    assert err == "wheelgap: error: nope.txt: no such file\n"
+    if flags:
+        assert json.loads(out)["error"] == {"message": "nope.txt: no such file", "type": "SourceError"}
+    else:
+        assert out == ""
+    assert fake_pypi == []  # and neither side is looked up
 
 
 def test_diff_json(fake_pypi, tmp_path, capsys):
@@ -700,8 +717,19 @@ def test_diff_refuses_index_url_in_the_ref_copy(fake_pypi, repo, capsys):
     (repo / "pyproject.toml").unlink()
     assert main(["HEAD:uv.lock", "uv.lock", *TARGET]) == 2
     assert fake_pypi == []
-    assert capsys.readouterr().err == (
-        f"wheelgap: error: SourceError: the pyproject.toml beside HEAD:uv.lock {INDEX_URL_REFUSAL}\n"
+    assert capsys.readouterr().err == (f"wheelgap: error: the pyproject.toml beside HEAD:uv.lock {INDEX_URL_REFUSAL}\n")
+
+
+@needs_git
+def test_diff_names_a_ref_copy_whose_tool_isnt_a_table_as_typed(fake_pypi, repo, capsys):
+    (repo / "pyproject.toml").write_text("tool = 1\n", encoding="utf-8")
+    git("add", "pyproject.toml", cwd=repo)
+    git("commit", "-q", "-m", "tool", cwd=repo)
+    (repo / "pyproject.toml").unlink()
+    assert main(["HEAD:uv.lock", "uv.lock", *TARGET]) == 2
+    assert fake_pypi == []
+    assert (
+        capsys.readouterr().err == "wheelgap: error: the pyproject.toml beside HEAD:uv.lock: [tool] must be a table\n"
     )
 
 
@@ -1040,3 +1068,27 @@ def test_diff_git_ref_config_when_lockfile_is_absent_from_working_tree(fake_pypi
     assert [(t["python"], t["platform"]) for t in json.loads(capsys.readouterr().out)["targets"]] == [
         ("3.13", "win-arm64")
     ]
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_diff_pyproject_non_table_tool_exits_with_source_error(capsys, tmp_path, fake_pypi, side):
+    old, new = write_pair(tmp_path, "idna==3.10\n", "idna==3.10\n")
+    (tmp_path / side / "pyproject.toml").write_text("tool = 1\n", encoding="utf-8")
+
+    assert main([old, new, "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    err = capsys.readouterr().err
+    assert "[tool] must be a table" in err
+    assert "AttributeError" not in err
+    assert fake_pypi == []
+
+
+def test_diff_refuses_a_non_table_tool_wheelgap_beside_the_old_side(capsys, tmp_path, fake_pypi):
+    # The NEW side's file goes through load_config(); the OLD side's was read for index-url only and skipped quietly.
+    old, new = write_pair(tmp_path, "idna==3.10\n", "idna==3.10\n")
+    (tmp_path / "old" / "pyproject.toml").write_text("[tool]\nwheelgap = 1\n", encoding="utf-8")
+
+    assert main([old, new, "-p", "3.13", "-t", "linux-x86_64"]) == 2
+    assert capsys.readouterr().err == (
+        f"wheelgap: error: the pyproject.toml beside {old}: [tool.wheelgap] must be a table\n"
+    )
+    assert fake_pypi == []

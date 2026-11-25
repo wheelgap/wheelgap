@@ -153,6 +153,8 @@ def run(origin, tmp_path):
             "WHEELGAP_SUMMARY": "true",
             "WHEELGAP_COMPARE_TO": "base",
             "WHEELGAP_COMMENT": "false",
+            # The Action's default is true; these tests turn it on where they test it, so the rest look nothing up.
+            "WHEELGAP_FIX": "false",
             "WHEELGAP_TOKEN": "",
             "WHEELGAP_EVENT": "pull_request",
             "WHEELGAP_HEAD_SHA": origin["head"],
@@ -224,6 +226,45 @@ def test_comment_suggests_a_newer_release_when_posting_or_updating(run, previous
     assert writes(r) == [
         "api -X PATCH repos/o/r/issues/comments/9" if previous else "api -X POST repos/o/r/issues/7/comments"
     ]
+
+
+def test_the_fix_goes_to_the_summary_and_the_comment(run):
+    listing = json.dumps([mine(9, MARK + "\nOld body")])
+    r = run(WHEELGAP_FIX="TRUE", STUB_RELEASES="1", WHEELGAP_COMMENT="true", GH_COMMENTS=listing)
+    assert r["code"] == 1, r["log"]
+    # armlib's releases (once: the Fix column replaces the comment's suggestions), nativeext's, and the gap wheel list.
+    assert "has wheels for musl-aarch64" not in r["body"]
+    assert sorted(r["pypi"]) == [
+        "https://pypi.org/pypi/armlib/json",
+        "https://pypi.org/pypi/nativeext/json",
+        "https://wheelgap.github.io/wheels/data/gap-wheels.json",
+    ]
+    fixed = "<td>✓ → ● source</td><td>upgrade to <code>1&#46;6&#46;0</code></td></tr>"
+    for text in (r["summary"], r["body"]):
+        assert fixed in text
+        assert "<td>(new) → ● source</td><td>newer releases weren't looked up (the log says why)</td></tr>" in text
+        assert "<p>How to fix:</p>" in html.unescape(text)
+        assert "run uv lock --upgrade-package armlib, then uv sync" in html.unescape(text)
+    assert writes(r) == ["api -X PATCH repos/o/r/issues/comments/9"]
+    # The comment output is the body that was sent.
+    comment = dict(line.split("=", 1) for line in r["output"].splitlines())["comment"]
+    assert Path(comment).read_text(encoding="utf-8") == r["body"]
+
+
+def test_fix_false_looks_nothing_up_and_has_no_fix_column(run):
+    r = run(WHEELGAP_FIX="false")
+    assert r["code"] == 1 and r["pypi"] == []
+    assert "<th>Fix</th>" not in r["summary"] and "How to fix" not in r["summary"]
+
+
+def test_a_forks_read_only_token_gets_a_notice_not_a_warning(run):
+    r = run(WHEELGAP_COMMENT="true", GH_WRITE_FAIL="403", WHEELGAP_HEAD_REPO="mallory/r")
+    assert r["code"] == 1
+    assert not [line for line in r["log"].splitlines() if line.startswith("::warning::")]
+    assert "::notice::wheelgap: no comment, as expected for a pull request from a fork" in r["log"]
+    assert "<td><code>armlib</code></td>" in r["summary"]
+    r = run(WHEELGAP_COMMENT="true", GH_WRITE_FAIL="403", WHEELGAP_HEAD_REPO="O/R")  # the same repository
+    assert [line for line in r["log"].splitlines() if line.startswith("::warning::")]
 
 
 def test_summary_only_does_not_request_suggestions(run):
@@ -338,6 +379,7 @@ def test_a_ref_without_a_pull_request_only_writes_the_summary(run):
             "comment: true is refused on pull_request_target and workflow_run",
         ),
         ({"WHEELGAP_COMMENT": "yes"}, "comment must be true or false"),
+        ({"WHEELGAP_FIX": "1"}, "fix must be true or false"),
         ({"WHEELGAP_HEAD_SHA": "abc; rm -rf /"}, "the pull_request event has no head commit"),
         ({"WHEELGAP_COMMENT_AUTHOR": "my app"}, "comment-author must be a GitHub login"),
         ({"WHEELGAP_ARGS": "-p 3.13 uv.lock"}, "args must start with the lockfile's path"),

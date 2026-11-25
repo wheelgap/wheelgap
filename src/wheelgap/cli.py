@@ -58,7 +58,7 @@ from .dockerfile import (
     read_dockerfile,
 )
 from .github import github_annotations, relative_path, workflow_command
-from .install_log import failed_builds, log_source, read_log
+from .install_log import LATEST_NOTE, failed_builds, log_source, read_log
 from .junit import write_junit
 from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
@@ -100,6 +100,7 @@ from .sources import (
     select_pyproject_groups,
     select_uv_dependencies,
     skipped_list,
+    tool_table,
     uv_selected_roots,
 )
 from .suggest_targets import render_text as render_target_suggestions
@@ -501,7 +502,7 @@ def load_config(path: Path) -> dict:
         text = path.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
     except UnicodeDecodeError:
         raise SourceError(f"{path}: isn't UTF-8, so its [tool.wheelgap] table can't be read") from None
-    table = tomllib.loads(text).get("tool", {}).get("wheelgap", {})
+    table = tool_table(tomllib.loads(text), path).get("wheelgap", {})
     if not isinstance(table, dict):
         raise SourceError(f"{path}: [tool.wheelgap] must be a table")
     config = {}
@@ -546,7 +547,7 @@ def load_config(path: Path) -> dict:
 def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
     """Native platforms needed by any required-environments marker for any selected Python."""
     # -sig: load_config() has already read this file, so only a BOM is left to allow for
-    table = tomllib.loads(path.read_text(encoding="utf-8-sig")).get("tool", {}).get("uv", {})
+    table = tool_table(tomllib.loads(path.read_text(encoding="utf-8-sig")), path).get("uv", {})
     if not isinstance(table, dict):
         raise SourceError(f"{path}: [tool.uv] must be a table")
     markers = table.get("required-environments", [])
@@ -1043,6 +1044,7 @@ def report_json(
     dockerfile_packages: list[dict[str, object]] | None = None,
     directory_inputs: list[dict[str, object]] | None = None,
     image_unread: bool = False,
+    from_log_notes: list[dict[str, str]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -1170,6 +1172,8 @@ def report_json(
         report["dockerfile_warnings"] = dockerfile_warnings
     if directory_inputs:  # an input was a directory: the file read from each, and why
         report["directory_inputs"] = directory_inputs
+    if from_log_notes is not None:  # --from-log: a failed package checked at a version the log doesn't name
+        report["from_log_notes"] = from_log_notes
     return json.dumps(report, indent=2)
 
 
@@ -2285,6 +2289,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     docker_constraints: dict[Path, tuple[Path, ...]] = {}
     docker_line_files: dict[Path, tuple[Path, ...]] = {}  # each file's -r files of its pip install line, in order
     uv_installs: set[tuple[int, Path]] = set()
+    # (line, lock) -> (its --no-dev, its pyproject.toml, its .python-version pin or None, that file or None)
+    uv_syncs: dict[tuple[int, Path], tuple[bool, Path, str | None, Path | None]] = {}
     image: ImageTarget | None = None
     unknown_image: UnknownImageError | None = None
     # What the Dockerfile answer leaves out, for --json's dockerfile_notes: {"dockerfile", "line", "kind", "message"}.
@@ -2298,8 +2304,20 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     def read_image() -> None:
         """The image of --dockerfile. One wheelgap can't read is an error, unless -p and -t say what to check."""
         nonlocal image, unknown_image
+        path = Path(args.dockerfile)
+        # Not path.exists(): from Python 3.14 it is False for any OSError, and a permission error keeps its own message.
         try:
-            image = read_dockerfile(Path(args.dockerfile), build_args)
+            path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            raise DockerfileError(f"--dockerfile {args.dockerfile}: no such file") from None
+        if path.is_dir():
+            clean = args.dockerfile.rstrip("/\\")
+            example = f"{clean}/Dockerfile" if clean else "/Dockerfile"
+            raise DockerfileError(
+                f"--dockerfile {args.dockerfile}: is a folder; pass the Dockerfile in it, e.g. {example}"
+            )
+        try:
+            image = read_dockerfile(path, build_args)
         except HeredocSyntaxError as e:
             if args.dockerfile_inputs:
                 # -p and -t don't help --dockerfile-inputs here: say what does, with the line.
@@ -2337,6 +2355,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 line_files=docker_line_files,
                 dependencies=args.deps,
                 uv_installs=uv_installs,
+                uv_syncs=uv_syncs,
                 report=inputs_report,
                 pythons=docker_pythons or ([image.python] if image is not None else None),
             )
@@ -2406,6 +2425,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 dockerfile_notes += notes
             if not quiet:
                 for install_line, requirements in installs:
+                    if (install_line, requirements) in uv_syncs:
+                        _, pyproject, _, pin_file = uv_syncs[install_line, requirements]
+                        read = f"{requirements}, {pyproject}" + (f", {pin_file}" if pin_file is not None else "")
+                        print(
+                            f"wheelgap: note: {args.dockerfile}:{install_line}: RUN uv sync reads {read}",
+                            file=sys.stderr,
+                        )
+                        continue
                     # Every file read: the requirements file and what it includes, then each -c file of the line
                     # and what that includes (a -r in a constraints file is requirements, a -c more constraints).
                     files = ", ".join(
@@ -2447,6 +2474,42 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     args.target = [musl_docker_names(item) for item in args.target]
                 config.update(python=[image.python], targets=[image.platform])
                 config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
+        # A `uv sync` line's copied .python-version picks the Python its lock installs for: that Python must be
+        # checked, as a venv's must be, and the answer can't split Pythons between the sync and other installs.
+        sync_pin = next((v for v in uv_syncs.values() if v[2] is not None), None)
+        if sync_pin is not None:
+            sync_line = next(line for (line, _), v in uv_syncs.items() if v is sync_pin)
+            pin_full = sync_pin[2]
+            assert pin_full is not None
+            m = re.fullmatch(r"(\d+\.\d+)(\.\d+)?(t?)", pin_full)
+            assert m is not None  # dockerfile.py only records a pin in this shape
+            pin_short, pin_patch = m[1] + m[3], m[2]
+            if args.python:
+                if pin_short not in docker_pythons:
+                    raise DockerfileError(
+                        f"{args.dockerfile}:{sync_line}: `uv sync` installs Python {pin_full} (its "
+                        f".python-version), which the check's Python ({', '.join(docker_pythons)}) doesn't "
+                        f"cover: check {pin_short} instead"
+                    )
+            else:
+                if image is not None and pin_short != image.python:
+                    others = [line for line, requirements in installs if (line, requirements) not in uv_syncs]
+                    others += [line for line, *_ in inputs_report.named]
+                    if others:
+                        raise DockerfileError(
+                            f"{args.dockerfile}:{sync_line}: `uv sync` installs Python {pin_short} (its "
+                            f".python-version), but the install on line {min(others)} installs the image's "
+                            f"{image.python}: --dockerfile-inputs checks one Python, and can't answer for both"
+                        )
+                config["python"] = [pin_short]
+            if pin_patch:
+                # As for an image's patch pin: the check is for X.Y at its newest patch release.
+                print(
+                    f"wheelgap: note: {args.dockerfile}:{sync_line}: .python-version pins Python {sync_pin[2]}; "
+                    f"wheelgap checks {pin_short} at its newest patch release, so a package that needs a later "
+                    f"{pin_short} patch isn't flagged",
+                    file=sys.stderr,
+                )
         glibc_version, musl_version = libc_versions(args, config)
         pythons = (
             args.python
@@ -2537,7 +2600,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         if args.from_log is not None:
             failures = failed_builds(read_log(args.from_log), other_index=origin.other_index(index_url) is not None)
-            listed = ", ".join(f"{name} {version}" for name, version in failures)
+            listed = ", ".join(
+                f"{name} {version}" if version else f"{name} (the log doesn't name the version)"
+                for name, version in failures
+            )
             print(f"wheelgap: note: the install log says these failed to build: {listed}", file=sys.stderr)
             sources = [log_source(failures)]
         else:
@@ -2548,9 +2614,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # RUN line, labelled with it, checked as names on wheelgap's own command line are.
                 # pip reads a `pip install -r FILE` file as requirements whatever its name, except a PEP 751 lock
                 # name (pylock.toml, pylock.NAME.toml), which pip 26.1 and later install as that lock; a uv line's
-                # file keeps the reader its name picks.
+                # file keeps the reader its name picks, and a `uv sync` line's lock is read as uv.lock whatever its
+                # context name (in the image it is uv.lock, which is what uv sync looks for).
                 docker_kinds = {
-                    req: "pylock" if _PIP_PYLOCK_NAME_RE.fullmatch(req.name) else "requirements"
+                    req: "uv"
+                    if (line, req) in uv_syncs
+                    else "pylock"
+                    if _PIP_PYLOCK_NAME_RE.fullmatch(req.name)
+                    else "requirements"
                     for line, req in installs
                     if (line, req) not in uv_installs
                 }
@@ -2684,6 +2755,19 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     )
                 select_pyproject_groups(source, args.group or [], args.only_group or [])
                 select_pyproject_extras(source, args.extra or [], args.all_extras)
+        # A `uv sync` line's own flags are its lock's selection, applied below even with no selectors of
+        # wheelgap's own: `wheelgap uv.lock` with no flags checks all groups and extras, but a sync without them
+        # installs the defaults (and dev only without --no-dev). The line is what the image installs, so wheelgap's
+        # own selectors don't apply to its lock: on the command line they are an error (as they are for a -r file
+        # of the Dockerfile), and configured ones ([tool.wheelgap] extras and groups) leave it as the line says.
+        sync_locks = {requirements: line for line, requirements in installs if (line, requirements) in uv_syncs}
+        if sync_locks and (from_cli or args.only_group):
+            sync_line = min(sync_locks.values())
+            raise SourceError(
+                "--extra, --all-extras, --group, --only-group and --no-dev don't apply to --dockerfile-inputs: "
+                f"`uv sync` on {args.dockerfile}:{sync_line} picks what the image installs"
+            )
+        lock_sources = [s for s in lock_sources if s.path not in sync_locks]
         if (from_cli or args.only_group or extra_names is not None or group_names is not None) and (
             lock_sources or not pyproject_sources
         ):
@@ -2703,6 +2787,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 poetry=bool(from_cli or args.only_group) or group_names is not None or extra_names is not None,
                 pdm=bool(from_cli or args.only_group) or group_names is not None,
             )
+        for source in sources:
+            if source.path in sync_locks and source.pyproject_extras is None:
+                no_dev, _, _, _ = uv_syncs[sync_locks[source.path], source.path]
+                select_uv_dependencies([source], UvSelection(no_dev=no_dev), strict=False)
         if args.deps:
             dependency_sources = [s for s in sources if s.specs or s.pyproject_extras is not None]
             if not dependency_sources:
@@ -3021,9 +3109,19 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             file=sys.stderr,
         )
     gaps = [r for r in rows if not r.ok]
+    # --from-log: each failed package checked at its latest release, as the log names no version (also in --json and
+    # --markdown, so a report never shows that version as the log's).
+    from_log_notes: list[dict[str, str]] = []
     if args.from_log is not None:
         multi_py = len({t.python for t in targets}) > 1
+        unversioned = {canonicalize_name(name) for name, version in failures if version is None}
         for r in rows:
+            if canonicalize_name(r.package.name) in unversioned and r.package.version:
+                message = LATEST_NOTE.format(name=r.package.name, version=r.package.version)
+                from_log_notes.append(
+                    {"name": r.package.name, "version": r.package.version, "kind": "latest", "message": message}
+                )
+                print(f"wheelgap: note: {message}", file=sys.stderr)
             if fits := [t.label(multi_py) for t, status in r.results.items() if status == Status.WHEEL]:
                 print(
                     f"wheelgap: note: the install log says {r.package.name} failed to build, but "
@@ -3366,6 +3464,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 ],
                 image_unread=bool(args.dockerfile_inputs) and unknown_image is not None,
                 directory_inputs=directory_inputs_json(sources),
+                from_log_notes=from_log_notes if args.from_log is not None else None,
             )
         )
         return code
@@ -3402,6 +3501,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     ),
                     *(["", f"> **Warning:** {unseen_line}"] if unseen_line else []),
                     *dockerfile_markdown(dockerfile_results(dockerfile_notes)),
+                    *(line for note in from_log_notes for line in ("", f"> **Note:** {note['message']}")),
                 ]
             )
         )

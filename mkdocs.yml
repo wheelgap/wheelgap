@@ -94,6 +94,8 @@ nav:
       - MCP Python SDK: case-studies/mcp-python-sdk.md
       - Prefect: case-studies/prefect.md
       - urllib3: case-studies/urllib3.md
+  - Reports:
+      - Python 3.15 readiness (Nov 2026): reports/python-3-15.md
   - Integrations:
       - Python API: python-api.md
       - MCP server: mcp.md

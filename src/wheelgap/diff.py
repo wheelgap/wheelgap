@@ -43,13 +43,22 @@ from pathlib import Path
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import InvalidName, canonicalize_name
 
-from . import __version__, origin, suggest
-from .api import Result, _check_lockfile, check_packages, make_targets, running_python
+from . import __version__, fix, gapwheels, origin, suggest
+from .api import Result, _check_lockfile, check_packages, explain_issues_urls, make_targets, running_python
 from .check import CELL, Row, Status, applies, lock_environments_note, narrow_to_lock_environments, reachable
-from .cli import find_pyproject, libc_versions, load_config, load_uv_targets, project_dir, read_python_version
+from .cli import (
+    find_pyproject,
+    gap_wheel_fills,
+    libc_versions,
+    load_config,
+    load_uv_targets,
+    project_dir,
+    read_python_version,
+    release_lookups,
+)
 from .logsafe import guarded_output
 from .pypi import check_index_url
-from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock
+from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock, tool_table
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -57,6 +66,7 @@ from .targets import (
     DEFAULT_MACOS,
     DEFAULT_MUSL,
     Target,
+    TargetError,
     next_python_note,
 )
 
@@ -244,22 +254,23 @@ def compare(before: dict[str, Package], after: dict[str, Package], targets: list
     return report
 
 
-def json_report(report: Report, targets: list[Target]) -> str:
+def json_report(report: Report, targets: list[Target], fixes: Fixes | None = None) -> str:
     """--json: one object. Its keys are a public interface, like the main command's --json. Versions are
     lists: empty when the input gives no version (an unpinned or unknown package, or a requirements line
-    installing from git, a path or a URL); several for a uv.lock fork."""
+    installing from git, a path or a URL); several for a uv.lock fork. With --fix, `fix_summary` counts the
+    listed gap cells as the main command's does (the `fix` entries are in `worse` and `new`)."""
     multi_py = len({t.python for t in targets}) > 1
-    return json.dumps(
-        {
-            "version": __version__,
-            "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
-            "worse": report.worse,
-            "new": report.new,
-            "unchecked": report.unchecked,
-            "summary": {"worse": len(report.worse), "new": len(report.new)},
-        },
-        indent=2,
-    )
+    out: dict[str, object] = {
+        "version": __version__,
+        "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
+        "worse": report.worse,
+        "new": report.new,
+        "unchecked": report.unchecked,
+        "summary": {"worse": len(report.worse), "new": len(report.new)},
+    }
+    if fixes is not None:
+        out["fix_summary"] = fix.counts(fixes.cells)
+    return json.dumps(out, indent=2)
 
 
 def add_comment_suggestions(report: Report, rows: list[Row], sources: list[Source], targets: list[Target]) -> None:
@@ -303,6 +314,58 @@ def add_comment_suggestions(report: Report, rows: list[Row], sources: list[Sourc
             hints[name] = list(dict.fromkeys(lines))
     for name, lines in hints.items():
         worse[name]["suggestions"] = lines
+
+
+@dataclass
+class Fixes:
+    """--fix: the way out of each gap cell the report lists, as `wheelgap NEW --fix` plans it, and what the text
+    report needs to show it."""
+
+    cells: list[fix.Cell]
+    fills: list[gapwheels.Fill]
+    not_looked_up: dict[int, str]
+    issues_urls: dict[int, str | None]
+
+
+def add_fixes(report: Report, rows: list[Row], sources: list[Source], targets: list[Target]) -> Fixes:
+    """Add `fix` (fix.to_json, as `wheelgap NEW --fix --json` has it) to each target entry of `worse` and `new` that
+    is a `source` or `missing` gap, and return the cells. The lookups and the plan are --fix's own (cli.release_lookups,
+    cli.gap_wheel_fills, fix.plan) on the NEW lockfile's rows, for the packages the report lists only, with names
+    judged by the NEW input alone, as `wheelgap NEW --fix` judges them."""
+    multi_py = len({t.python for t in targets}) > 1
+    entries = {canonicalize_name(e["name"]): e for e in report.worse + report.new}
+    listed = [r for r in rows if not r.ok and canonicalize_name(r.package.name) in entries]
+    if not listed:
+        return Fixes([], [], {}, {})
+    # The rows are the NEW input's, so only it decides which names are PyPI's, as with `wheelgap NEW --fix`: the OLD
+    # side is an earlier copy of the same file, not another input of the run, and a REF:PATH copy (always pypi_only
+    # False) would otherwise keep every name it shares with NEW in, though NEW places it on PyPI.
+    new_side = sources[-1:]
+    fills = gap_wheel_fills(listed, targets, new_side, None, "--index-url", False)
+    upgrades, not_looked_up = release_lookups(listed, targets, new_side, None, False, flag="--fix")
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    cells = []
+    for cell in fix.plan(listed, targets, source_of, upgrades, fills, not_looked_up):
+        side = entries[canonicalize_name(cell.row.package.name)]["targets"].get(cell.target.label(multi_py))
+        # Only the cells the report lists, from the entry whose status it shows (a uv.lock fork has several).
+        if side is None or "fix" in side:
+            continue
+        if side.get("new_status", side.get("status")) != cell.row.results[cell.target].value:
+            continue
+        side["fix"] = fix.to_json(cell)
+        cells.append(cell)
+    shown = {(id(c.row), c.target) for c in cells}
+    fills = [f for f in fills if (id(f.row), f.target) in shown]
+    return Fixes(cells, fills, not_looked_up, explain_issues_urls([c.row for c in cells], new_side))
+
+
+def fix_text(fixes: Fixes, targets: list[Target]) -> list[str]:
+    """--fix's section of the text report, as the main command prints it for these cells."""
+    multi_py = len({t.python for t in targets}) > 1
+    return [
+        *fix.text_lines(fixes.cells, multi_py, fixes.not_looked_up, fixes.issues_urls),
+        *gapwheels.text_lines(fixes.fills, multi_py, fix.alternatives(fixes.cells), fix.any_upgrade(fixes.cells)),
+    ]
 
 
 def summary(n_worse: int, n_new: int) -> str:
@@ -468,13 +531,16 @@ def _input_index_url(path: str, label: str) -> None:
     if pyproject is None:
         return
     try:
-        table = tomllib.loads(pyproject.read_text(encoding="utf-8-sig")).get("tool", {}).get("wheelgap", {})
+        # Named as typed: a REF:PATH's copy sits in a temporary folder that's gone after the run.
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8-sig"))
+        table = tool_table(data, f"the pyproject.toml beside {label}").get("wheelgap", {})
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise SourceError(
             f"the pyproject.toml beside {label} can't be read, so its index-url isn't known: {e}"
         ) from None
-    if isinstance(table, dict):
-        _refuse_index_url(table, f"the pyproject.toml beside {label}")
+    if not isinstance(table, dict):  # as load_config() says it for the NEW side's file
+        raise SourceError(f"the pyproject.toml beside {label}: [tool.wheelgap] must be a table")
+    _refuse_index_url(table, f"the pyproject.toml beside {label}")
 
 
 def _main(argv: list[str] | None, prog: str) -> int:
@@ -518,7 +584,22 @@ def _main(argv: list[str] | None, prog: str) -> int:
         action="store_true",
         help="resolve two pinned PyPI package specs and compare their full dependency trees",
     )
+    p.add_argument(
+        "--fix",
+        action="store_true",
+        help="also say how to fix each listed gap, as wheelgap NEW --fix does: an upgrade first, else an unofficial "
+        "gap wheel (looks the gap packages up on PyPI and reads wheelgap's gap wheel list)",
+    )
     args = p.parse_args(argv)
+    if args.fix and args.deps:
+        print("wheelgap: error: --fix works on two lockfiles, not with --deps", file=sys.stderr)
+        if args.json:
+            print(
+                json.dumps(
+                    {"error": {"message": "--fix works on two lockfiles, not with --deps", "type": "UsageError"}}
+                )
+            )
+        return 2
     try:
         # As in the main command, before any lookup: a /simple URL there would make every package `unknown`.
         _check_index_url()
@@ -583,6 +664,9 @@ def _main(argv: list[str] | None, prog: str) -> int:
                 read = []
                 for path in (args.old, args.new):
                     ref = git_ref_input(path)
+                    if ref is None and not os.path.exists(path):
+                        # As the main command says it: the argument as typed, not Python's FileNotFoundError.
+                        raise SourceError(f"{path}: no such file")
                     read.append((read_git_ref(*ref, Path(tmp)) if ref is not None else path, ref))
                 for (path, _), label in zip(read, (args.old, args.new), strict=True):
                     _input_index_url(path, label)  # before any lookup, for either side
@@ -600,23 +684,37 @@ def _main(argv: list[str] | None, prog: str) -> int:
                     sides.append(packages)
                     sources.append(source)
     except Exception as e:  # unknown targets, unreadable or malformed lockfiles, a REF:PATH git can't read
-        print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
+        # The main command prints these two without the exception's name, and their text is written for people.
+        prefix = "" if isinstance(e, (SourceError, TargetError)) else f"{type(e).__name__}: "
+        print(f"wheelgap: error: {prefix}{e}", file=sys.stderr)
         if args.json:  # as the main command does, so scripts needn't parse stderr
             print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
         return 2
 
     report = compare(sides[0], sides[1], targets)
+    fixes = None
+    if args.fix:
+        try:
+            fixes = add_fixes(report, rows, sources, targets)
+        except Exception as e:  # like the suggestions below, --fix never changes the comparison or the exit code
+            print(f"wheelgap: note: --fix couldn't work out the fixes ({type(e).__name__})", file=sys.stderr)
+            for entry in report.worse + report.new:
+                for side in entry["targets"].values():
+                    side.pop("fix", None)
     if args.json:
-        if os.environ.get("_WHEELGAP_ACTION_SUGGEST") == "1":
+        # The comment's release hints say what the Fix column already does, so they're only for a run without --fix.
+        if os.environ.get("_WHEELGAP_ACTION_SUGGEST") == "1" and fixes is None:
             try:
                 add_comment_suggestions(report, rows, sources, targets)
             except Exception:
                 pass  # An optional lookup must not change the comparison's report or exit code.
-        print(json_report(report, targets))
+        print(json_report(report, targets, fixes))
     else:
         for line in report.lines:
             print(line)
         print(summary(len(report.worse), len(report.new)))
+        for line in fix_text(fixes, targets) if fixes is not None else []:
+            print(line)
     if report.unchecked:
         print(f"wheelgap: note: couldn't check {', '.join(report.unchecked)} in either lockfile", file=sys.stderr)
     return 1 if report.worse or report.new else 0

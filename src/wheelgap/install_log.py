@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import codecs
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import BinaryIO
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
@@ -30,6 +32,9 @@ MAX_FAILURES = 50
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")  # GitHub Actions' prefix on each log line
+# Docker BuildKit's plain progress output: `#12 28.56 ` (step and seconds) on each line of a RUN's output, and `28.56 `
+# alone in the failed step's excerpt that `docker build` prints at the end.
+_BUILDKIT = re.compile(r"(?:#(?P<step>\d+) )?\d+\.\d+(?: |$)")
 _NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 # pip's own lines, not a build's output (which pip indents further): `Collecting cryptography==43.0.0 (from ...)`,
 # `Collecting cryptography>=42`, `Collecting x @ https://...`; `  Downloading cryptography-43.0.0.tar.gz (686 kB)`,
@@ -45,6 +50,26 @@ _BACKTRACK = re.compile(rf"INFO: pip is (?:still )?looking at multiple versions 
 # `Looking in links: /wheels, https://example.com/wheels` for --find-links (with or without --no-index).
 _INDEXES = re.compile(r"\s*Looking in indexes: (.+)$")
 _LINKS = re.compile(r"\s*Looking in links: (.+)$")
+# A pip or uv pip install command in the log (a shell prompt, a Dockerfile's `RUN`, BuildKit's step name): its exact
+# pins give a failed package's version when pip's own lines don't.
+_INSTALL_COMMAND = re.compile(r"(?:^|[\s>$:;&|(\"'/])pip3?(?:\.\d+)?\s+install\s+(.*)$")
+# pip install options that take a value, which isn't a requirement.
+_INSTALL_VALUE_OPTIONS = frozenset(
+    "-r --requirement -c --constraint -e --editable -i --index-url --extra-index-url -f --find-links -t --target "
+    "--prefix --root --python --platform --python-version --implementation --abi --src --cache-dir --log "
+    "--progress-bar --upgrade-strategy --report --only-binary --no-binary --trusted-host --proxy --timeout --retries "
+    "--exists-action --cert --client-cert --config-settings -C --global-option --keyring-provider -p".split()
+)
+# pip's own line for a project it doesn't collect from an index: `Processing ./src` (`pip install .`), `Obtaining
+# file:///...` (`pip install -e .`).
+_LOCAL = re.compile(r" {0,2}(?:Processing|Obtaining) (\S+)")
+# pip's error when a package's sdist fails before `Building wheel for`: getting its build requirements, or its
+# metadata. pip prints it twice (indented, then at column 0) and names no package: it's the one collected last.
+_PREPARE_FAILED = re.compile(
+    r" {0,2}(?:(?:× ?)?(?:Getting requirements to build (?:wheel|editable)|Preparing (?:editable )?metadata "
+    r"\([^)]*\)) did not run successfully\.?|error: metadata-generation-failed|(?:× ?)?Encountered error while "
+    r"generating package metadata\.?)\s*"
+)
 # The end of a pip run that installed what it was asked to; the next run in the same log starts afresh.
 _INSTALLED = re.compile(r"Successfully installed ")
 _PYPI_SIMPLE = "https://pypi.org/simple"
@@ -99,6 +124,12 @@ class LogError(SourceError):
         self.kind = kind
 
 
+# Said for a failed package the log names no version of, once the latest release is looked up.
+LATEST_NOTE = (
+    "the log doesn't name the version of {name} that failed to build; checked {name} {version}, the latest release "
+    "(if the install pinned another version, check that one)"
+)
+
 OTHER_INDEX = "other_index"
 FIND_LINKS = "find_links"
 NO_FAILURE = "no_failure"
@@ -143,16 +174,19 @@ def _decode(f: BinaryIO) -> str:
     return bytes(buf).decode(encoding, "replace").removeprefix("\ufeff")
 
 
-def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]:
+def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str | None]]:
     """The (name, version) of each package the log says failed to build, in the order the log names them. The version
     is the one uv names; for pip, the one the `Collecting`, `Downloading` and `Using cached` lines since the package's
     last `Collecting` line name, in the same pip run (a run ends at `Successfully installed`); for Poetry, the one its
     build-backend note names, if an earlier `Installing`/`Updating`/`Downgrading` line names it too; and for PDM
     (`pdm install -v` only), the one its `✖ Install NAME VERSION failed` line names, with a `BuildError` traceback for
-    that package and the build link that says which index the sdist came from. A failure whose version the log doesn't
-    make clear is an error, and so is a log that used another index than PyPI or --find-links (pip), or that built the
-    package from another index (PDM), unless `other_index` (wheelgap itself checks another index, as with
-    --index-url)."""
+    that package and the build link that says which index the sdist came from. pip's `Getting requirements to build
+    wheel` and `Preparing metadata` failures name no package: it's the sdist of the last column-0 `Collecting` line,
+    downloaded since. When pip's lines name no version, an exact pin on a `pip install` line in the log gives it, and
+    with none the version is None (the caller checks the latest release, and says so), unless the log has pip's
+    `Processing`/`Obtaining` line for a local project. A failure whose version the log doesn't make clear is an error,
+    and so is a log that used another index than PyPI or --find-links (pip), or that built the package from another
+    index (PDM), unless `other_index` (wheelgap itself checks another index, as with --index-url)."""
     # canonical name -> the versions named since its last `Collecting` line (Version -> as written), or _UNCLEAR,
     # _DIRECT or _EARLIER
     versions: dict[str, dict[Version, str] | str] = {}
@@ -160,7 +194,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
     # versions its dependencies are collected at, and pip doesn't log a candidate again when it goes back to it.
     backtracked: str | None = None
     built: set[str] = set()  # names pip printed `Building wheel for` or `Failed building wheel for` for
-    failures: dict[str, tuple[str, str]] = {}
+    failures: dict[str, tuple[str, str | None]] = {}
+    # canonical name -> the versions `pip install` lines in the log pin it to exactly
+    command_pins: dict[str, set[Version | None]] = {}  # None: an install command names it without an exact pin
+    step: str | None = None  # the BuildKit step of the last `#N` line
+    steps_left: set[str] = set()
+    interleaved = False  # BuildKit steps' output mixed (#7, #8, #7): pip's lines may be two runs'
+    local = False  # pip's `Processing` or `Obtaining` line for a project that isn't a distribution file
+    # The sdist (name, version) downloaded since the last column-0 `Collecting` line, for the package it collects.
+    collecting: str | None = None
+    collected_sdist: tuple[str, str] | None = None
     poetry_build = False
     poetry_operations: dict[str, set[str]] = {}  # canonical name -> the versions Poetry's operation lines name
     pdm_versions: dict[str, set[str]] = {}
@@ -170,9 +213,9 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
     pdm_error: str | None = None
     pdm_traceback = False
 
-    def failed(name: str, version: str | None) -> None:
+    def failed(name: str, version: str | None, pip: bool = False) -> None:
         key = canonicalize_name(name)
-        if version is None:
+        if pip:
             version = pip_version(name, key)
         if key in failures and failures[key][1] != version:
             raise SourceError(
@@ -185,7 +228,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
                 "like a broken build environment rather than missing wheels"
             )
 
-    def pip_version(name: str, key: str) -> str:
+    def interleaving(name: str) -> None:
+        # pip's lines name the version before the failure: from two steps, they may be another run's.
+        if interleaved:
+            raise SourceError(
+                "--from-log: the log mixes the output of more than one Docker build step, so which version of "
+                f"{name} failed isn't clear; refusing to guess (check {name}==VERSION directly)"
+            )
+
+    def pip_version(name: str, key: str) -> str | None:
+        interleaving(name)
         # pip doesn't say which version failed, so it must be the one version the log names for it.
         seen = versions.get(key)
         if seen == _UNCLEAR:
@@ -204,13 +256,25 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
                 f"--from-log: the log installs {name} from a URL or a path, not from an index, so it can't be checked"
             )
         if not isinstance(seen, dict) or not seen:
-            # A local project (`pip install .` logs `Processing`, never `Collecting`), `pip install -q`, or a log
-            # whose start was cut off. PyPI's newest release of that name may be another project altogether.
-            raise SourceError(
-                f"--from-log: the log doesn't say which version of {name} failed to build (pip logs `Processing` "
-                "for a local project, and `pip install -q` hides `Collecting`); refusing to guess "
-                f"(check {name}==VERSION directly)"
-            )
+            # `pip install -q` hides `Collecting`, and a log's start may be cut off: an exact pin on the install
+            # command gives the version, else it's the latest (said in a note). But for a local project (`pip
+            # install .` logs `Processing`, never `Collecting`), PyPI's release of that name may be another project.
+            pins = command_pins.get(key, set())
+            if len(pins) > 1:
+                raise SourceError(
+                    f"--from-log: the log's install commands pin {name} to more than one version (or also "
+                    f"unpinned), so which version failed is unclear; refusing to guess (check {name}==VERSION directly)"
+                )
+            if None not in pins and pins:
+                return str(next(iter(pins)))
+            if local:
+                raise SourceError(
+                    f"--from-log: the log doesn't say which version of {name} failed to build, and pip's "
+                    "`Processing`/`Obtaining` line or the install command says it may be a local project, "
+                    "not PyPI's; refusing to guess "
+                    f"(check {name}==VERSION directly)"
+                )
+            return None
         if len(seen) > 1:
             raise SourceError(
                 f"--from-log: pip tried more than one version of {name}, so which version failed isn't clear; "
@@ -238,13 +302,30 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
         if not all(_NAME_RE.fullmatch(n) and canonicalize_name(n) in built for n in names):
             raise SourceError("--from-log: can't read pip's list of packages that failed to build; refusing to guess")
         for n in names:
-            failed(n, None)
+            failed(n, None, pip=True)
 
     # After pip 25.2's `Failed to build installable wheels ...`: whether it had the `×`, so the names follow `╰─>`.
     diagnostic: bool | None = None
     for line in _ANSI.sub("", text).splitlines():
         if m := _TIMESTAMP.match(line):
             line = line[m.end() :]
+        if m := _BUILDKIT.match(line):
+            line = line[m.end() :]
+            if (sid := m.group("step")) and sid != step:
+                interleaved |= sid in steps_left
+                if step is not None:
+                    steps_left.add(step)
+                step = sid
+        # Not a comment, an echo, or a build's output (indented further than a Dockerfile excerpt's `   3 | >>> RUN`)
+        if (
+            (m := _INSTALL_COMMAND.search(line))
+            and len(line) - len(line.lstrip()) < 6
+            and not re.match(r"\s*#(?!\d+ )|.*\becho\b", line[: m.start() + 1])
+        ):
+            pins_found, local_arg = _command_pins(m.group(1))
+            local |= local_arg
+            for pin_key, pinned in pins_found:
+                command_pins.setdefault(pin_key, set()).add(pinned)
         if line.startswith("Synchronizing working set with resolved packages:"):
             pdm_versions.clear()
             pdm_sources.clear()
@@ -342,8 +423,12 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
             # A later run's failure without its own `Collecting` line must not take this run's version.
             for key in versions:
                 versions[key] = _EARLIER
+        if (m := _LOCAL.match(line)) and _file_version(m.group(1)) is None:
+            local = True
+            collecting = collected_sdist = None
         if m := _COLLECT.match(line):
             key, rest = canonicalize_name(m.group(1)), m.group(2)
+            collecting, collected_sdist = key, None
             if (pin := _PIN.match(rest)) and _is_version(pin.group(1)):
                 versions[key] = {Version(pin.group(1)): pin.group(1)}
             elif rest.lstrip().startswith("@"):
@@ -354,6 +439,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
                 versions[key] = {}
         elif (m := _FILE.match(line)) and (found := _file_version(m.group(1))):
             named(canonicalize_name(found[0]), found[1])
+            if canonicalize_name(found[0]) == collecting and m.group(1).endswith((".tar.gz", ".zip")):
+                collected_sdist = found
+        if _PREPARE_FAILED.fullmatch(line):
+            if collected_sdist is None:
+                raise SourceError(
+                    "--from-log: pip failed to prepare a package to build, but the log doesn't name its sdist after "
+                    "the last `Collecting` line; refusing to guess"
+                )
+            interleaving(collected_sdist[0])
+            failed(*collected_sdist)
         if backtracked is None and (m := _BACKTRACK.match(line)):
             backtracked = m.group(1)
         if m := _BUILDING.search(line):
@@ -386,6 +481,41 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
             NO_FAILURE,
         )
     return list(failures.values())
+
+
+def _command_pins(args: str) -> tuple[list[tuple[str, Version | None]], bool]:
+    """The (canonical name, version) of each requirement among a pip install command's arguments (None without an
+    exact pin), and whether it installs a local path (`.`, `-e .`, `C:\\src\\foo`)."""
+    try:
+        words = shlex.split(args, comments=True)
+    except ValueError:  # an unclosed quote: the end of a command quoted inside another line (Docker's error)
+        words = [word.strip("'\"") for word in args.split()]
+    pins: list[tuple[str, Version | None]] = []
+    local = False
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        if word in ("-e", "--editable"):
+            local = True
+        if word.startswith("-"):
+            skip = word in _INSTALL_VALUE_OPTIONS
+            continue
+        if word.startswith((".", "/", "~")) or "/" in word or "\\" in word or re.match(r"[A-Za-z]:", word):
+            local = True
+            continue
+        try:
+            req = Requirement(word)
+        except InvalidRequirement:
+            continue
+        clauses = list(req.specifier)
+        exact = not req.url and len(clauses) == 1 and clauses[0].operator in ("==", "===")
+        if exact and "*" not in clauses[0].version and _is_version(clauses[0].version):
+            pins.append((canonicalize_name(req.name), Version(clauses[0].version)))
+        else:
+            pins.append((canonicalize_name(req.name), None))
+    return pins, local
 
 
 def _pdm_index(url: str, key: str) -> str:
@@ -423,9 +553,10 @@ def _is_version(version: str | None) -> bool:
     return True
 
 
-def log_source(failures: list[tuple[str, str]]) -> Source:
-    """The packages to check, as PyPI names: built from the log's names and versions, never read as paths."""
+def log_source(failures: list[tuple[str, str | None]]) -> Source:
+    """The packages to check, as PyPI names: built from the log's names and versions (the latest release when the log
+    names none), never read as paths."""
     source = Source("install log", pypi_only=True)
     for name, version in failures:
-        source.packages.append(requirement_to_package(f"{name}=={version}", "install log"))
+        source.packages.append(requirement_to_package(name if version is None else f"{name}=={version}", "install log"))
     return source

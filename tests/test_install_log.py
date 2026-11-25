@@ -45,6 +45,12 @@ def log(name: str) -> str:
         ("poetry-normal.log", [("pyaudio", "0.2.14")]),
         ("poetry-verbose.log", [("pyaudio", "0.2.14")]),
         ("pdm-verbose.log", [("pyaudio", "0.2.14")]),
+        # Real logs from public issues (#735, #736, #737): a Docker build's excerpt, with BuildKit's `28.56 ` prefix
+        # and the version from the Dockerfile's `RUN pip install`; the version from a shell prompt's `pip install`;
+        # and pip's `Getting requirements to build wheel` failure, for the sdist collected last.
+        ("docker-tokenizers.log", [("tokenizers", "0.20.0")]),
+        ("pip-grpcio-prompt.log", [("grpcio", "1.73.1")]),
+        ("pip-pyyaml-build-requirements.log", [("pyyaml", "5.4")]),
     ],
 )
 def test_failed_builds(name, expected):
@@ -221,8 +227,6 @@ def test_column_0_text_that_names_no_built_package_is_not_pip_summary():
         ("pip-two-versions.log", "forked failed to build at more than one version"),
         ("pip-git-url.log", "installs nowheels from a URL or a path"),
         ("uv-local-project.log", "not as NAME==VERSION"),
-        # The log's start was cut off: no version to be found.
-        ("pip-no-version.log", r"doesn't say which version of nowheels failed to build .*check nowheels==VERSION"),
     ],
 )
 def test_refuses_rather_than_guesses(name, fragment):
@@ -243,13 +247,125 @@ Failed to build nowheels
     [
         # `pip install .` logs `Processing`, never `Collecting`: PyPI's nowheels may be another project.
         "Processing /home/me/nowheels\n  Installing build dependencies ... done\n" + BUILD_FAILED,
-        # `pip install -q` hides `Collecting`, `Building wheel for` and `Failed to build`.
-        "  ERROR: Failed building wheel for nowheels\nERROR: Failed to build installable wheels for some "
-        "pyproject.toml based projects (nowheels)\n",
+        "Obtaining file:///home/me/nowheels\n" + BUILD_FAILED,  # `pip install -e .`
     ],
 )
-def test_no_version_is_refused(text):
-    with pytest.raises(SourceError, match="doesn't say which version of nowheels failed to build"):
+def test_no_version_for_a_local_project_is_refused(text):
+    with pytest.raises(SourceError, match="doesn't say which version of nowheels failed to build.*local project"):
+        failed_builds(text)
+
+
+PIP_Q_FAILED = (
+    "  ERROR: Failed building wheel for nowheels\nERROR: Failed to build installable wheels for some "
+    "pyproject.toml based projects (nowheels)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        PIP_Q_FAILED,  # `pip install -q` hides `Collecting`, `Building wheel for` and `Failed to build`
+        log("pip-no-version.log"),  # the log's start was cut off
+        "$ pip install -q 'nowheels>=0.5'\n" + PIP_Q_FAILED,  # a range isn't a version
+        "$ pip install -q nowheels==0.*\n" + PIP_Q_FAILED,  # nor is a wildcard
+        # A cached wheel pip installs isn't a local project.
+        "Processing /root/.cache/pip/wheels/ab/cd/other-1.0-py3-none-any.whl\n" + PIP_Q_FAILED,
+    ],
+)
+def test_no_version_anywhere_is_the_latest(text):
+    # The caller checks the latest release and says so.
+    assert failed_builds(text) == [("nowheels", None)]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$ pip install -q nowheels==0.9",
+        "RUN pip install --no-cache-dir -r requirements.txt nowheels==0.9",
+        "RUN uv pip install --system 'nowheels == 0.9' other",
+        "PS C:\\app> python -m pip install -i https://pypi.org/simple nowheels===0.9",
+        "#5 [2/2] RUN /venv/bin/pip3 install nowheels[extra]==0.9",
+        # Docker's error quotes the command: what follows `pip install` has an unclosed quote.
+        'ERROR: failed to solve: process "/bin/sh -c pip install nowheels==0.9" did not complete successfully',
+    ],
+)
+def test_the_install_command_gives_the_version(command):
+    assert failed_builds(command + "\n" + PIP_Q_FAILED) == [("nowheels", "0.9")]
+
+
+def test_install_commands_that_pin_two_versions_are_refused():
+    text = "$ pip install nowheels==0.9\n$ pip install nowheels==1.0\n" + PIP_Q_FAILED
+    with pytest.raises(SourceError, match="install commands pin nowheels to more than one version"):
+        failed_builds(text)
+
+
+def test_pips_own_lines_beat_the_install_command():
+    # `pip install nowheels` then a `pip install` of the dependency at another version: pip's `Collecting` wins.
+    text = "$ pip install nowheels==1.0\nCollecting nowheels==0.9\n" + BUILD_FAILED
+    assert failed_builds(text) == [("nowheels", "0.9")]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "#12 28.56 ",  # `docker build --progress=plain`
+        "28.56 ",  # the failed step's excerpt at the end of `docker build`
+        "2024-09-03T10:00:00.1234567Z #12 28.56 ",  # a docker build in GitHub Actions
+    ],
+)
+def test_docker_buildkit_prefixes_are_skipped(prefix):
+    text = "".join(prefix + line + "\n" for line in ("Collecting nowheels==0.9", *BUILD_FAILED.splitlines()))
+    assert failed_builds(text + prefix.rstrip() + "\n") == [("nowheels", "0.9")]  # and a prefix alone on a line
+
+
+def test_a_step_number_without_seconds_is_not_a_prefix():
+    # `#12 [2/2] RUN ...` and `#12 DONE 0.5s` are BuildKit's own lines: only `#N SECONDS ` is stripped.
+    text = "#12 DONE 0.5s\nCollecting nowheels==0.9\n" + BUILD_FAILED.replace("\nFailed", "\n#12 Failed")
+    with pytest.raises(LogError, match="found no package"):
+        failed_builds(text)
+
+
+PREPARE_FAILED = [
+    "  × Getting requirements to build wheel did not run successfully.",
+    "× Getting requirements to build editable did not run successfully.",
+    "  × Preparing metadata (pyproject.toml) did not run successfully.",
+    "error: metadata-generation-failed",
+    "× Encountered error while generating package metadata.",
+]
+
+
+@pytest.mark.parametrize("error", PREPARE_FAILED)
+def test_a_failure_before_building_is_the_sdist_collected_last(error):
+    text = (
+        "Collecting fastlib\n  Downloading fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl (1 MB)\n"
+        "Collecting nowheels>=0.5 (from fastlib)\n  Downloading nowheels-0.9.tar.gz (5 kB)\n"
+        "  Installing build dependencies ... done\n"
+        f"{error}\n"
+    )
+    assert failed_builds(text) == [("nowheels", "0.9")]
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        "Collecting nowheels\n  Downloading nowheels-0.9-py3-none-any.whl (5 kB)\n",  # a wheel, not an sdist
+        "Collecting nowheels==0.9\n",  # no sdist named
+        # A local project after an sdist that was prepared fine.
+        "Collecting nowheels==0.9\n  Downloading nowheels-0.9.tar.gz (5 kB)\nProcessing ./myproject\n",
+        # A build dependency's sdist, under `pip install -v`, isn't the package being collected.
+        "Collecting fastlib\n    Downloading nowheels-0.9.tar.gz (5 kB)\n",
+        "",
+    ],
+)
+def test_a_failure_before_building_without_its_sdist_is_refused(before):
+    with pytest.raises(SourceError, match="doesn't name its sdist after the last `Collecting` line"):
+        failed_builds(before + "  Getting requirements to build wheel ... error\n" + PREPARE_FAILED[0] + "\n")
+
+
+def test_a_failure_before_building_in_a_build_dependencys_pip_is_not_this_runs():
+    # The pip that installs build dependencies indents its own output further.
+    text = "Collecting nowheels==0.9\n  Downloading nowheels-0.9.tar.gz (5 kB)\n      " + PREPARE_FAILED[0].strip()
+    with pytest.raises(LogError, match="found no package"):
         failed_builds(text)
 
 
@@ -572,7 +688,7 @@ def test_flags_it_cant_be_combined_with(capsys, extra, flag):
     [
         ("pip-unclear-version.log", "collects forked again without a version"),
         ("pip-succeeded.log", "found no package that failed to build"),
-        ("pip-no-version.log", "doesn't say which version of nowheels failed to build"),  # never asks PyPI for it
+        ("pip-two-versions.log", "forked failed to build at more than one version"),  # never asks PyPI for it
     ],
 )
 def test_an_unreadable_log_is_an_input_error(capsys, fake_pypi, name, fragment):
@@ -585,3 +701,81 @@ def test_an_unreadable_log_is_an_input_error(capsys, fake_pypi, name, fragment):
 def test_a_missing_log_is_an_input_error(capsys, tmp_path):
     code, _, err = run(capsys, "--from-log", str(tmp_path / "nope.log"), "-p", "3.13", "-t", "win-amd64")
     assert code == 2 and f"--from-log: can't read {tmp_path / 'nope.log'}" in err
+
+
+def test_no_version_in_the_log_checks_the_latest_release_with_a_note(capsys, fake_pypi):
+    code, out, err = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--json"))
+    assert code == 1
+    (pkg,) = json.loads(out)["packages"]
+    assert (pkg["name"], pkg["version"], pkg["results"]) == ("nowheels", "0.9", {"win-amd64": "source"})
+    assert fake_pypi[0] == "https://pypi.org/pypi/nowheels/json"
+    assert "these failed to build: nowheels (the log doesn't name the version)\n" in err
+    assert (
+        "wheelgap: note: the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9, "
+        "the latest release" in err
+    )
+
+
+def test_a_pinned_log_has_no_latest_note(capsys, fake_pypi):
+    _, _, err = run(capsys, *from_log("uv-ansi.log", "-t", "win-arm64"))
+    assert "the latest release" not in err
+
+
+_FOO_FAILED = "  ERROR: Failed building wheel for foo\nFailed to build foo\n"
+
+
+@pytest.mark.parametrize(
+    ("log", "refusal"),
+    [
+        ("Run pip install -q .\n" + _FOO_FAILED, "local project"),
+        ("$ pip install -q -e .\n" + _FOO_FAILED, "local project"),
+        ("PS C:\\src> pip install -q C:\\src\\foo\n" + _FOO_FAILED, "local project"),
+        ("$ pip install -q foo==1.0\n$ pip install -q --upgrade foo\n" + _FOO_FAILED, "more than one version"),
+        (
+            "#7 1.2 Collecting foo==1.0\n#7 1.3   Downloading foo-1.0.tar.gz\n#8 1.4 Collecting foo==2.0\n"
+            "#8 1.5   Downloading foo-2.0.tar.gz\n#7 9.0   Building wheel for foo (pyproject.toml): started\n"
+            "#7 9.1   ERROR: Failed building wheel for foo\n#7 9.2 Failed to build foo\n",
+            "more than one Docker build step",
+        ),
+    ],
+)
+def test_install_commands_and_buildkit_steps_that_make_the_version_unclear_are_refused(log, refusal):
+    with pytest.raises(SourceError, match=refusal):
+        failed_builds(log)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["# RUN pip install foo==1.0\n", "echo 'pip install foo==1.0'\n", "      hint: pip install foo==0.9\n"]
+)
+def test_a_commented_or_echoed_pin_is_not_the_version(prefix):
+    assert failed_builds(prefix + _FOO_FAILED) == [("foo", None)]
+
+
+def test_the_latest_release_note_is_in_json_and_markdown(capsys, fake_pypi):
+    # A report read without stderr must not show the latest release as the log's version.
+    _, out, _ = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--json"))
+    (note,) = json.loads(out)["from_log_notes"]
+    assert (note["name"], note["version"], note["kind"]) == ("nowheels", "0.9", "latest")
+    assert note["message"].startswith("the log doesn't name the version of nowheels that failed to build")
+    _, out, _ = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--markdown"))
+    assert "> **Note:** the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9" in out
+
+
+def test_a_pinned_log_has_empty_from_log_notes(capsys, fake_pypi):
+    _, out, _ = run(capsys, *from_log("pip23-laggard.log", "-t", "win-amd64", "--json"))
+    assert json.loads(out)["from_log_notes"] == []
+
+
+def test_uv_failures_are_read_when_buildkit_steps_interleave():
+    # uv names the version on its failure line, so other steps' lines in between don't matter.
+    text = "#7 1.0 Resolved 1 package\n#8 1.1 Collecting other==1.0\n#7 2.0 × Failed to build `nowheels==0.9`\n"
+    assert failed_builds(text) == [("nowheels", "0.9")]
+
+
+def test_a_failure_before_building_is_refused_when_buildkit_steps_interleave():
+    text = (
+        "#7 1.0 Collecting nowheels==0.9\n#7 1.1   Downloading nowheels-0.9.tar.gz (5 kB)\n#8 1.2 other output\n"
+        "#7 2.0   × Getting requirements to build wheel did not run successfully.\n"
+    )
+    with pytest.raises(SourceError, match="more than one Docker build step"):
+        failed_builds(text)

@@ -2886,6 +2886,18 @@ def test_diff_lockfiles_refuses_an_index_url_beside_either_lockfile(fake_pypi, t
     assert "sets index-url in [tool.wheelgap], which wheelgap diff doesn't read yet" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_diff_lockfiles_non_table_tool_is_a_tool_error(fake_pypi, tmp_path, side):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    (tmp_path / side / "pyproject.toml").write_text("tool = 1\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert "[tool] must be a table" in text
+    assert "AttributeError" not in text
+    assert fake_pypi == []
+
+
 def test_diff_lockfiles_malformed_lockfile_is_a_tool_error(fake_pypi, tmp_path):
     old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
     Path(new).write_text("[[package\n", encoding="utf-8")
@@ -3034,13 +3046,27 @@ def test_explain_install_failure_log_with_no_failure_is_an_error(fake_pypi):
 
 
 def test_explain_install_failure_refusal_gives_the_tools_advice(fake_pypi):
-    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    result = explain_failure(log=install_log("pip-unclear-version.log"), python="3.13", targets=["win-amd64"])
     assert result["isError"] is True
     text = result["content"][0]["text"]
-    assert text.startswith("the log doesn't say which version of nowheels failed to build")
-    assert "(call check_package for nowheels with the version)" in text
+    assert text.startswith("the log collects forked again without a version")
+    assert "(call check_package for forked with the version)" in text
     assert "--from-log" not in text and "==VERSION" not in text
     assert fake_pypi == []
+
+
+def test_explain_install_failure_without_a_version_checks_the_latest(fake_pypi):
+    # #736: an agent gets an answer, not an error, when the log names no version.
+    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    assert result["isError"] is False
+    (pkg,) = result["structuredContent"]["packages"]
+    assert (pkg["name"], pkg["version"], pkg["gaps"]) == ("nowheels", "0.9", ["3.13 win-amd64"])
+    assert any(
+        n.startswith(
+            "the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9, the latest"
+        )
+        for n in result["structuredContent"]["notes"]
+    )
 
 
 @pytest.mark.parametrize(

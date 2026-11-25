@@ -547,3 +547,24 @@ def test_mobile_versions_and_errors():
         build_targets(["3.13"], ["ios"], ios="abc")
     with pytest.raises(TargetError, match="iOS 11.0 is too old"):
         build_targets(["3.13"], ["ios"], ios="11.0")
+
+
+def test_libc_versions_require_minor_and_valid_major():
+    from wheelgap.targets import parse_version_pair
+
+    with pytest.raises(TargetError, match=r"glibc version '2' needs a minor version too \(expected e\.g\. 2\.36\)"):
+        parse_version_pair("2", "glibc")
+    for spec in ("3.1", "1.36"):
+        with pytest.raises(TargetError, match=r"doesn't exist: glibc versions are 2\.x"):
+            parse_version_pair(spec, "glibc")
+    with pytest.raises(TargetError, match="musl version '1' needs a minor version too"):
+        parse_version_pair("1", "musl")
+    with pytest.raises(TargetError, match=r"doesn't exist: musl versions are 1\.x"):
+        parse_version_pair("2.0", "musl")
+    with pytest.raises(TargetError, match="glibc version '2' needs a minor version too"):
+        build_targets(["3.13"], ["linux-x86_64"], glibc="2")
+    assert parse_version_pair("2.17", "glibc") == (2, 17)
+    assert parse_version_pair("2.36", "glibc") == (2, 36)
+    assert parse_version_pair("1.1", "musl") == (1, 1)
+    assert parse_version_pair("1.2", "musl") == (1, 2)
+    assert parse_version_pair("15", "macOS") == (15, 0)
