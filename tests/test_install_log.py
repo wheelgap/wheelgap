@@ -719,3 +719,63 @@ def test_no_version_in_the_log_checks_the_latest_release_with_a_note(capsys, fak
 def test_a_pinned_log_has_no_latest_note(capsys, fake_pypi):
     _, _, err = run(capsys, *from_log("uv-ansi.log", "-t", "win-arm64"))
     assert "the latest release" not in err
+
+
+_FOO_FAILED = "  ERROR: Failed building wheel for foo\nFailed to build foo\n"
+
+
+@pytest.mark.parametrize(
+    ("log", "refusal"),
+    [
+        ("Run pip install -q .\n" + _FOO_FAILED, "local project"),
+        ("$ pip install -q -e .\n" + _FOO_FAILED, "local project"),
+        ("PS C:\\src> pip install -q C:\\src\\foo\n" + _FOO_FAILED, "local project"),
+        ("$ pip install -q foo==1.0\n$ pip install -q --upgrade foo\n" + _FOO_FAILED, "more than one version"),
+        (
+            "#7 1.2 Collecting foo==1.0\n#7 1.3   Downloading foo-1.0.tar.gz\n#8 1.4 Collecting foo==2.0\n"
+            "#8 1.5   Downloading foo-2.0.tar.gz\n#7 9.0   Building wheel for foo (pyproject.toml): started\n"
+            "#7 9.1   ERROR: Failed building wheel for foo\n#7 9.2 Failed to build foo\n",
+            "more than one Docker build step",
+        ),
+    ],
+)
+def test_install_commands_and_buildkit_steps_that_make_the_version_unclear_are_refused(log, refusal):
+    with pytest.raises(SourceError, match=refusal):
+        failed_builds(log)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["# RUN pip install foo==1.0\n", "echo 'pip install foo==1.0'\n", "      hint: pip install foo==0.9\n"]
+)
+def test_a_commented_or_echoed_pin_is_not_the_version(prefix):
+    assert failed_builds(prefix + _FOO_FAILED) == [("foo", None)]
+
+
+def test_the_latest_release_note_is_in_json_and_markdown(capsys, fake_pypi):
+    # A report read without stderr must not show the latest release as the log's version.
+    _, out, _ = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--json"))
+    (note,) = json.loads(out)["from_log_notes"]
+    assert (note["name"], note["version"], note["kind"]) == ("nowheels", "0.9", "latest")
+    assert note["message"].startswith("the log doesn't name the version of nowheels that failed to build")
+    _, out, _ = run(capsys, *from_log("pip-no-version.log", "-t", "win-amd64", "--markdown"))
+    assert "> **Note:** the log doesn't name the version of nowheels that failed to build; checked nowheels 0.9" in out
+
+
+def test_a_pinned_log_has_empty_from_log_notes(capsys, fake_pypi):
+    _, out, _ = run(capsys, *from_log("pip23-laggard.log", "-t", "win-amd64", "--json"))
+    assert json.loads(out)["from_log_notes"] == []
+
+
+def test_uv_failures_are_read_when_buildkit_steps_interleave():
+    # uv names the version on its failure line, so other steps' lines in between don't matter.
+    text = "#7 1.0 Resolved 1 package\n#8 1.1 Collecting other==1.0\n#7 2.0 × Failed to build `nowheels==0.9`\n"
+    assert failed_builds(text) == [("nowheels", "0.9")]
+
+
+def test_a_failure_before_building_is_refused_when_buildkit_steps_interleave():
+    text = (
+        "#7 1.0 Collecting nowheels==0.9\n#7 1.1   Downloading nowheels-0.9.tar.gz (5 kB)\n#8 1.2 other output\n"
+        "#7 2.0   × Getting requirements to build wheel did not run successfully.\n"
+    )
+    with pytest.raises(SourceError, match="more than one Docker build step"):
+        failed_builds(text)

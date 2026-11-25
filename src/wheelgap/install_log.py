@@ -34,7 +34,7 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")  # GitHub Actions' prefix on each log line
 # Docker BuildKit's plain progress output: `#12 28.56 ` (step and seconds) on each line of a RUN's output, and `28.56 `
 # alone in the failed step's excerpt that `docker build` prints at the end.
-_BUILDKIT = re.compile(r"(?:#\d+ )?\d+\.\d+(?: |$)")
+_BUILDKIT = re.compile(r"(?:#(?P<step>\d+) )?\d+\.\d+(?: |$)")
 _NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
 # pip's own lines, not a build's output (which pip indents further): `Collecting cryptography==43.0.0 (from ...)`,
 # `Collecting cryptography>=42`, `Collecting x @ https://...`; `  Downloading cryptography-43.0.0.tar.gz (686 kB)`,
@@ -196,7 +196,10 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
     built: set[str] = set()  # names pip printed `Building wheel for` or `Failed building wheel for` for
     failures: dict[str, tuple[str, str | None]] = {}
     # canonical name -> the versions `pip install` lines in the log pin it to exactly
-    command_pins: dict[str, set[Version]] = {}
+    command_pins: dict[str, set[Version | None]] = {}  # None: an install command names it without an exact pin
+    step: str | None = None  # the BuildKit step of the last `#N` line
+    steps_left: set[str] = set()
+    interleaved = False  # BuildKit steps' output mixed (#7, #8, #7): pip's lines may be two runs'
     local = False  # pip's `Processing` or `Obtaining` line for a project that isn't a distribution file
     # The sdist (name, version) downloaded since the last column-0 `Collecting` line, for the package it collects.
     collecting: str | None = None
@@ -225,7 +228,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
                 "like a broken build environment rather than missing wheels"
             )
 
+    def interleaving(name: str) -> None:
+        # pip's lines name the version before the failure: from two steps, they may be another run's.
+        if interleaved:
+            raise SourceError(
+                "--from-log: the log mixes the output of more than one Docker build step, so which version of "
+                f"{name} failed isn't clear; refusing to guess (check {name}==VERSION directly)"
+            )
+
     def pip_version(name: str, key: str) -> str | None:
+        interleaving(name)
         # pip doesn't say which version failed, so it must be the one version the log names for it.
         seen = versions.get(key)
         if seen == _UNCLEAR:
@@ -250,15 +262,16 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
             pins = command_pins.get(key, set())
             if len(pins) > 1:
                 raise SourceError(
-                    f"--from-log: the log's install commands pin {name} to more than one version, so which version "
-                    f"failed isn't clear; refusing to guess (check {name}==VERSION directly)"
+                    f"--from-log: the log's install commands pin {name} to more than one version (or also "
+                    f"unpinned), so which version failed is unclear; refusing to guess (check {name}==VERSION directly)"
                 )
-            if pins:
+            if None not in pins and pins:
                 return str(next(iter(pins)))
             if local:
                 raise SourceError(
                     f"--from-log: the log doesn't say which version of {name} failed to build, and pip's "
-                    "`Processing` or `Obtaining` line says it may be a local project, not PyPI's; refusing to guess "
+                    "`Processing`/`Obtaining` line or the install command says it may be a local project, "
+                    "not PyPI's; refusing to guess "
                     f"(check {name}==VERSION directly)"
                 )
             return None
@@ -298,8 +311,20 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
             line = line[m.end() :]
         if m := _BUILDKIT.match(line):
             line = line[m.end() :]
-        if m := _INSTALL_COMMAND.search(line):
-            for pin_key, pinned in _command_pins(m.group(1)):
+            if (sid := m.group("step")) and sid != step:
+                interleaved |= sid in steps_left
+                if step is not None:
+                    steps_left.add(step)
+                step = sid
+        # Not a comment, an echo, or a build's output (indented further than a Dockerfile excerpt's `   3 | >>> RUN`)
+        if (
+            (m := _INSTALL_COMMAND.search(line))
+            and len(line) - len(line.lstrip()) < 6
+            and not re.match(r"\s*#(?!\d+ )|.*\becho\b", line[: m.start() + 1])
+        ):
+            pins_found, local_arg = _command_pins(m.group(1))
+            local |= local_arg
+            for pin_key, pinned in pins_found:
                 command_pins.setdefault(pin_key, set()).add(pinned)
         if line.startswith("Synchronizing working set with resolved packages:"):
             pdm_versions.clear()
@@ -422,6 +447,7 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
                     "--from-log: pip failed to prepare a package to build, but the log doesn't name its sdist after "
                     "the last `Collecting` line; refusing to guess"
                 )
+            interleaving(collected_sdist[0])
             failed(*collected_sdist)
         if backtracked is None and (m := _BACKTRACK.match(line)):
             backtracked = m.group(1)
@@ -457,31 +483,39 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
     return list(failures.values())
 
 
-def _command_pins(args: str) -> list[tuple[str, Version]]:
-    """The (canonical name, version) of each exact pin among a pip install command's arguments."""
+def _command_pins(args: str) -> tuple[list[tuple[str, Version | None]], bool]:
+    """The (canonical name, version) of each requirement among a pip install command's arguments (None without an
+    exact pin), and whether it installs a local path (`.`, `-e .`, `C:\\src\\foo`)."""
     try:
         words = shlex.split(args, comments=True)
     except ValueError:  # an unclosed quote: the end of a command quoted inside another line (Docker's error)
         words = [word.strip("'\"") for word in args.split()]
-    pins: list[tuple[str, Version]] = []
+    pins: list[tuple[str, Version | None]] = []
+    local = False
     skip = False
     for word in words:
         if skip:
             skip = False
             continue
+        if word in ("-e", "--editable"):
+            local = True
         if word.startswith("-"):
             skip = word in _INSTALL_VALUE_OPTIONS
+            continue
+        if word.startswith((".", "/", "~")) or "/" in word or "\\" in word or re.match(r"[A-Za-z]:", word):
+            local = True
             continue
         try:
             req = Requirement(word)
         except InvalidRequirement:
             continue
         clauses = list(req.specifier)
-        if req.url or len(clauses) != 1 or clauses[0].operator not in ("==", "===") or "*" in clauses[0].version:
-            continue
-        if _is_version(clauses[0].version):
+        exact = not req.url and len(clauses) == 1 and clauses[0].operator in ("==", "===")
+        if exact and "*" not in clauses[0].version and _is_version(clauses[0].version):
             pins.append((canonicalize_name(req.name), Version(clauses[0].version)))
-    return pins
+        else:
+            pins.append((canonicalize_name(req.name), None))
+    return pins, local
 
 
 def _pdm_index(url: str, key: str) -> str:

@@ -530,6 +530,10 @@ check, each with its `file` and `why` (`[]` in the usual case), and `other_requi
 `compiled`, whether it looks like `pip-compile`, `uv pip compile` or `uv export` output that pins everything (a hint
 for which to check next, never used to choose; those come first), and `[]` otherwise. The key is absent when no input was a directory. See
 [Which file is read](inputs.md#which-file-is-read).
+`from_log_notes` (**after 0.14.0**; with [`--from-log`](cli.md#from-log) only, `[]` in the usual case) lists each
+failed package checked at its latest release because the log doesn't name its version, one object each: `name`,
+`version` (the release checked), `kind` (`latest`) and the `message` the note on stderr has. `--markdown` adds the same
+message as a `> **Note:**` line.
 `dockerfile_notes` lists what a `--dockerfile` answer leaves out, one object each: the `dockerfile`
 path as given, the `line` it is about (or `null`), a `kind` to match on and the `message` the note on stderr has.
 The kinds: `image-not-read` (`-p` and `-t` stood in for an [image wheelgap can't read](cli.md#dockerfile));

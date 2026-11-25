@@ -627,9 +627,13 @@ Cython 3 break is one); without such an sdist it's an error. When pip's lines do
 hides `Collecting`, or the log's start was cut off), an exact pin on a `pip install`, `uv pip install` or `RUN pip
 install` line in the log gives it (`pip install 'grpcio ==1.73.1'` at a shell prompt, a Dockerfile's `RUN pip install
 tokenizers==0.20.0`); with no version anywhere, the latest release is checked, with a note (`the log doesn't name the
-version of NAME that failed to build; checked NAME X, the latest release`). It's still an error when pip's `Processing`
-or `Obtaining` line says the package may be a local project (`pip install .`), whose name PyPI may give another
-project; check `NAME==VERSION` directly then. Docker BuildKit's output works too: its `#12 28.56 ` prefix
+version of NAME that failed to build; checked NAME X, the latest release`; in `--json` as
+[`from_log_notes`](output.md#json), and in `--markdown`). It's still an error when pip's `Processing` or `Obtaining`
+line, or a path or `-e` on the log's install command (`pip install -q .`), says the package may be a local project,
+whose name PyPI may give another project; when the install commands also name the package unpinned (`pip install -U
+NAME` after `NAME==1.0`); and when Docker BuildKit steps' output interleaves (`#7`, `#8`, then `#7` again), since pip's
+lines may then be another step's. Check `NAME==VERSION` directly then. Install commands on a comment or `echo` line, or
+in a build's output (indented 6 or more spaces), don't count. Docker BuildKit's output works too: its `#12 28.56 ` prefix
 (`--progress=plain`) and the `28.56 ` prefix of the failed step's excerpt are skipped, as GitHub Actions timestamps
 are. A failure inside the pip that installs build dependencies (`× pip subprocess to install build dependencies did
 not run successfully`) isn't read.
