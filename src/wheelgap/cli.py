@@ -49,6 +49,7 @@ from .deps import Resolver, pinned_complete, resolve_deps
 from .dockerfile import (
     _PIP_PYLOCK_NAME_RE,
     PASSED_OVER,
+    PYTORCH_INDEX,
     DockerfileError,
     HeredocSyntaxError,
     ImageTarget,
@@ -1260,7 +1261,17 @@ def dockerfile_report_notes(
         }
         for line, what in report.copied
     ]
-    order = sorted({line for line, _ in (*report.warnings, *report.copied)})
+    warnings += [
+        {
+            "dockerfile": dockerfile,
+            "line": line,
+            "kind": "may-install",
+            "message": f"this install uses {PYTORCH_INDEX}, which wheelgap doesn't read; "
+            "its packages and their dependencies aren't checked",
+        }
+        for line in report.pytorch_lines
+    ]
+    order = sorted({line for line, _ in (*report.warnings, *report.copied)} | set(report.pytorch_lines))
     warnings.sort(key=lambda entry: order.index(entry["line"]))  # type: ignore[arg-type]
     unseen = ""
     if order:
@@ -1269,7 +1280,12 @@ def dockerfile_report_notes(
         if report.copied:
             does += (", or " if does else "") + f"cop{'ies' if one else 'y'} files from another stage or image"
         brought = "bring" if report.copied else "install"
-        unseen = f"{dockerfile} {_line_list(order)} {does}: any Python packages they {brought} are not in this answer."
+        if report.pytorch_lines:
+            unseen = f"{dockerfile}: {unseen_lines(order)}; those installs aren't fully covered by this answer."
+        else:
+            unseen = (
+                f"{dockerfile} {_line_list(order)} {does}: any Python packages they {brought} are not in this answer."
+            )
     return notes, warnings, unseen
 
 
@@ -1757,6 +1773,17 @@ def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
     """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
     if "://" in spec:
         raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {undo_offline(how)}")
+
+
+def mark_pytorch_packages(source: Source, dockerfile: str, lines: dict[str, int]) -> None:
+    """Leave unknown rows out of both normal lookups and rechecks of locked files."""
+    for pkg in source.packages:
+        if pkg.skip or (line := lines.get(pkg.key)) is None:
+            continue
+        pkg.error = f"{dockerfile}:{line}: this package may come from {PYTORCH_INDEX}, an index wheelgap doesn't read"
+        pkg.files = None
+        pkg.registry = None
+        pkg.partial_files = False
 
 
 def unpinned_requirement_names(source: Source) -> list[str]:
@@ -2645,6 +2672,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     if args.inputs
                     else []
                 )
+                for source in sources:
+                    if source.path is not None and (pytorch := inputs_report.pytorch_files.get(source.path)):
+                        mark_pytorch_packages(source, args.dockerfile, pytorch)
                 for (named_line, named_texts, by_uv), line_files in zip(
                     inputs_report.named, inputs_report.named_files, strict=True
                 ):
@@ -2656,6 +2686,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         for text in named_texts:
                             named.packages.append(requirement_to_package(text, named.label))
                             named.specs.append(text)
+                    if pytorch := inputs_report.pytorch_named.get(named_line):
+                        mark_pytorch_packages(named, args.dockerfile, pytorch)
                     sources.append(named)
                     if by_uv:
                         uv_named.add(id(named))

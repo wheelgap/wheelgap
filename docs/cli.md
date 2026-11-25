@@ -167,6 +167,19 @@ When no install line is left to read, that is an error too, and it names the lin
 | `--no-deps` | Taken; with `--deps` it is an error, since the line installs no dependencies |
 | `--prefer-binary` | Read only when every requirement the line installs is pinned with `==` (in `FILE`, in the files it includes, and in a `-r` inside a `-c` file; a requirement that a constraint pins with `==` counts) and `--deps` isn't used: otherwise pip may take an older release that has a wheel over a newer one that has none, while wheelgap checks the newest |
 
+**PyTorch's index (after 0.14.0).** A plain `RUN pip install NAME...` with one `--index-url` or
+`--extra-index-url` on the exact HTTPS host `download.pytorch.org` no longer stops the rest of the check. For
+example, `RUN pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu` lists `torch` as
+`unknown`, with its Dockerfile line. Wheelgap sends none of the names on that line to either index: even with
+`--extra-index-url`, pip might choose a file from that host. A later requirement for the same name in the same
+Python environment is also `unknown` because pip may keep the installed version. A requirements file used both
+before and after that install is only reported once, with that name marked `unknown` and the reason pointing to
+the index line. Ordinary names on other lines are still checked. This is not a complete build check: the text report
+warns, `--json` sets
+`summary.complete` to `false`, and `--deps` refuses because the uninspected packages can change the dependency
+set. Index URLs are not printed. Other index choices, mirrors, URLs with credentials, ports, queries or fragments,
+compound commands, and index options on a `-r FILE` or `uv pip install` line are still refused.
+
 **`uv pip install` flags.** `--system` (or an earlier `ENV UV_SYSTEM_PYTHON=1` or
 `=true`) is required: without it uv installs into a virtual environment. Any other flag is an error, pip's own among
 them (`--no-input`, `--disable-pip-version-check`, `--root-user-action`, `--prefer-binary`, `--no-compile`,

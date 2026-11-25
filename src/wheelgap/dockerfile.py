@@ -2453,6 +2453,10 @@ class InputsReport:
     # (line, name) for each Python package a system package command installs (apk add py3-yaml, apt-get install
     # python3-numpy): pip keeps one that satisfies a requirement, where wheelgap checks a fresh install.
     system_python: list[tuple[int, str]] = field(default_factory=list)
+    pytorch_lines: list[int] = field(default_factory=list)
+    # For names this run can't check: the original foreign-index line, by canonical name in each input.
+    pytorch_named: dict[int, dict[str, int]] = field(default_factory=dict)
+    pytorch_files: dict[Path, dict[str, int]] = field(default_factory=dict)
 
     def passed(self, kind: str, number: int) -> None:
         lines = self.passed_over.setdefault(kind, [])
@@ -2488,6 +2492,7 @@ class _Install:
     scripts: int = 0  # how many commands that run the project's own scripts come before it (InputsReport.scripts)
     sync: bool = False  # `uv sync`, which installs the lock beside pyproject.toml in its working folder
     sync_no_dev: bool = False  # `uv sync --no-dev`
+    pytorch: bool = False  # the explicit requirements on the exact approved index form, with no lookup
 
 
 def _up_the_tree(folder: str) -> Iterable[str]:
@@ -2739,6 +2744,7 @@ class _RunReader:
         exited: str | None = None  # an `exit` or `return` before the command: it may never run
         image_path = self.path  # a RUN is a shell of its own: what it does to PATH ends with it
         groups = self._and_or_lists(commands)
+        pytorch = _pytorch_requirements(args)
         for index, command in enumerate(commands):
             words = list(command.words)
             texts = [word.text for word in words]
@@ -2817,7 +2823,14 @@ class _RunReader:
             # Input from a redirect or a pipe: an interpreter with no script named runs it (`python < setup.py`).
             # `3< FILE` opens another file descriptor (its operator is "3<"), not the input.
             stdin = command.before == "|" or any(op in ("<", "<<<", "<>", "<&") for op, _ in command.redirects)
-            kind, detail = self._classify(number, words, cwd, uv_system, stop, stdin) if words else ("shell", "")
+            if pytorch:
+                self._python("pip", "pip", cwd, "pip install", stop)
+                kind, detail = self._into(
+                    ("install", _Install(False, [], [], False, pytorch, None, None, pytorch=True)),
+                    self._environment("pip", cwd),
+                )
+            else:
+                kind, detail = self._classify(number, words, cwd, uv_system, stop, stdin) if words else ("shell", "")
             if kind in ("install", "installer-tools", "pip"):
                 names_installer = True
             if isinstance(detail, _Install):
@@ -3124,6 +3137,8 @@ class _RunReader:
         base = posixpath.basename(name)
         pythonish = _PIP_RE.fullmatch(base) or _PYTHON_RE.fullmatch(base)
         texts = [word.text for word in words[1:]]
+        if (pythonish or base == "uv") and (index := _install_index_option(texts, uv=True)):
+            shown = f"{name} … {index}"  # don't echo a URL through a Python selection diagnostic
         if (_PIP_RE.fullmatch(base) and texts[:1] and texts[0] in _PIP_PROBES) or (
             _PYTHON_RE.fullmatch(base)
             and (
@@ -3321,6 +3336,14 @@ class _RunReader:
                         "and requirements by name are"
                     )
                 _command_line_requirement(number, tool, word.text)  # a project folder or a file: says so
+        rest = [word.text for word in args]
+        if index := _install_index_option(rest[1:], uv):
+            # The static PyTorch exception never reaches this path. A rejected URL may include credentials
+            # or shell syntax (for example ? is a glob), so refuse by option name before echoing unknown words.
+            stop(
+                f"{tool} install {index}: this line installs from another index or a folder of files, "
+                "where the files can differ from PyPI's, and --dockerfile-inputs only checks PyPI"
+            )
         globs = tuple(word.text for word in args if word.brackets and _requirement_name(word.text) is not None)
         args = [_Word(word.text) if word.text in globs else word for word in args]
         if unknown := next((word for word in args if not word.exact), None):
@@ -3466,6 +3489,50 @@ _ARCHIVE_SUFFIXES = (
 )
 _PIP_INDEX_FLAGS = ("-i", "-f", "--index-url", "--extra-index-url", "--find-links", "--no-index", "--trusted-host")
 _UV_INDEX_FLAGS = (*_PIP_INDEX_FLAGS, "--index", "--default-index", "--index-strategy")
+PYTORCH_INDEX = "download.pytorch.org"
+_PYTORCH_URL = re.compile(rf"https://{re.escape(PYTORCH_INDEX)}(?:/[A-Za-z0-9_./-]*)?", re.IGNORECASE | re.ASCII)
+_LITERAL_REQUIREMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+!=~,-]*", re.ASCII)
+
+
+def _install_index_option(words: list[str], uv: bool) -> str | None:
+    """The first index flag, never its value (which could carry credentials)."""
+    for word in words:
+        option = word.split("=", 1)[0]
+        if option in (_UV_INDEX_FLAGS if uv else _PIP_INDEX_FLAGS):
+            return option
+        if word.startswith(("-i", "-f")) and not word.startswith("--"):
+            return word[:2]
+    return None
+
+
+def _pytorch_requirements(args: str) -> list[str]:
+    """The narrow exception is one literal, shell-form RUN pip install NAME... with a single index option."""
+    words = re.split(r"[ \t]+", args.strip(" \t"))
+    if words[:2] != ["pip", "install"]:
+        return []
+    names: list[str] = []
+    has_index = False
+    i = 2
+    while i < len(words):
+        word = words[i]
+        i += 1
+        option, equals, url = word.partition("=")
+        if option in ("--index-url", "--extra-index-url"):
+            if not equals and i < len(words):
+                url = words[i]
+                i += 1
+            if has_index or not _PYTORCH_URL.fullmatch(url):
+                return []
+            has_index = True
+        elif (
+            _LITERAL_REQUIREMENT.fullmatch(word)
+            and _requirement_name(word) is not None
+            and not word.lower().endswith(_ARCHIVE_SUFFIXES)
+        ):
+            names.append(word)
+        else:
+            return []
+    return names if has_index else []
 
 
 def _command_line_requirement(number: int, tool: str, text: str) -> str:
@@ -3505,15 +3572,6 @@ def _pip_install_files(
     tool = "uv pip" if uv else "pip"
     for word in rest[1:]:
         option = word.split("=", 1)[0]
-        if option in (_UV_INDEX_FLAGS if uv else _PIP_INDEX_FLAGS) or (
-            word[:2] in ("-i", "-f") and not word.startswith("--") and word not in ("-i", "-f")
-        ):
-            # Requirements files have the same gap (an index line in one is not followed), and it isn't copied here.
-            raise DockerfileError(
-                f"line {number}: {tool} install {option if option.startswith('--') else word[:2]}: this line "
-                "installs from another index or a folder of files, where the files can differ from PyPI's, and "
-                "--dockerfile-inputs only checks PyPI"
-            )
         if option in ("-e", "--editable"):
             raise DockerfileError(
                 f"line {number}: {tool} install {option}: an editable install of a project folder isn't read by "
@@ -3816,6 +3874,8 @@ def _dockerfile_requirements(
     # (venv or None, package key) -> (line, file, pin or None) of the install that put the package there: what a
     # later install in the same environment finds already installed.
     earlier: dict[tuple[str | None, str], tuple[int, str, str | None]] = {}
+    # In the same Python environment the installer may keep a build from the uninspected index.
+    pytorch_installs: dict[str | None, dict[str, int]] = {}
 
     def copied_requirements(file: str, option: str, uv: bool, install: _Install) -> Path:
         """The file in the build context that `-r FILE` or `-c FILE` on the RUN at `number` reads in the image, for
@@ -3955,6 +4015,9 @@ def _dockerfile_requirements(
             by_key.setdefault(entry[0].key, []).append(entry)
         for package, entries in by_key.items():
             key = (install.env, package)
+            if package in pytorch_installs.get(install.env, {}):
+                earlier.pop(key, None)  # don't say a PyPI version was checked for this requirement
+                continue
             before = earlier.get(key)
             pkgs = [pkg for pkg, _, _, _ in entries]
             pin = next((pkg.version for pkg in pkgs if pkg.version is not None), None)
@@ -4171,6 +4234,11 @@ def _dockerfile_requirements(
         if install.sync:
             read_sync(install)
             return
+        if install.pytorch and dependencies:
+            raise DockerfileError(
+                f"line {number}: --deps can't check an install using {PYTORCH_INDEX}, whose packages may change "
+                "the dependency set; drop --deps to check the other lines"
+            )
         if install.no_deps and dependencies:
             tool = "uv pip" if install.uv else "pip"
             raise DockerfileError(
@@ -4326,6 +4394,18 @@ def _dockerfile_requirements(
             found.setdefault(host, number)
         for glob in install.globs:
             check_glob(glob, install)
+        if install.pytorch:
+            report.pytorch_lines.append(number)
+            current = pytorch_installs.setdefault(install.env, {})
+            for name in install.names:
+                current[requirement_to_package(name, "").key] = number
+        if previous := pytorch_installs.get(install.env):
+            for host in hosts:
+                report.pytorch_files.setdefault(host, {}).update(previous)
+            for name in install.names:
+                key = requirement_to_package(name, "").key
+                if key in previous:
+                    report.pytorch_named.setdefault(number, {})[key] = previous[key]
         if install.names:
             loose = [
                 name for name in install.names if requirement_to_package(name, "").version is None

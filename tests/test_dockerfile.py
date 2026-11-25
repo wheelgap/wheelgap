@@ -5462,7 +5462,10 @@ _ANOTHER_INDEX = (
         # Another index or a folder of files: requirements files ignore such a line (#632), and that isn't copied.
         ("pip install -i https://example.test/simple six", ":4: pip install -i: this line installs from another"),
         ("pip install --index-url=https://user:secret@example.test/simple six", ":4: pip install --index-url: "),
-        ("pip install six --extra-index-url https://download.pytorch.org/whl/cpu", ":4: pip install --extra-index-url"),
+        (
+            "pip install six --extra-index-url https://download.pytorch.org.example.test/whl/cpu",
+            ":4: pip install --extra-index-url",
+        ),
         ("pip install -f /wheels six", ":4: pip install -f: this line installs from another index or a folder"),
         ("pip install --find-links=/wheels --no-index six", ":4: pip install --find-links: this line"),
         ("pip install --no-index six", ":4: pip install --no-index: this line"),
@@ -5540,6 +5543,127 @@ def test_cli_dockerfile_inputs_checks_the_names_an_install_line_names(tmp_path, 
     assert "requirements.txt has 1 unpinned package (unpinned)" in captured.err
     assert main(argv) == 1
     assert f"requirements.txt ({path}:6) + {path}:3 + {path}:8 · 4 packages" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("index_option", ["--index-url ", "--extra-index-url="])
+def test_cli_dockerfile_inputs_pytorch_index_has_unknown_rows_without_lookups(
+    tmp_path, capsys, fake_pypi, index_option
+):
+    index = "https://download.pytorch.org/whl/cpu"
+    path = _context(
+        tmp_path,
+        "FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt .\n"
+        f"RUN pip install torch==2.9.1+cpu torchvision {index_option}{index}\n"
+        "RUN pip install -r requirements.txt\n"
+        "RUN pip install TORCHVISION\n",
+    )
+    (tmp_path / "requirements.txt").write_text("Torch==2.9.1\npurewheel==3.1\n", encoding="utf-8")
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs", "--no-cache"]
+    assert main([*argv, "--json", "--online", "--explain", "--suggest"]) == 1
+    out, err = capsys.readouterr()
+    report = json.loads(out)
+    assert report["dockerfile_packages"][0] == {
+        "dockerfile": str(path),
+        "line": 4,
+        "installer": "pip",
+        "requirements": ["torch==2.9.1+cpu", "torchvision"],
+    }
+    rows = report["packages"]
+    assert len(rows) == 5
+    for row in rows:
+        if row["name"] == "purewheel":
+            assert set(row["results"].values()) == {"wheel"}
+            assert row["error"] is None
+        else:
+            assert set(row["results"].values()) == {"unknown"}
+            assert f"{path}:4" in row["error"]
+            assert "doesn't read" in row["error"]
+    assert report["summary"]["complete"] is False
+    assert [(w["line"], w["kind"]) for w in report["dockerfile_warnings"]] == [(4, "may-install")]
+    assert index not in out + err
+    assert fake_pypi == ["https://pypi.org/pypi/purewheel/3.1/json"]
+
+    assert main([*argv, "--quiet"]) == 1
+    out, err = capsys.readouterr()
+    assert "unknown" in out
+    assert f"{path}:4" in err
+    assert index not in out + err
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "--index-url https://mirror.example.test/private",
+        "--index-url https://user:indexsecret@download.pytorch.org/private",
+        "--index-url=https://download.pytorch.org:443/private",
+        "--index-url https://download.pytorch.org/private?indexsecret",
+        "--index-url 'https://download.pytorch.org/private#fragmentsecret'",
+        "--index-url http://download.pytorch.org/private",
+        "--index-url https://download.pytorch.org.example.test/private",
+        "--index-url https://download.pytorch.org/private --extra-index-url https://example.test/secret",
+        "--index-url https://download.pytorch.org/private --find-links /wheels",
+        "--index-url https://download.pytorch.org/private -r requirements.txt",
+        "-i https://download.pytorch.org/private",
+        "--index-url https://download.pytorch.org/private && pip install purewheel",
+    ],
+)
+def test_cli_dockerfile_inputs_pytorch_index_refuses_other_forms_without_echo_or_lookups(
+    tmp_path, capsys, fake_pypi, tail
+):
+    path = _context(tmp_path, f"FROM python:3.12\nRUN pip install torch {tail}\n")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 2
+    out, err = capsys.readouterr()
+    assert json.loads(out)["error"]["type"] == "DockerfileError"
+    assert f"{path}:2:" in err
+    assert "://" not in out + err
+    assert "indexsecret" not in out + err
+    assert "fragmentsecret" not in out + err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_inputs_pytorch_index_refuses_deps_without_lookups(tmp_path, capsys, fake_pypi):
+    path = _context(
+        tmp_path,
+        "FROM python:3.12\nRUN pip install purewheel==3.1\n"
+        "RUN pip install torch --index-url https://download.pytorch.org/whl/cpu\n",
+    )
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--deps", "--json"]) == 2
+    out, err = capsys.readouterr()
+    assert f"{path}:3:" in err
+    assert "--deps" in json.loads(out)["error"]["message"]
+    assert "://" not in out + err
+    assert fake_pypi == []
+
+
+def test_cli_dockerfile_inputs_pytorch_index_keeps_other_python_environment_independent(tmp_path, capsys, fake_pypi):
+    path = _context(
+        tmp_path,
+        "FROM python:3.12\n"
+        "RUN pip install purewheel==3.1 --extra-index-url https://download.pytorch.org/whl/cpu\n"
+        "RUN python -m venv /venv\nRUN /venv/bin/pip install purewheel==3.1\n",
+    )
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json", "--no-cache"]) == 1
+    rows = json.loads(capsys.readouterr().out)["packages"]
+    assert {value for row in rows for value in row["results"].values()} == {"unknown", "wheel"}
+    assert fake_pypi == ["https://pypi.org/pypi/purewheel/3.1/json"]
+
+
+def test_cli_dockerfile_inputs_pytorch_index_attributes_a_reused_file_to_the_index_line(tmp_path, capsys, fake_pypi):
+    path = _context(
+        tmp_path,
+        "FROM python:3.12\nWORKDIR /app\nCOPY requirements.txt .\n"
+        "RUN pip install -r requirements.txt\n"
+        "RUN pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu\n"
+        "RUN pip install -r requirements.txt\n",
+    )
+    (tmp_path / "requirements.txt").write_text("Torch==2.9.1\npurewheel==3.1\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json", "--no-cache"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert [entry["line"] for entry in report["dockerfile_inputs"]] == [4]  # the file is reported once
+    torch = [row for row in report["packages"] if row["name"].lower() == "torch"]
+    assert len(torch) == 2
+    assert all(set(row["results"].values()) == {"unknown"} and f"{path}:5:" in row["error"] for row in torch)
+    assert fake_pypi == ["https://pypi.org/pypi/purewheel/3.1/json"]
 
 
 def test_cli_dockerfile_inputs_reads_a_dockerfile_that_only_names_packages(tmp_path, capsys, fake_pypi):

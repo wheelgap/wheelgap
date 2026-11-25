@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `--dockerfile-inputs` now marks packages from a plain `pip install` using only PyTorch's index option as
+  `unknown` without sending their names to an index. The rest of the Dockerfile is still checked, except that
+  repeated names in the same Python environment stay unknown and `--deps` refuses.
+
 - `--dockerfile-inputs` no longer warns or stops with `--deps` for `bundle config`: it changes Bundler settings without running the project's Gemfile. Other Bundler commands such as `bundle install` and `bundle exec` are still flagged. (#749, thanks [@sundaysebasidian-byte](https://github.com/sundaysebasidian-byte))
 - `--from-log` and the MCP `explain_install_failure` tool no longer read a log whose build ran on PyPy as a CPython install: a PyPy interpreter in the log's paths (`venv/pypy/bin/pypy3`) or a build error only a PyPy build prints (PyO3's `the configured PyPy interpreter version`) now gives a note that wheelgap checks CPython wheels only, so the answers don't say why the build failed there, instead of the misleading `the log likely comes from another platform or Python than the one checked` — PyPy wheels differ (`pp311`, not `cp311`), so no `-p`/`-t` re-check could explain it. (#748, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs` with `--deps`: the error for a command that runs the project's own code before an install now quotes the command in full, as the warning does (``this line runs `npm i -g ./tools/x` …``), instead of only its first word or two (`npm i runs …`), which couldn't say which part of the line was meant. (#747, thanks [@Seyamalam](https://github.com/Seyamalam))
