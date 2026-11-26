@@ -80,12 +80,12 @@ the integration that pins them), which leaves 112 distinct name and version pins
 
 All four are source builds on both targets. `--explain --suggest` gives the reason for each:
 
-| Package | What PyPI has for this pin | Newest release with a musllinux wheel |
+| Package | What PyPI has for this pin | Newest release with a wheel that installs on musl |
 | --- | --- | --- |
 | gazetteer-matcher 1.1.0 | `abi3` wheels for macOS, Windows and glibc Linux, none for musl | none |
 | pymicro-vad 1.0.1 | `cp39` to `cp312` wheels for glibc Linux and macOS, none for musl or 3.14 | none |
 | pyspeex-noise 1.0.2 | no wheels, sdist only | none |
-| PyTurboJPEG 1.8.3 | no wheels, sdist only | 2.5.0 |
+| PyTurboJPEG 1.8.3 | no wheels, sdist only | 2.5.0 (a `py3-none-any` wheel) |
 
 ```text
 gazetteer-matcher 1.1.0 on musl-x86_64: ● source
@@ -136,9 +136,9 @@ PyPI alone on Alpine would build them from source.
 
 For the container build, nothing: the pins already have wheels from the project's index. Outside it, on PyPI alone:
 
-- PyTurboJPEG 1.8.3 → **2.5.0** has musllinux wheels.
+- PyTurboJPEG 1.8.3 → **2.5.0** ships a `py3-none-any` wheel, which installs on Alpine.
 - gazetteer-matcher, pymicro-vad and pyspeex-noise have no newer release with a musllinux wheel. wheelgap links the
   trackers where a wheel can be requested: [pymicro-vad](https://github.com/rhasspy/pymicro-vad/issues) and
-  [pyspeex-noise](https://github.com/rhasspy/speex-noise/issues).
+  [pyspeex-noise](https://github.com/rhasspy/pyspeex-noise/issues).
 
 This study reports what wheelgap found and makes no claim about the project's packaging choices.
