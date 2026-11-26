@@ -7,9 +7,9 @@ when the check ran; new uploads and lockfile updates can change them.
 
 ## Summary
 
-The nineteen studies below were scanned between 15 and 25 November 2026. Each result is for the pinned commit its page
-names and for wheelgap 0.13.0, except the mitmproxy study, which used wheelgap 0.10.0, and the dlt study, which
-used wheelgap 0.14.0. A project, or a package it
+The twenty studies below were scanned between 15 and 27 November 2026. Each result is for the pinned commit its page
+names and for wheelgap 0.13.0, except the mitmproxy study, which used wheelgap 0.10.0, and the dlt and Home Assistant
+Core studies, which used wheelgap 0.14.0. A project, or a package it
 depends on, may have changed since.
 
 | Project | What was checked | Result | Gaps and fixes |
@@ -33,6 +33,7 @@ depends on, may have changed since.
 | [Prefect](prefect.md) | Python 3.15; Linux x86_64 and ARM64, Windows; runtime dependencies (105 packages); the CI test install, with the `dev` group, on Linux x86_64 and Windows (213) | 2 source builds; 5 with the `dev` group | orjson 3.13.0's CPython 3.15 Linux wheels are tagged `manylinux_2_39`, newer than the glibc 2.36 floor; with `--glibc 2.39` it is a wheel. PyYAML 6.0.3 has no CPython 3.15 wheel; 6.0.4, uploaded on 20 November 2026, does. The `dev` group adds testslide 2.7.1, which is sdist only, pyre-check 0.9.23, which has no Windows wheel, and watchfiles 1.2.0, which has no CPython 3.15 Windows wheel; 1.3.0 has one. On Python 3.14 the runtime dependencies are all wheels |
 | [urllib3](urllib3.md) | Python 3.15 and 3.14t; Linux (glibc 2.39), Windows, macOS (macOS 26.0); the CI test install (64 packages on 3.15, 63 on 3.14t); the same on 3.14t with the `brotli` extra that CI leaves out there (64) | all wheels in the CI test install; 1 source build with the `brotli` extra on 3.14t | Brotli 1.2.1 has no free-threaded wheel on any target and is the newest release. On regular CPython 3.15 it is a wheel |
 | [dlt](dlt.md) | Python 3.14; Linux, Windows, macOS; runtime dependencies (39 packages) | 1 source build and 1 missing | PyYAML 6.0.2's wheels stop at CPython 3.13, so it builds everywhere on 3.14 (6.0.3 has them). pywin32 310 has neither a CPython 3.14 Windows wheel nor a buildable sdist; 311 has the wheel |
+| [Home Assistant Core](home-assistant.md) | Python 3.14; Alpine on x86_64 and ARM64 (`musl-x86_64`, `musl-aarch64`); the container's `requirements.txt` (61 packages) and `requirements_all.txt` (1,255) | 4 source builds in the core file; 116 rows (112 distinct pins) in the full set | gazetteer-matcher 1.1.0, pymicro-vad 1.0.1, pyspeex-noise 1.0.2 and PyTurboJPEG 1.8.3 have no musllinux wheel on PyPI; PyTurboJPEG 2.5.0 does. Home Assistant's own wheel index lists a wheel for every one of the 112 pins, so its container build, which installs with `--no-build`, is not what these rows describe |
 
 Unless a row says otherwise, Linux is `linux-x86_64` with a glibc 2.36 floor, Windows is `win-amd64`, and macOS is
 `macos-arm64` with a macOS 14.0 floor. A source build means the pinned version has an sdist but no wheel that fits the
@@ -89,3 +90,4 @@ These packages are a gap in more than one study:
 - [Prefect: a glibc-floor gap and PyYAML on Python 3.15](prefect.md)
 - [urllib3: the brotli extra on free-threaded 3.14](urllib3.md)
 - [dlt: two runtime gaps on Python 3.14, both fixed one release up](dlt.md)
+- [Home Assistant Core: four PyPI gaps in the container requirements, covered by the project's own wheels](home-assistant.md)
