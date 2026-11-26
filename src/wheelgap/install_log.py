@@ -64,11 +64,15 @@ _INSTALL_VALUE_OPTIONS = frozenset(
 # file:///...` (`pip install -e .`).
 _LOCAL = re.compile(r" {0,2}(?:Processing|Obtaining) (\S+)")
 # pip's error when a package's sdist fails before `Building wheel for`: getting its build requirements, or its
-# metadata. pip prints it twice (indented, then at column 0) and names no package: it's the one collected last.
+# metadata, or installing its build or backend dependencies (`pip subprocess to install build dependencies` up to pip
+# 25.2, `installing build dependencies for NAME` since 25.3): its own build never ran, so the failure is the
+# package's, whatever failed inside the subprocess. pip prints it twice (indented, then at column 0) and names no
+# package, or only the one it was preparing: it's the one collected last.
 _PREPARE_FAILED = re.compile(
     r" {0,2}(?:(?:× ?)?(?:Getting requirements to build (?:wheel|editable)|Preparing (?:editable )?metadata "
-    r"\([^)]*\)) did not run successfully\.?|error: metadata-generation-failed|(?:× ?)?Encountered error while "
-    r"generating package metadata\.?)\s*"
+    r"\([^)]*\)|pip subprocess to install (?:build|backend) dependencies|installing (?:build|backend) dependencies"
+    r"(?: for (?P<owner>[A-Za-z0-9][A-Za-z0-9._-]*))?) did not run successfully\.?|error: "
+    r"metadata-generation-failed|(?:× ?)?Encountered error while generating package metadata\.?)\s*"
 )
 # The end of a pip run that installed what it was asked to; the next run in the same log starts afresh.
 _INSTALLED = re.compile(r"Successfully installed ")
@@ -195,8 +199,9 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
     build-backend note names, if an earlier `Installing`/`Updating`/`Downgrading` line names it too; and for PDM
     (`pdm install -v` only), the one its `✖ Install NAME VERSION failed` line names, with a `BuildError` traceback for
     that package and the build link that says which index the sdist came from. pip's `Getting requirements to build
-    wheel` and `Preparing metadata` failures name no package: it's the sdist of the last column-0 `Collecting` line,
-    downloaded since. When pip's lines name no version, an exact pin on a `pip install` line in the log gives it, and
+    wheel`, `Preparing metadata` and build-dependencies subprocess failures name no package: it's the sdist of the
+    last column-0 `Collecting` line, downloaded since. When pip's lines name no version, an exact pin on a
+    `pip install` line in the log gives it, and
     with none the version is None (the caller checks the latest release, and says so), unless the log has pip's
     `Processing`/`Obtaining` line for a local project. A failure whose version the log doesn't make clear is an error,
     and so is a log that used another index than PyPI or --find-links (pip), or that built the package from another
@@ -437,6 +442,7 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
             # A later run's failure without its own `Collecting` line must not take this run's version.
             for key in versions:
                 versions[key] = _EARLIER
+            collecting = collected_sdist = None
         if (m := _LOCAL.match(line)) and _file_version(m.group(1)) is None:
             local = True
             collecting = collected_sdist = None
@@ -455,7 +461,17 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str |
             named(canonicalize_name(found[0]), found[1])
             if canonicalize_name(found[0]) == collecting and m.group(1).endswith((".tar.gz", ".zip")):
                 collected_sdist = found
-        if _PREPARE_FAILED.fullmatch(line):
+        if (m := _PREPARE_FAILED.fullmatch(line)) and not (
+            # pip 25.3+ names the package: another one's (a build dependency's own pip) isn't the sdist collected last.
+            m.group("owner")
+            and collected_sdist is not None
+            and canonicalize_name(m.group("owner")) != canonicalize_name(collected_sdist[0])
+        ):
+            if collecting is not None and versions.get(collecting) == _DIRECT:
+                raise SourceError(
+                    f"--from-log: the log installs {collected_sdist[0] if collected_sdist else collecting} from a URL "
+                    "or a path, not from an index, so it can't be checked"
+                )
             if collected_sdist is None:
                 raise SourceError(
                     "--from-log: pip failed to prepare a package to build, but the log doesn't name its sdist after "

@@ -357,6 +357,13 @@ PREPARE_FAILED = [
     "  × Preparing metadata (pyproject.toml) did not run successfully.",
     "error: metadata-generation-failed",
     "× Encountered error while generating package metadata.",
+    "  × pip subprocess to install build dependencies did not run successfully.",
+    "× pip subprocess to install build dependencies did not run successfully.",
+    # pip 25.3 and later
+    "  × installing build dependencies for nowheels did not run successfully.",
+    "× installing backend dependencies for NoWheels did not run successfully.",
+    "× installing build dependencies did not run successfully.",
+    "  × pip subprocess to install backend dependencies did not run successfully.",
 ]
 
 
@@ -371,6 +378,41 @@ def test_a_failure_before_building_is_the_sdist_collected_last(error):
     assert failed_builds(text) == [("nowheels", "0.9")]
 
 
+def test_a_build_dependencies_subprocess_failure_is_the_sdist_collected_last():
+    # The shape of timvink/mkdocs-table-reader-plugin#46: pandas's own build never runs, because numpy fails inside
+    # the pip that installs its build dependencies. The inner pip's lines are the subprocess's quoted output, so
+    # numpy is neither collected nor failed in this run; the failure is pandas's.
+    text = (
+        "Collecting pandas>=1.1\n  Downloading pandas-1.5.3.tar.gz (5.2 MB)\n"
+        "  Installing build dependencies: started\n  Installing build dependencies: finished with status 'error'\n"
+        "  error: subprocess-exited-with-error\n\n"
+        "  \u00d7 pip subprocess to install build dependencies did not run successfully.\n"
+        "  \u2502 exit code: 1\n  \u2570\u2500> [6 lines of output]\n"
+        "      Collecting numpy==1.23.2\n        Downloading numpy-1.23.2.tar.gz (10.7 MB)\n"
+        "      Building wheels for collected packages: numpy\n"
+        "        Building wheel for numpy (pyproject.toml): finished with status 'error'\n"
+        "        ERROR: Failed building wheel for numpy\n"
+        "      ERROR: Failed to build installable wheels for some pyproject.toml based projects (numpy)\n"
+        "      [end of output]\n\n"
+        "  note: This error originates from a subprocess, and is likely not a problem with pip.\n"
+        "error: subprocess-exited-with-error\n\n"
+        "\u00d7 pip subprocess to install build dependencies did not run successfully.\n"
+        "\u2502 exit code: 1\n\u2570\u2500> See above for output.\n"
+    )
+    assert failed_builds(text) == [("pandas", "1.5.3")]
+
+
+def test_pip_25_3s_failure_for_another_package_isnt_the_sdist_collected_last():
+    # pip 25.3+ names the package whose build dependencies failed: a build dependency's own pip, under `-v`, names
+    # that build dependency, not the sdist this run collected.
+    text = "Collecting pandas>=1.1\n  Downloading pandas-1.5.3.tar.gz (5.2 MB)\n"
+    inner = "  \u00d7 installing build dependencies for numpy did not run successfully.\n"
+    outer = "\u00d7 installing build dependencies for pandas did not run successfully.\n"
+    assert failed_builds(text + inner + outer) == [("pandas", "1.5.3")]
+    with pytest.raises(LogError, match="found no package"):
+        failed_builds(text + inner)
+
+
 @pytest.mark.parametrize(
     "before",
     [
@@ -383,9 +425,10 @@ def test_a_failure_before_building_is_the_sdist_collected_last(error):
         "",
     ],
 )
-def test_a_failure_before_building_without_its_sdist_is_refused(before):
+@pytest.mark.parametrize("error", [PREPARE_FAILED[0], PREPARE_FAILED[-1]])
+def test_a_failure_before_building_without_its_sdist_is_refused(before, error):
     with pytest.raises(SourceError, match="doesn't name its sdist after the last `Collecting` line"):
-        failed_builds(before + "  Getting requirements to build wheel ... error\n" + PREPARE_FAILED[0] + "\n")
+        failed_builds(before + "  Getting requirements to build wheel ... error\n" + error + "\n")
 
 
 def test_a_failure_before_building_in_a_build_dependencys_pip_is_not_this_runs():
@@ -425,10 +468,11 @@ def test_backtracking_is_refused(backtracked):
         failed_builds(text)
 
 
-def test_a_download_doesnt_turn_a_url_into_an_index_version():
+@pytest.mark.parametrize("failure", [BUILD_FAILED, PREPARE_FAILED[0] + "\n", PREPARE_FAILED[5] + "\n"])
+def test_a_download_doesnt_turn_a_url_into_an_index_version(failure):
     text = "Collecting nowheels @ https://example.com/nowheels-1.0.tar.gz\n  Downloading nowheels-1.0.tar.gz\n"
     with pytest.raises(SourceError, match="installs nowheels from a URL or a path"):
-        failed_builds(text + BUILD_FAILED)
+        failed_builds(text + failure)
 
 
 def test_a_build_dependency_install_under_pip_v_doesnt_reset_the_version():
@@ -483,6 +527,13 @@ Successfully installed nowheels-1.0
 def test_a_version_from_an_earlier_pip_run_is_refused(run_2):
     with pytest.raises(SourceError, match="last `Collecting` line for nowheels is from an earlier pip run"):
         failed_builds(RUN_1 + run_2)
+
+
+@pytest.mark.parametrize("error", [PREPARE_FAILED[0], PREPARE_FAILED[5]])
+def test_a_failure_before_building_in_a_later_pip_run_isnt_the_earlier_runs_sdist(error):
+    # `pip install -q otherpkg` hides `Collecting`: nowheels 1.0 built and installed fine in the first run.
+    with pytest.raises(SourceError, match="doesn't name its sdist after the last `Collecting` line"):
+        failed_builds(RUN_1 + error + "\n")
 
 
 def test_a_later_pip_run_that_collects_the_package_again_gives_its_version():

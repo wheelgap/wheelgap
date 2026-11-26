@@ -7,8 +7,9 @@ when the check ran; new uploads and lockfile updates can change them.
 
 ## Summary
 
-The eighteen studies below were scanned between 15 and 21 November 2026. Each result is for the pinned commit its page
-names and for wheelgap 0.13.0, except the mitmproxy study, which used wheelgap 0.10.0. A project, or a package it
+The nineteen studies below were scanned between 15 and 25 November 2026. Each result is for the pinned commit its page
+names and for wheelgap 0.13.0, except the mitmproxy study, which used wheelgap 0.10.0, and the dlt study, which
+used wheelgap 0.14.0. A project, or a package it
 depends on, may have changed since.
 
 | Project | What was checked | Result | Gaps and fixes |
@@ -31,6 +32,7 @@ depends on, may have changed since.
 | [MCP Python SDK](mcp-python-sdk.md) | Python 3.11 to 3.15; Linux, Windows; the whole lock (120 packages) | 5 source builds: 1 on every Python, 3 on 3.14 and 5 on 3.15 | cffi 2.0.0, the only gap in the runtime dependencies, has no CPython 3.15 wheel; 2.1.0 does. forbiddenfruit 0.1.4 (`dev` group) is sdist only and is the newest release. MarkupSafe 3.0.2 and PyYAML 6.0.2 (`docs` group) have wheels up to CPython 3.13 only; MarkupSafe 3.0.4 has 3.14 and 3.15 wheels; PyYAML 6.0.3 has a 3.14 wheel but no 3.15 one, and 6.0.4, uploaded on 20 November 2026 after the scan, has both. jiter 0.16.0 (the opt-in `translate` group, which the CI test job doesn't install) has wheels up to CPython 3.14 only; 0.17.0 has 3.15 wheels |
 | [Prefect](prefect.md) | Python 3.15; Linux x86_64 and ARM64, Windows; runtime dependencies (105 packages); the CI test install, with the `dev` group, on Linux x86_64 and Windows (213) | 2 source builds; 5 with the `dev` group | orjson 3.13.0's CPython 3.15 Linux wheels are tagged `manylinux_2_39`, newer than the glibc 2.36 floor; with `--glibc 2.39` it is a wheel. PyYAML 6.0.3 has no CPython 3.15 wheel; 6.0.4, uploaded on 20 November 2026, does. The `dev` group adds testslide 2.7.1, which is sdist only, pyre-check 0.9.23, which has no Windows wheel, and watchfiles 1.2.0, which has no CPython 3.15 Windows wheel; 1.3.0 has one. On Python 3.14 the runtime dependencies are all wheels |
 | [urllib3](urllib3.md) | Python 3.15 and 3.14t; Linux (glibc 2.39), Windows, macOS (macOS 26.0); the CI test install (64 packages on 3.15, 63 on 3.14t); the same on 3.14t with the `brotli` extra that CI leaves out there (64) | all wheels in the CI test install; 1 source build with the `brotli` extra on 3.14t | Brotli 1.2.1 has no free-threaded wheel on any target and is the newest release. On regular CPython 3.15 it is a wheel |
+| [dlt](dlt.md) | Python 3.14; Linux, Windows, macOS; runtime dependencies (39 packages) | 1 source build and 1 missing | PyYAML 6.0.2's wheels stop at CPython 3.13, so it builds everywhere on 3.14 (6.0.3 has them). pywin32 310 has neither a CPython 3.14 Windows wheel nor a buildable sdist; 311 has the wheel |
 
 Unless a row says otherwise, Linux is `linux-x86_64` with a glibc 2.36 floor, Windows is `win-amd64`, and macOS is
 `macos-arm64` with a macOS 14.0 floor. A source build means the pinned version has an sdist but no wheel that fits the
@@ -86,3 +88,4 @@ These packages are a gap in more than one study:
 - [MCP Python SDK: one runtime gap and four in its development groups](mcp-python-sdk.md)
 - [Prefect: a glibc-floor gap and PyYAML on Python 3.15](prefect.md)
 - [urllib3: the brotli extra on free-threaded 3.14](urllib3.md)
+- [dlt: two runtime gaps on Python 3.14, both fixed one release up](dlt.md)
