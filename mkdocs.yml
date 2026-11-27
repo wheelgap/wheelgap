@@ -68,6 +68,7 @@ nav:
       - Targets: targets.md
       - Windows on ARM: windows-arm.md
       - Free-threaded Python: free-threading.md
+      - Python 3.15 readiness: python-3-15-ready.md
       - Configuration: configuration.md
       - Output: output.md
       - CI: ci.md

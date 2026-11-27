@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Docs: add a "Python 3.15 readiness" how-to that checks your own project with one command, with real `--fix` output, a section on free-threaded 3.15t and fallback options when no official fix exists. (#783)
+
 - `--dockerfile-inputs`: a `uv sync --locked` or `--frozen` line and a read `uv pip install` line may also use `--keyring-provider` with uv's `disabled` or `subprocess` values: the keyring lookup only supplies index authentication and doesn't change which locked or exactly pinned distributions uv installs, so the answer is unchanged. (#784, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a `uv sync --locked` or `--frozen` line and a read `uv pip install` line may also use `--reinstall-package NAME`: uv installs the same locked or exactly pinned distribution for that package again rather than changing which versions or artifacts it installs, so the answer is unchanged. (#776, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a `uv sync --locked` or `--frozen` line and a read `uv pip install` line may also use `--refresh-package NAME`: refreshing one package's cached data doesn't change locked or exactly pinned installations, so the answer is unchanged. (#775, thanks [@Seyamalam](https://github.com/Seyamalam))

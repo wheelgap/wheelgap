@@ -40,6 +40,8 @@ As a fallback, wheelgap's gap wheel index has unofficial wheels PyPI lacks (buil
 
 In 83 pinned projects from the 300 most-starred Python repositories, 82% of the Python 3.15 gaps on Linux x86-64 were stale pins like these: the release with the wheel was already out. For a `uv.lock`, `--fix` prints the `uv lock --upgrade-package` command instead. Gap wheels are built twice from the sdist on PyPI, published only if both builds are byte-for-byte identical, and installed and imported on a fresh machine first ([how they're made](https://wheelgap.github.io/wheels/)).
 
+New to this? The [Python 3.15 readiness how-to](https://wheelgap.github.io/wheelgap/python-3-15-ready/) walks through one command and how to read its output.
+
 🔎 **Try it on any public repo, in your browser: [wheelgap.github.io/tracker/check](https://wheelgap.github.io/tracker/check/).** Paste a GitHub repository. It reads the lockfile, works out the platforms the repo ships to from its CI and Dockerfiles, and lists every dependency with no prebuilt wheel there, with the release that fixes it. Nothing to install.
 
 📊 **[Wheel coverage for the top 5,000 PyPI packages](https://wheelgap.github.io/tracker/)**, by platform and Python version, updated nightly. 📚 **[Case studies](https://wheelgap.github.io/wheelgap/case-studies/)**: what wheelgap found in FastAPI, pydantic, Poetry, PDM, Streamlit, Typer and other projects, each pinned to a commit you can re-run.

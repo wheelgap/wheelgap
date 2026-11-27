@@ -2,6 +2,9 @@
 
 *Published 25 November 2026. Data as of 23 November 2026, 45 days after Python 3.15.0.*
 
+To check **your own** project instead of reading these totals, follow
+[Python 3.15 readiness in one command](../python-3-15-ready.md).
+
 Python 3.15.0 came out on 9 October 2026. On 23 November, 45 days later, we checked two things:
 
 1. **The top of PyPI**: the latest release of each of the 4,999 most-downloaded packages, on Python 3.14, 3.15 and free-threaded 3.15t, for Linux x86-64 and aarch64, macOS arm64 and Windows x64.
