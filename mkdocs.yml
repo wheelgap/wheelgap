@@ -64,6 +64,7 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Guides:
+      - Failed building wheel on Alpine or ARM: failed-building-wheel.md
       - Inputs: inputs.md
       - Targets: targets.md
       - Windows on ARM: windows-arm.md

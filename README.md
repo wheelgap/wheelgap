@@ -13,7 +13,7 @@
 
 **Find the Python dependencies that have no prebuilt wheel for your platform, before your Docker build does, and get the exact change that fixes each one.**
 
-Point it at your lockfile and the platforms you ship to (ARM servers, Alpine images, Windows on ARM, Python 3.15, free-threaded 3.14t). It tells you which packages pip or uv will have to compile from source, and which can't be installed at all. With `--fix` it says how to close each gap: first the upgrade to an official release that has the wheel, with the command for your lockfile; then, only where you can't upgrade, an unofficial wheel from wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/):
+Point it at your lockfile and the platforms you ship to (ARM servers, Alpine images, Windows on ARM, Python 3.15, free-threaded 3.14t). It tells you which packages pip or uv will have to compile from source, and which can't be installed at all. With `--fix` it says how to close each gap: first the upgrade to an official release that has the wheel, with the command for your lockfile; then, only where you can't upgrade, an unofficial wheel from wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/). Seeing `Failed building wheel` on Alpine or ARM? [Start here](https://wheelgap.github.io/wheelgap/failed-building-wheel/).
 
 ```console
 $ uvx wheelgap requirements.txt -p 3.15 -t linux-x86_64,win-amd64 --fix
