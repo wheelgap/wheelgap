@@ -1857,6 +1857,7 @@ _UV_VALUE_FLAGS = {
     "--output-format": "text|json",
     "--color": "auto|always|never",
     "--keyring-provider": "disabled|subprocess",
+    "--no-editable-package": _UV_PACKAGE_NAME,
     "--refresh-package": _UV_PACKAGE_NAME,
     "--reinstall-package": _UV_PACKAGE_NAME,
 }  # uv's possible values; it exits on any other
@@ -1864,7 +1865,8 @@ _UV_GLOBAL_VALUE_FLAGS = {"--color": _UV_VALUE_FLAGS["--color"]}
 _UV_FLAGS_READ = (
     "--system, -r FILE, -c FILE, --no-cache, --no-cache-dir, --upgrade (-U), --quiet (-q), "
     "--compile-bytecode (--compile), --no-progress, --reinstall, --refresh, "
-    "--refresh-package NAME, --reinstall-package NAME, --link-mode, --output-format, --color, "
+    "--no-editable-package NAME, --refresh-package NAME, --reinstall-package NAME, --link-mode, "
+    "--output-format, --color, "
     "--keyring-provider, "
     "--break-system-packages, --strict, --no-python-downloads, --system-certs and --no-deps"
 )
@@ -3312,8 +3314,8 @@ class _RunReader:
         """`uv sync ARGS`: `uv sync --locked` or `--frozen` (so the lock copied into the image is what is
         installed), optionally `--no-dev`, `--no-install-project`, `--no-install-workspace`, `--no-install-local`,
         `--no-editable`, `--compile-bytecode`/`--compile`, `--reinstall`, `--refresh`, `--inexact`, `--link-mode`,
-        `--output-format`, `--color`, `--keyring-provider`, `--refresh-package` and `--reinstall-package` with uv's
-        values, and the harmless global flags."""
+        `--output-format`, `--color`, `--keyring-provider`, `--no-editable-package`, `--refresh-package` and
+        `--reinstall-package` with uv's values, and the harmless global flags."""
         if unknown := next((word for word in args if not word.exact), None):
             if both := next((name for name in self.ambiguous if re.search(rf"\$\{{?{name}\b", unknown.text)), None):
                 stop(
@@ -3360,8 +3362,8 @@ class _RunReader:
                 f"`{shown}`: only `uv sync --locked` or `--frozen` (optionally `--no-dev`, `--no-install-project`, "
                 "`--no-install-workspace`, `--no-install-local`, `--no-editable`, `--compile-bytecode`/`--compile`, "
                 "`--reinstall`, `--refresh`, `--inexact`, or `--link-mode`/`--output-format`/`--color`/"
-                "`--keyring-provider`/`--refresh-package`/`--reinstall-package` with uv's values) is read by "
-                "--dockerfile-inputs, "
+                "`--keyring-provider`/`--no-editable-package`/`--refresh-package`/"
+                "`--reinstall-package` with uv's values) is read by --dockerfile-inputs, "
                 "and this one may change what is installed"
             )
         if ("--locked" in seen) == ("--frozen" in seen):

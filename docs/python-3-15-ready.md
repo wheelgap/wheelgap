@@ -42,8 +42,9 @@ wheelgap doesn't resolve dependencies: the rest of them must allow these release
 ```
 
 The `● source` cells are the gaps: pip or uv will compile those packages from
-source on the target platform. A `●` with a wheel tag would mean there is a
-usable prebuilt wheel. `--all` shows the packages that are already fine.
+source on the target platform. A `✗ missing` cell would mean there's no wheel
+and no sdist either, so the install fails. `--all` also shows the packages that
+are already fine (`✓ wheel`).
 
 ## The common case is a stale pin
 

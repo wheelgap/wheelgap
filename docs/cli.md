@@ -193,6 +193,7 @@ them (`--no-input`, `--disable-pip-version-check`, `--root-user-action`, `--pref
 | `--output-format text` / `json` (or `=json`) | uv's only values: output alone |
 | `--color auto` / `always` / `never` (or `=never`) | uv's only values: output alone |
 | `--keyring-provider disabled` / `subprocess` (or `=disabled`) | uv's only values: authentication alone, not which requirements are selected |
+| `--no-editable-package NAME` (or `=NAME`) | uv's package names: editable lines are refused here, so this is a no-op for the pinned requirements that are read |
 | `--refresh-package NAME` (or `=NAME`) | uv's package names: only that package's cached data is revalidated |
 | `--reinstall-package NAME` (or `=NAME`) | uv's package names: only that package is installed again |
 
@@ -200,10 +201,9 @@ them (`--no-input`, `--disable-pip-version-check`, `--root-user-action`, `--pref
 relock, and the copied lock may then not be what the image gets. `--no-dev`, `--no-install-project`,
 `--no-install-workspace`, `--no-install-local`, `--no-editable`, `--compile-bytecode` (or its alias `--compile`),
 `--reinstall`, `--refresh`, `--inexact`, `--link-mode`, `--output-format`, `--color`, `--keyring-provider`,
-`--refresh-package` and `--reinstall-package` with uv's values, and the harmless global flags may join it after
-`sync`; a global flag
-before the subcommand (`uv --quiet sync --locked`) is an error, and so is every other flag, since it may change
-the installed set.
+`--no-editable-package`, `--refresh-package` and `--reinstall-package` with uv's values, and the harmless global
+flags may join it after `sync`; a global flag before the subcommand (`uv --quiet sync --locked`) is an error, and
+so is every other flag, since it may change the installed set.
 
 | Flag | Read |
 | --- | --- |
@@ -215,6 +215,7 @@ the installed set.
 | `--output-format text` / `json` (or `=json`) | uv's only values: output alone doesn't change which locked dependencies are installed |
 | `--color auto` / `always` / `never` (or `=never`) | uv's only values: output alone doesn't change which locked dependencies are installed |
 | `--keyring-provider disabled` / `subprocess` (or `=disabled`) | uv's only values: authentication alone doesn't change which locked dependencies are installed |
+| `--no-editable-package NAME` (or `=NAME`) | uv's package names: it only decides whether a named first-party editable package is installed non-editably, not which locked dependencies are installed |
 | `--refresh-package NAME` (or `=NAME`) | uv's package names: only that package's cached data is revalidated, which doesn't change which locked dependencies are installed |
 | `--reinstall-package NAME` (or `=NAME`) | uv's package names: only that locked package is installed again, which doesn't change which locked dependencies are installed |
 | `-q` / `--quiet`, `--no-cache` / `--no-cache-dir`, `--no-progress`, `--no-python-downloads`, `--system-certs` | Taken with no value |
@@ -350,7 +351,7 @@ wheelgap reads, in an earlier `RUN` or earlier on the same one.
 | `-i` / `--index-url`, `--extra-index-url`, `-f` / `--find-links`, `--no-index`, `--trusted-host` (and uv's `--index`, `--default-index`) | The files on another index can differ from PyPI's, and only PyPI is checked. A requirements *file* with such a line is still read against PyPI alone today, a known gap that isn't copied here | Check the other index's files on the command line instead |
 | Any other `pip install` flag — `--require-hashes`, `--pre`, `--only-binary`, `--user`, `--target`, `--ignore-installed`, `-e`, combined short flags such as `-Uq`, `--requirement=FILE` — or a value pip doesn't take (`--progress-bar pretty`); on a `uv pip install` line, any flag not in the uv table above, pip's own among them | It may change what the installer picks, or make it exit | Drop the flag if the build doesn't need it; write `--requirement=FILE` as `-r FILE` and a combined flag such as `-Uq` as `-U -q` |
 | A `uv pip install` without `--system` (or an earlier `ENV UV_SYSTEM_PYTHON=1`) | uv then installs into a virtual environment, not the image's Python | Add `--system` |
-| `pip uninstall`/`download`/`config`, `uv sync` in another form than `--locked` or `--frozen` (optionally `--no-dev`, `--no-install-project`, `--no-install-workspace`, `--no-install-local`, `--no-editable`, `--compile-bytecode`/`--compile`, `--reinstall`, `--refresh`, `--inexact`, `--link-mode`, `--output-format`, `--color`, `--keyring-provider`, `--refresh-package` or `--reinstall-package`, **after 0.14.0**) and every other `uv` command (`uv add`, `uv pip sync`), `poetry`, `pdm`, `pipenv`, `conda`, `mamba`, `pipx`, `easy_install`, `hatch`, `pixi`, `python setup.py` | Python packages installed a way that isn't read | Install with `pip install -r` or `uv pip install --system -r`, or sync with `uv sync --locked` |
+| `pip uninstall`/`download`/`config`, `uv sync` in another form than `--locked` or `--frozen` (optionally `--no-dev`, `--no-install-project`, `--no-install-workspace`, `--no-install-local`, `--no-editable`, `--compile-bytecode`/`--compile`, `--reinstall`, `--refresh`, `--inexact`, `--link-mode`, `--output-format`, `--color`, `--keyring-provider`, `--no-editable-package`, `--refresh-package` or `--reinstall-package`, **after 0.14.0**) and every other `uv` command (`uv add`, `uv pip sync`), `poetry`, `pdm`, `pipenv`, `conda`, `mamba`, `pipx`, `easy_install`, `hatch`, `pixi`, `python setup.py` | Python packages installed a way that isn't read | Install with `pip install -r` or `uv pip install --system -r`, or sync with `uv sync --locked` |
 | A `uv.lock` or `pyproject.toml` no `COPY` brings before a `uv sync` line, or any `COPY --from` before it other than uv's own `/uv /uvx` (whose files wheelgap can't read), the two from different folders of the build context, or a cache or tmpfs mount over them | The image's pair may not be one project, or the build may read another file than the one on disk | `COPY` the lock and `pyproject.toml` in together, from beside each other in the build context |
 | For a `uv sync` line, a `uv.toml` or `[tool.uv]` table uv would read settings from, or a `uv.toml` with settings beside the lock in the build context that the image doesn't get (not copied, or left out by `.dockerignore`) | uv resolves with those settings, so the check would follow settings the image doesn't use — or miss the ones it does | Copy the requirements the lock pins into a `-r` file instead, or keep uv's settings out of the build |
 | For a `uv sync` line, a `.python-version` an earlier `RUN` writes, one a `COPY` puts above the project's folder (uv 0.13.9 reads it only when that folder is the workspace root, which isn't read) or in uv's config folder (`~/.config/uv`, where `uv python pin --global` writes), a `.python-versions` (uv 0.13.9 reads its first version), a `.venv` in the project's folder, or `UV_PROJECT_ENVIRONMENT` (in an `ENV`, an `ARG` with a value, or on the `RUN`) | Each may give the sync a Python or environment the check doesn't know | `COPY` a `.python-version` into the project's folder instead — it is read, above — or drop the file or setting |

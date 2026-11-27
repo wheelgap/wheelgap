@@ -2553,6 +2553,9 @@ _UV_SYNC = "FROM python:3.13\nWORKDIR /app\nCOPY uv.lock pyproject.toml ./\nRUN 
         ("uv sync --locked --color=always", False),
         ("uv sync --locked --keyring-provider disabled", False),
         ("uv sync --locked --keyring-provider=subprocess", False),
+        ("uv sync --locked --no-editable-package packaging", False),
+        ("uv sync --locked --no-editable-package=packaging", False),
+        ("uv sync --locked --no-editable-package packaging --no-editable-package other", False),
         ("uv sync --locked --reinstall", False),
         ("uv sync --locked --refresh", False),
         ("uv sync --locked --refresh-package packaging", False),
@@ -2634,6 +2637,7 @@ def test_dockerfile_inputs_uv_sync_follows_copies(tmp_path, copy, files, lock, p
         ("uv sync --output-format json", "needs exactly one of --locked or --frozen"),
         ("uv sync --color never", "needs exactly one of --locked or --frozen"),
         ("uv sync --keyring-provider disabled", "needs exactly one of --locked or --frozen"),
+        ("uv sync --no-editable-package packaging", "needs exactly one of --locked or --frozen"),
         ("uv sync --reinstall", "needs exactly one of --locked or --frozen"),
         ("uv sync --refresh", "needs exactly one of --locked or --frozen"),
         ("uv sync --refresh-package packaging", "needs exactly one of --locked or --frozen"),
@@ -2651,6 +2655,10 @@ def test_dockerfile_inputs_uv_sync_follows_copies(tmp_path, copy, files, lock, p
         ("uv sync --locked --keyring-provider bogus", "only `uv sync --locked` or `--frozen`"),
         ("uv sync --locked --keyring-provider=bogus", "only `uv sync --locked` or `--frozen`"),
         ("uv sync --locked --keyring-provider", "only `uv sync --locked` or `--frozen`"),
+        ("uv sync --locked --no-editable-package bad!", "only `uv sync --locked` or `--frozen`"),
+        ("uv sync --locked --no-editable-package=bad!", "only `uv sync --locked` or `--frozen`"),
+        ("uv sync --locked --no-editable-package é", "only `uv sync --locked` or `--frozen`"),
+        ("uv sync --locked --no-editable-package", "only `uv sync --locked` or `--frozen`"),
         ("uv sync --locked --refresh-package bad!", "only `uv sync --locked` or `--frozen`"),
         ("uv sync --locked --refresh-package=bad!", "only `uv sync --locked` or `--frozen`"),
         ("uv sync --locked --refresh-package", "only `uv sync --locked` or `--frozen`"),
@@ -3607,6 +3615,9 @@ _UV_RUN = "FROM python:3.13\nWORKDIR /app\nCOPY {} ./\nRUN uv pip install --syst
         "--color=always",
         "--keyring-provider disabled",
         "--keyring-provider=subprocess",
+        "--no-editable-package packaging",
+        "--no-editable-package=packaging",
+        "--no-editable-package packaging --no-editable-package other",
         "--break-system-packages",
         "--strict",
         "--no-python-downloads",
@@ -3656,7 +3667,8 @@ def test_dockerfile_requirements_refuses_pip_only_flags_on_a_uv_line(tmp_path, f
         f":4: uv pip install {re.escape(flags.split()[0])}: --dockerfile-inputs only reads --system, -r FILE, "
         r"-c FILE, --no-cache, --no-cache-dir, --upgrade \(-U\), --quiet \(-q\), "
         r"--compile-bytecode \(--compile\), --no-progress, --reinstall, --refresh, "
-        r"--refresh-package NAME, --reinstall-package NAME, --link-mode, --output-format, --color, "
+        r"--no-editable-package NAME, --refresh-package NAME, --reinstall-package NAME, --link-mode, "
+        r"--output-format, --color, "
         r"--keyring-provider, --break-system-packages, --strict, --no-python-downloads, --system-certs and "
         r"--no-deps for uv"
     )
@@ -3680,6 +3692,8 @@ def test_dockerfile_requirements_refuses_pip_only_flags_on_a_uv_line(tmp_path, f
         "--color=always",
         "--keyring-provider disabled",
         "--keyring-provider=subprocess",
+        "--no-editable-package packaging",
+        "--no-editable-package=packaging",
         "--strict",
         "--no-python-downloads",
     ],
@@ -3722,6 +3736,10 @@ def test_dockerfile_requirements_refuses_uv_only_flags_on_a_pip_line(tmp_path, f
         "--keyring-provider=bogus",
         "--keyring-provider DISABLED",
         "--keyring-provider",
+        "--no-editable-package bad!",
+        "--no-editable-package=bad!",
+        "--no-editable-package é",
+        "--no-editable-package",
         "--refresh-package bad!",
         "--refresh-package=bad!",
         "--refresh-package é",
@@ -3733,8 +3751,8 @@ def test_dockerfile_requirements_refuses_uv_only_flags_on_a_pip_line(tmp_path, f
 )
 def test_dockerfile_requirements_refuses_a_value_uv_does_not_take(tmp_path, flags):
     # uv exits on a --link-mode other than clone, copy, hardlink or symlink, an --output-format other than text or
-    # json, a --keyring-provider other than disabled or subprocess, or a --refresh-package/--reinstall-package value
-    # that isn't a package name (`uv pip install --help`, uv 0.13.1), and the word after the flag is never taken for
+    # json, a --keyring-provider other than disabled or subprocess, or a package-valued flag's value that isn't a
+    # package name (`uv pip install --help`, uv 0.13.1), and the word after the flag is never taken for
     # a requirement.
     path = _context(tmp_path, _UV_RUN.format("requirements.txt", f"{flags} -r requirements.txt"))
     with pytest.raises(DockerfileError, match=rf":4: uv pip install {re.escape(flags.split()[0])}: "):
