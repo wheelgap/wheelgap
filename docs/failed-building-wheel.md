@@ -15,7 +15,10 @@ can have a Linux x86-64 glibc wheel and nothing that fits `musl-aarch64`.
 
 ## Find the dependency before the build
 
-Run wheelgap against your lockfile and the platforms you ship:
+Run wheelgap against your lockfile and the platforms you ship. The output below
+comes from the `uv.lock` of
+[ClawBio](https://github.com/ClawBio/ClawBio/blob/b3dec99cedbff0b5848182b61c8456c9c4f4cdca/uv.lock)
+at commit `b3dec99c`:
 
 ```console
 $ wheelgap uv.lock -p 3.13 -t musl-aarch64,linux-aarch64
