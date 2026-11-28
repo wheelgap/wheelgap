@@ -182,7 +182,7 @@ class DirectoryInput:
 class Source:
     label: str
     packages: list[Package] = field(default_factory=list)
-    # uv.lock only: which packages each package depends on, and where the walk starts.
+    # Lockfile dependency graphs: which packages each package depends on, and where the walk starts.
     # When set, a package applies to a target only if it's reachable along edges whose markers hold.
     edges: dict[int, list[Edge]] | None = None
     roots: list[int] = field(default_factory=list)
@@ -1190,12 +1190,15 @@ def parse_poetry_lock(path: Path) -> Source:
         pkgs.append(pkg)
     # With markers on edges only, walk the graph from the packages nothing depends on, as for uv.lock.
     if edge_markers_only and pkgs:
-        roots = set(_graph_roots(pkgs, edges))
-        # The project's own dependencies are roots too, even if another package also depends on them
-        # under a marker (colorama directly, and via click only on Windows).
         declared = _project_dependencies(path.parent / "pyproject.toml")
-        roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
-        return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+        return Source(
+            path.name,
+            pkgs,
+            edges=edges,
+            roots=_graph_roots(pkgs, edges, declared),
+            root_edges=declared,
+            poetry_tables=data.get("package", []),
+        )
     extras = data.get("extras")
     return Source(
         path.name,
@@ -1206,7 +1209,7 @@ def parse_poetry_lock(path: Path) -> Source:
     )
 
 
-def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]:
+def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]], root_edges: Iterable[Edge] = ()) -> list[int]:
     """Where to start walking a lock that doesn't record its project: every package in a group of
     packages (a strongly connected component, usually just one package) that nothing outside the group
     depends on. That covers dependency cycles such as sphinx <-> sphinxcontrib-*, which no package
@@ -1220,6 +1223,8 @@ def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]
     }
     comp = _components(len(pkgs), succ)
     has_outside_parent = {comp[j] for i in succ for j in succ[i] if comp[i] != comp[j]}
+    # A declared dependency enters its entire component through the project's conditional edge, not an inferred root.
+    has_outside_parent.update(comp[j] for name, *_ in root_edges for j in by_name.get(canonicalize_name(name), []))
     return [i for i in range(len(pkgs)) if comp[i] not in has_outside_parent]
 
 
@@ -1264,13 +1269,13 @@ def _components(n: int, succ: dict[int, list[int]]) -> list[int]:
     return comp
 
 
-def _project_dependencies(pyproject: Path) -> set[str]:
-    """Names a project declares itself (PEP 621 and Poetry tables), to use as roots for poetry.lock.
+def _project_dependencies(pyproject: Path) -> list[Edge]:
+    """Dependencies a project declares itself, preserving conditions on the edges that seed a Poetry 1.x walk.
     A missing or odd pyproject.toml just means no extra roots: it must never break the run."""
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except Exception:
-        return set()
+        return []
 
     def table(value: object) -> dict:
         return value if isinstance(value, dict) else {}
@@ -1284,17 +1289,38 @@ def _project_dependencies(pyproject: Path) -> set[str]:
         specs += strings(extra)
     for group in table(data.get("dependency-groups")).values():
         specs += strings(group)
-    names: set[str] = set()
+    edges: list[Edge] = []
     for spec in specs:
         try:
-            names.add(canonicalize_name(Requirement(spec).name))
+            req = Requirement(spec)
+            edges.append((req.name, str(req.specifier) or None, str(req.marker) if req.marker else None, None))
         except InvalidRequirement:
             continue
     poetry = table(table(data.get("tool")).get("poetry"))
     tables = [table(poetry.get("dependencies")), table(poetry.get("dev-dependencies"))]
     tables += [table(table(g).get("dependencies")) for g in table(poetry.get("group")).values()]
-    names |= {canonicalize_name(name) for t in tables for name in t if name.lower() != "python"}
-    return names
+    for t in tables:
+        for name, spec in t.items():
+            if name.lower() == "python":
+                continue
+            for variant in spec if isinstance(spec, list) else [spec]:
+                entry = table(variant)
+                marker = entry.get("markers")
+                if marker is not None and not isinstance(marker, str):
+                    marker = "unreadable Poetry marker"
+                python = entry.get("python", "*")
+                if python != "*":
+                    try:
+                        constraint = SpecifierSet(python)
+                        python_marker = " and ".join(
+                            f'python_full_version {clause.operator} "{clause.version}"' for clause in constraint
+                        )
+                    except (InvalidSpecifier, TypeError):
+                        python_marker = "unsupported Poetry Python constraint"
+                    marker = f"({marker}) and ({python_marker})" if marker else python_marker
+                version = entry.get("version") if entry else variant
+                edges.append((name, version if isinstance(version, str) and version != "*" else None, marker, None))
+    return edges
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Respect direct dependency markers and Python restrictions when reading Poetry 1.x locks, and report undecidable dependency paths as unknown.
+
 - `wheelgap diff` and the Action's `compare-to` gate no longer compare a target whose Python either lockfile's `requires-python` leaves out: a lock isn't made for that Python, and one that moved its packages to a mirror looked as if they all lost their wheels there (18 false regressions on a real Dependabot PR). Those targets get a note, a new `not_compared` key in `--json` and a "Not compared" line in the job summary and comment, and never count as worse; the last line then says "Nothing got worse on the compared targets." A Python only the new lockfile leaves out is one the change dropped (`uv sync` there now fails): the note says so, the job summary and comment lead with "This change drops Python 3.13 support", and the Action's log gets a warning, though the exit code still counts only worse and new packages. (#830)
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-break-system-packages`, the explicit negative form of `--break-system-packages`: it doesn't change which exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#791, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-editable`: editable installs are already refused there, so the flag has no editable package to affect and doesn't change which exactly pinned distributions or artifacts uv installs. (#790, thanks [@Seyamalam](https://github.com/Seyamalam))

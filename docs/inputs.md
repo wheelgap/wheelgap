@@ -274,10 +274,13 @@ hashes and no file names are looked up on the index; packages in them from anoth
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
-next to the lock. `--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
-lock doesn't say which Pythons a direct dependency is installed for (`numpy = [{version = "1.26.4", python = "<3.13"},
-...]` is only in `pyproject.toml`), so the range would report a pin as `missing` on a Python Poetry never installs it
-on.
+next to the lock. Direct dependencies retain their environment markers and PEP 440 `python` restrictions from
+`pyproject.toml`, including alternative entries and dependency groups. A dependency excluded on a target is `n/a`;
+when its only dependency paths have conditions the target cannot decide, it is `unknown`. This includes patch-level
+Python restrictions and Poetry-specific Python constraints that aren't PEP 440 specifiers (such as `^3.12`). An
+unconditional path to the same package still counts normally. `--explain` shows the dependency path for these locks.
+A locked package's `python-versions` isn't applied: it describes the available release, not the project's condition
+for installing it.
 
 **Dependency selection** (Poetry 2.x locks): `--group`, `--only-group` and `--no-dev` work with Poetry's meanings, and
 configured `groups` apply too. `main` and every group not marked `optional = true` in `pyproject.toml` count;

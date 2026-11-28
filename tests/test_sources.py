@@ -2857,3 +2857,137 @@ def test_requirements_tab_before_an_option_is_one_requirement_as_in_pip(tmp_path
     req.write_text("fastlib==2.0.0\t--no-binary fastlib\n", encoding="utf-8")
     with pytest.raises(SourceError, match="can't parse requirement"):
         parse_requirements(req)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "pythons", "expected"),
+    [
+        (
+            '[tool.poetry.dependencies]\ncolorama = {version = "*", markers = "platform_system == \\"Windows\\""}\n',
+            ["3.12"],
+            [Status.NOT_NEEDED, Status.SOURCE],
+        ),
+        (
+            '[project]\ndependencies = ["colorama; platform_system == \\"Windows\\""]\n',
+            ["3.12"],
+            [Status.NOT_NEEDED, Status.SOURCE],
+        ),
+        (
+            '[tool.poetry.dependencies]\ncolorama = {version = "*", python = ">=3.13"}\n',
+            ["3.12", "3.13"],
+            [Status.NOT_NEEDED, Status.NOT_NEEDED, Status.SOURCE, Status.SOURCE],
+        ),
+        (
+            "[tool.poetry.dependencies]\n"
+            'colorama = {version = "*", python = ">=3.13", markers = "sys_platform == \\"win32\\""}\n',
+            ["3.12", "3.13"],
+            [Status.NOT_NEEDED, Status.NOT_NEEDED, Status.NOT_NEEDED, Status.SOURCE],
+        ),
+        (
+            "[tool.poetry.group.dev.dependencies]\n"
+            'colorama = {version = "*", markers = "sys_platform == \\"win32\\""}\n',
+            ["3.12"],
+            [Status.NOT_NEEDED, Status.SOURCE],
+        ),
+        (
+            '[tool.poetry.dependencies]\ncolorama = {version = "*", markers = "platform_release == \\"6.1\\""}\n',
+            ["3.12"],
+            [Status.UNKNOWN, Status.UNKNOWN],
+        ),
+        (
+            '[tool.poetry.dependencies]\ncolorama = {version = "*", python = ">=3.12.4"}\n',
+            ["3.12", "3.13"],
+            [Status.UNKNOWN, Status.UNKNOWN, Status.SOURCE, Status.SOURCE],
+        ),
+        (
+            '[tool.poetry.dependencies]\ncolorama = {version = "*", python = "^3.12"}\n',
+            ["3.12"],
+            [Status.UNKNOWN, Status.UNKNOWN],
+        ),
+    ],
+)
+def test_poetry_1x_direct_dependency_conditions(tmp_path, declaration, pythons, expected):
+    (tmp_path / "pyproject.toml").write_text(declaration, encoding="utf-8")
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\n'
+        'files = [{file = "colorama-0.4.6.tar.gz"}]\n\n[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    targets = build_targets(pythons, ["linux-x86_64", "win-amd64"])
+    (row,) = check([src], targets)
+    assert [row.results[t] for t in targets] == expected
+
+
+def test_poetry_1x_conditional_root_does_not_hide_another_dependency_path(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\napp = "*"\n'
+        'colorama = {version = "*", markers = "platform_release == \\"6.1\\""}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app"\nversion = "1"\nfiles = []\n[package.dependencies]\ncolorama = "*"\n\n'
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\nfiles = [{file = "colorama-0.4.6.tar.gz"}]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    (target,) = build_targets(["3.12"], ["linux-x86_64"])
+    rows = {r.package.name: r.results[target] for r in check([src], [target])}
+    assert rows["colorama"] is Status.SOURCE
+
+
+def test_poetry_1x_conditional_root_keeps_its_dependency_cycle_conditional(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\napp = {version = "*", markers = "sys_platform == \\"win32\\""}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app"\nversion = "1"\nfiles = []\n[package.dependencies]\nother = "*"\n\n'
+        '[[package]]\nname = "other"\nversion = "1"\nfiles = []\n[package.dependencies]\napp = "*"\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    lin, win = build_targets(["3.12"], ["linux-x86_64", "win-amd64"])
+    rows = check([src], [lin, win])
+    assert all(r.results[lin] is Status.NOT_NEEDED and r.results[win] is Status.MISSING for r in rows)
+
+
+def test_poetry_1x_direct_dependency_alternatives_pick_the_matching_version(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\ncolorama = [\n"
+        '  {version = "0.4.5", python = "<3.13"},\n'
+        '  {version = "0.4.6", python = ">=3.13"},\n]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "poetry.lock").write_text(
+        "".join(
+            f'[[package]]\nname = "colorama"\nversion = "{version}"\n'
+            f'files = [{{file = "colorama-{version}.tar.gz"}}]\n\n'
+            for version in ["0.4.5", "0.4.6"]
+        )
+        + '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    old, new = build_targets(["3.12", "3.13"], ["linux-x86_64"])
+    rows = {r.package.version: r.results for r in check([src], [old, new])}
+    assert rows["0.4.5"] == {old: Status.SOURCE, new: Status.NOT_NEEDED}
+    assert rows["0.4.6"] == {old: Status.NOT_NEEDED, new: Status.SOURCE}
+
+
+def test_poetry_1x_unknown_direct_condition_propagates_to_dependencies(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\napp = {version = "*", markers = "platform_release == \\"6.1\\""}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app"\nversion = "1"\nfiles = []\n[package.dependencies]\ncolorama = "*"\n\n'
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\nfiles = [{file = "colorama-0.4.6.tar.gz"}]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    (target,) = build_targets(["3.12"], ["linux-x86_64"])
+    assert all(r.results[target] is Status.UNKNOWN for r in check([src], [target]))

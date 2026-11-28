@@ -1032,7 +1032,7 @@ def dropped_targets(local: list[str], last: list[tuple[str, str | None]], target
     ]
 
 
-def reachable(source: Source, target: Target) -> dict[int, Parent]:
+def reachable(source: Source, target: Target, *, certain: bool = False) -> dict[int, Parent]:
     """Packages installed on `target`, each mapped to the parent it was first reached from.
 
     The walk is breadth-first from the roots, so following the parents gives a shortest path.
@@ -1045,7 +1045,8 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
 
     def follow(edge: Edge) -> list[int]:
         name, version, marker, edge_source = edge
-        if not marker_holds(marker, target):
+        value = marker_value(marker, target)
+        if value is False or (certain and value is None):
             return []
         return _narrow_candidates(
             source,
@@ -1302,6 +1303,11 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
             }
         else:
             installed = None
+        certain_installed = (
+            {t: reachable(source, t, certain=True) for t in targets}
+            if source.poetry_tables is not None and source.edges is not None and source.root_edges
+            else None
+        )
         # The (via ...) hint, per target, worked out only when a gap needs it, so gap-free runs never pay. Text and
         # Markdown tables show it, and `--json --explain` writes it as `direct`.
         hints: dict[Target, dict[int, tuple[str, ...]]] = {}
@@ -1332,6 +1338,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                     if needed
                     else Status.NOT_NEEDED
                 )
+                if needed and certain_installed is not None and i not in certain_installed[t]:
+                    row.results[t] = Status.UNKNOWN
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i]
