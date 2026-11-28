@@ -1102,6 +1102,9 @@ def parse_uv_lock(path: Path) -> Source:
         # (directory = "libs/x") is reached through its dependents' edges and their markers instead.
         if (kind in ("editable", "virtual") and src.get(kind) == ".") or pkg.key in members:
             source.roots.append(i)
+    for i in source.roots:  # their extras and groups are read again for a selection and the walk: check them now
+        uv_extra_names((source.uv_packages or [])[i], path.name)
+        uv_group_names((source.uv_packages or [])[i], path.name)
     _uv_build_restrictions(path, source)
     for name, group in manifest_groups.items():
         for d in group:
@@ -1167,16 +1170,33 @@ def uv_selected_roots(source: Source) -> list[int]:
     return project or source.roots
 
 
-def uv_extra_names(package: dict) -> frozenset[str]:
+def _uv_table(mapping: dict, field: str, owner: str) -> dict:
+    value = mapping.get(field, {})
+    if not isinstance(value, dict):
+        raise SourceError(f"{owner}: {field} must be a table")
+    return value
+
+
+def uv_extra_names(package: dict, lock: str = "uv.lock") -> frozenset[str]:
     # uv omits empty optional-dependency groups from the graph, but records their names here.
-    return frozenset(canonicalize_name(name) for name in package.get("optional-dependencies", {})) | frozenset(
-        canonicalize_name(name) for name in package.get("metadata", {}).get("provides-extras", [])
+    owner = f"{lock}: package {package.get('name', '?')}"
+    optional = _uv_table(package, "optional-dependencies", owner)
+    metadata = _uv_table(package, "metadata", owner)
+    provides_extras = metadata.get("provides-extras", [])
+    if not isinstance(provides_extras, list) or not all(isinstance(name, str) for name in provides_extras):
+        raise SourceError(f"{owner}: provides-extras must be a list of strings")
+    return frozenset(canonicalize_name(name) for name in optional) | frozenset(
+        canonicalize_name(name) for name in provides_extras
     )
 
 
-def uv_group_names(package: dict) -> frozenset[str]:
-    return frozenset(canonicalize_name(name) for name in package.get("dev-dependencies", {})) | frozenset(
-        canonicalize_name(name) for name in package.get("metadata", {}).get("requires-dev", {})
+def uv_group_names(package: dict, lock: str = "uv.lock") -> frozenset[str]:
+    owner = f"{lock}: package {package.get('name', '?')}"
+    dev_deps = _uv_table(package, "dev-dependencies", owner)
+    metadata = _uv_table(package, "metadata", owner)
+    requires_dev = _uv_table(metadata, "requires-dev", owner)
+    return frozenset(canonicalize_name(name) for name in dev_deps) | frozenset(
+        canonicalize_name(name) for name in requires_dev
     )
 
 
