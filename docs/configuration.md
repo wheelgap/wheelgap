@@ -122,7 +122,8 @@ off for one run. See [Tracker notes](output.md#notes).
 
 ### `build-info` {#build-info}
 
-`true` or `false`. `build-info = true` makes `--explain` also say what each `source` build needs, as
+`true` or `false`. `build-info = true` makes `--explain` also say what each `source` build needs, and `--fix` which
+distro packages to install to build a gap with no fix on a Linux target, as
 [`--build-info`](cli.md#build-info) does, which downloads the sdists of packages known to be PyPI's. See
 [Build requirements](output.md#build-info).
 

@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
 
 from .sources import (
     Edge,
+    MarkerGroup,
     Package,
     PoetryExtras,
     Source,
@@ -1288,7 +1289,89 @@ def _in_range(version: str | None, spec: SpecifierSet) -> bool:
 
 
 def applies(pkg: Package, target: Target) -> bool:
+    if pkg.marker_group is not None:
+        return group_answer(pkg.marker_group, target) is pkg
     return pkg.markers is None or any(marker_holds(m, target) for m in pkg.markers)
+
+
+def group_answer(group: MarkerGroup, target: Target) -> Package | None:
+    """The package of a name required under different markers that `target` installs, as pip combines the lines whose
+    markers hold there: the member for exactly that set of lines, or a line's own package when its release meets every
+    line that holds (one less lookup to show). Where a marker can't be decided (platform_machine on linux-armv7l, a
+    patch release of Python), the answer stands only if it can't change: the release checked for the lines that hold
+    for sure meets every line that may hold too. Otherwise the group's `unknown` member; None if no line holds."""
+    values = [True if m is None else _any_marker(m, target) for m in group.markers]
+    held = frozenset(i for i, value in enumerate(values) if value is True)
+    maybe = frozenset(i for i, value in enumerate(values) if value is None)
+    if not held and not maybe:
+        return None
+    fallback = next(m for m in group.members if frozenset() in m.marker_sets)
+    python = f"{target.major}.{target.minor}"
+
+    def meets(pkg: Package, lines: frozenset[int]) -> bool:
+        """Whether pip would take `pkg`'s checked release for these lines too: each allows it and lists its hashes."""
+        resolved = pkg.resolutions.get(python, pkg)
+        version = resolved.version
+        if pkg.skip or resolved.error or version is None:
+            return False
+        try:
+            own = SpecifierSet(pkg.spec or "")
+            together = own
+            for i in lines:
+                line = group.lines[i]
+                if line.skip or line.error or (line.hashes, line.other_hashes) != (pkg.hashes, pkg.other_hashes):
+                    return False
+                specifier = _pin(line.version) if line.version else line.spec
+                if specifier:
+                    if not SpecifierSet(specifier).contains(version, prereleases=True):
+                        return False
+                    together &= SpecifierSet(specifier)
+        except (InvalidSpecifier, InvalidVersion):
+            return False
+        # A release the index picked for `pkg`'s own range: if a line names a pre-release (tensorflow>=2.16.0rc0),
+        # pip takes pre-releases for the lines together, so a newer one may win (pip 26.3 installs
+        # tensorflow 2.22.0rc1 for that with tensorflow>=2.15). Then only the merged lines' own lookup can say.
+        picked = resolved.version_from_index or pkg.version_from_index
+        return not (picked and pkg.prereleases is None and together.prereleases and not own.prereleases)
+
+    # A line that may hold but asks exactly what one that holds asks (`py-cpuinfo; platform_machine == "aarch64"`
+    # beside `py-cpuinfo`, on linux-armv7l) changes nothing either way.
+    maybe = frozenset(i for i in maybe if not any(_same_ask(group.lines[i], group.lines[j]) for j in held))
+    singles = {i: m for m in group.members for s in m.marker_sets if len(s) == 1 for i in s}
+    if held:
+        answer = next((m for m in group.members if held in m.marker_sets), None)
+        if answer is None:
+            return fallback
+        # A line's own package when its release meets every line that holds: `scipy>=1.13` alone and with
+        # `scipy>=1.15; python_version >= "3.13"` check the same newest release.
+        answer = next((singles[i] for i in sorted(held) if i in singles and meets(singles[i], held)), answer)
+        return answer if not maybe or meets(answer, maybe) else fallback
+    # Only lines that may hold: whichever do, pip takes the same release if each line's own is one release they all
+    # allow.
+    own = [singles.get(i) for i in sorted(maybe)]
+    first = own[0]
+    if first is None or any(m is None or not meets(m, maybe) for m in own):
+        return fallback
+    versions = {m.resolutions.get(python, m).version for m in own if m is not None}
+    return first if len(versions) == 1 else fallback
+
+
+def _same_ask(a: Package, b: Package) -> bool:
+    fields = ("version", "spec", "hashes", "other_hashes", "skip", "error")
+    return all(getattr(a, f) == getattr(b, f) for f in fields)
+
+
+def _any_marker(markers: list[str], target: Target) -> bool | None:
+    values = [marker_value(m, target) for m in markers]
+    return True if True in values else None if None in values else False
+
+
+def _pin(version: str) -> str:
+    try:
+        Version(version)
+    except InvalidVersion:
+        return f"==={version}"
+    return f"=={version}"
 
 
 def _selected_direct_dependencies(
@@ -1517,6 +1600,10 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                     if needed or source.poetry_roots_unknown
                     else Status.NOT_NEEDED
                 )
+                if needed and status is Status.MISSING and resolved.other_hashes:
+                    # No file with a listed sha256 fits here, so pip doesn't filter by them (filter_unallowed_hashes)
+                    # and checks its pick against the line's sha384/sha512 hashes too, which wheelgap can't match.
+                    status = Status.UNKNOWN
                 if not needed and status not in (Status.WHEEL, Status.NOT_NEEDED) and installed is not None:
                     # No dependency installs it here, but Poetry installs a direct dependency everywhere, and only the
                     # pyproject.toml can say whether it is one. Another version of the name installed here settles it.
@@ -1545,7 +1632,25 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                         if direct := hints[t].get(i):
                             row.direct_via[t] = direct
             rows.extend(resolved_rows.values())
-    return rows
+    return _drop_unused_group_rows(rows)
+
+
+def _drop_unused_group_rows(rows: list[Row]) -> list[Row]:
+    """Leave out the rows of a MarkerGroup's packages that no target installs: the lines merged for an environment
+    that isn't checked, and the `unknown` one, whose reason would otherwise be printed. If none of the group's rows is
+    needed, its lines' own rows stay, as for any package whose marker no target holds."""
+    used = {
+        id(group)
+        for row in rows
+        if row.needed and (group := (row.input_package or row.package).marker_group) is not None
+    }
+    return [
+        row
+        for row in rows
+        if (group := (row.input_package or row.package).marker_group) is None
+        or row.needed
+        or (id(group) not in used and any(len(s) == 1 for s in (row.input_package or row.package).marker_sets))
+    ]
 
 
 def poetry_roots_reason(source: Source) -> str:

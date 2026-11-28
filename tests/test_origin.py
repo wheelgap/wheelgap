@@ -125,15 +125,19 @@ def package(tmp_path, files, name="nowheels"):
         ),
         ({"pyproject.toml": PYPROJECT + "\n[tool.pixi.pypi-options]\nfind-links = [{path = './wheels'}]\n"}, False),
         ({"pyproject.toml": PYPROJECT, "pdm.toml": "[pypi.corp]\nurl = 'https://x.example/simple'\n"}, False),
-        # Requirements files: a byte order mark, includes that aren't read, abbreviated include options.
+        # Requirements files: a byte order mark, abbreviated include options (followed, as pip follows them).
         ({"requirements.txt": b"\xef\xbb\xbf--index-url https://x.example/simple\nnowheels==0.9\n"}, False),
         ({"requirements.txt": b"\xef\xbb\xbfnowheels==0.9\n"}, True),
-        ({"requirements.txt": "-c https://x.example/constraints.txt\nnowheels==0.9\n"}, False),
-        ({"requirements.txt": "-c ${CONSTRAINTS}\nnowheels==0.9\n"}, False),
-        ({"requirements.txt": "--requirem more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
-        ({"requirements.txt": "--cons=more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
-        ({"requirements.txt": "--pre --req more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
-        ({"requirements.txt": '--pre "--req" more.txt\nnowheels==0.9\n', "more.txt": ""}, False),
+        ({"requirements.txt": "--requirem more.txt\nnowheels==0.9\n", "more.txt": ""}, True),
+        ({"requirements.txt": "--cons=more.txt\nnowheels==0.9\n", "more.txt": ""}, True),
+        (
+            {"requirements.txt": "--pre --requirem more.txt\nnowheels==0.9\n", "more.txt": "-i https://x.example/s\n"},
+            False,
+        ),
+        (
+            {"requirements.txt": '--pre "--cons" more.txt\nnowheels==0.9\n', "more.txt": "-i https://x.example/s\n"},
+            False,
+        ),
         (
             {"requirements.txt": "--pre -r more.txt\nnowheels==0.9\n", "more.txt": "--index-url https://x.example/s\n"},
             False,
@@ -256,6 +260,18 @@ def test_private_names_are_private_in_every_input(fake_pypi, tmp_path):
     assert not origin.known_pypi(nowheels, reqs, env=EMPTY, private=private)
     assert origin.known_pypi(purewheel, reqs, env=EMPTY, private=private)
     assert "nowheels" not in origin.private_names([reqs], env=EMPTY)  # the requirements file alone
+
+
+def test_private_names_judges_a_name_required_under_markers_by_its_group(fake_pypi, tmp_path):
+    # The group's `unknown` stand-in (and a merge that conflicts) is never looked up: the name is placed by the
+    # packages that are, so --fix, --notes and --conda-forge still treat numpy-like names as PyPI's (#835 review).
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged>=1.5\nranged<2 ; sys_platform == 'linux'\n", encoding="utf-8")
+    (source,) = load_inputs([str(path)])
+    pypi.fill_all(source.packages)
+    stand_in = next(p for p in source.packages if frozenset() in p.marker_sets)
+    assert not stand_in.found_on_pypi and origin.known_pypi(stand_in, source, env=EMPTY)
+    assert origin.private_names([source], env=EMPTY) == frozenset()
 
 
 def test_private_names_judges_a_range_by_its_resolutions():
