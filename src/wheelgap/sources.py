@@ -233,6 +233,9 @@ class Source:
     pyproject_groups_only: bool = False
     # pyproject.toml only: the canonical [project] name, to spot `myproject[extra]` self-references.
     pyproject_name: str | None = None
+    # pyproject.toml and scripts: the uv settings uv applies to each requirement, including
+    # those of extras and groups selected later (_project_package).
+    uv_rules: UvRules | None = None
     # poetry.lock only: each package's [[package]] table, kept so --group/--only-group/--no-dev can pick packages
     # by the groups Poetry records on them.
     poetry_tables: list[dict] | None = None
@@ -583,8 +586,9 @@ def tool_table(data: dict, path: Path | str) -> dict:
     return tool
 
 
-# The shared reader of the uv settings uv applies to an input (#812): a project's uv.lock and a script's lock go
-# through _find_uv_settings and _uv_build_policy.
+# The shared reader of the uv settings uv applies to an input (#811, #812): a project's uv.lock, a script's lock, a
+# pyproject.toml and a script all go through _find_uv_settings and _uv_build_policy, and a pyproject.toml or
+# script's requirements through UvRules.apply as well.
 
 
 @dataclass
@@ -700,6 +704,11 @@ class _BuildPolicy:
     no_build_package: dict[str, str] = field(default_factory=dict)
     no_binary_package: dict[str, str] = field(default_factory=dict)
 
+    def settings_on(self) -> list[str]:
+        package_lists = (self.no_build_package, self.no_binary_package)
+        firsts = [next(iter(names.values())) for names in package_lists if names]
+        return [setting for setting in (self.no_build, self.no_binary, *firsts) if setting]
+
     def apply(self, pkg: Package) -> None:
         restrictions = []
         if self.no_build or pkg.key in self.no_build_package:
@@ -749,6 +758,54 @@ def _uv_build_restrictions(path: Path, source: Source) -> None:
     for pkg in source.packages:
         if not pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
             policy.apply(pkg)
+
+
+@dataclass
+class UvRules:
+    """What uv does to a pyproject.toml or script's requirements beyond what they say (#811): the build restrictions
+    in the settings it applies."""
+
+    policy: _BuildPolicy
+
+    def apply(self, pkg: Package) -> None:
+        if pkg.skip:  # a direct URL: not from an index whatever the settings
+            return
+        self.policy.apply(pkg)
+
+
+def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
+    """The UvRules for a pyproject.toml or script (`data`, a script's block as _project_source gets it). A script's
+    settings are its block's [tool.uv] with those `uv run` finds (_script_uv_layers). For a pyproject.toml uv
+    applies the settings found from its folder up (a uv.toml beside it in place of its [tool.uv]); for a workspace
+    member, those of the workspace root instead (uv ignores the member's own)."""
+    own_uv = _table(_table(data, "tool"), "uv")
+    if script:
+        layers = _script_uv_layers(path, own_uv)
+    else:
+        folder = _input_folder(path)
+        own = folder / path.name
+        workspace = _workspace_root(path, data)
+        found = _find_uv_settings(folder, own) if workspace is None else None
+        if workspace is not None:
+            root, _, certain = workspace
+            found = _find_uv_settings(root.parent)
+            if not certain:
+                # A member gets the root's settings, a project of its own the settings found for it.
+                alone = _find_uv_settings(folder, own)
+                differ = [
+                    f"{config} sets {', '.join(keys)}"
+                    for config, settings in ([] if alone == found else [f for f in (found, alone) if f is not None])
+                    if (keys := [key for key in _UV_BUILD_RESTRICTIONS if key in settings])
+                ]
+                if differ:
+                    raise SourceError(
+                        f"{path}: wheelgap can't tell whether this is a member of the workspace at {root} (its "
+                        "[tool.uv.workspace] members or exclude use patterns wheelgap doesn't match as uv does), and "
+                        f"uv gives a member the workspace root's settings: {differ[0]}"
+                    )
+                found = alone
+        layers = [] if found is None else [_uv_layer(found, folder, own)]
+    return UvRules(_uv_build_policy(layers))
 
 
 def parse_uv_lock(path: Path) -> Source:
@@ -1876,13 +1933,16 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
     )
     _read_exclude_newer(source, data, path, script)
+    source.uv_rules = _uv_rules(data, path, script)
+    if settings := source.uv_rules.policy.settings_on():
+        source.deps_blockers.append(f"{settings[0]}, which uv applies to the dependencies it resolves too")
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
         source.pyproject_name = canonicalize_name(name)
     self_extras: list[str] = []
     for line in dependencies:
-        pkg = requirement_to_package(line, path.name)
+        pkg = _project_package(source, line)
         if pkg.key != source.pyproject_name:
             source.packages.append(pkg)
             source.specs.append(line)
@@ -1965,7 +2025,7 @@ def select_pyproject_groups(source: Source, groups: Iterable[str], only_groups: 
             # Installing the project installs its dependencies, and `myproject[extra]` that extra too.
             self_extras.extend(_self_reference_extras(source, line, req))
             continue
-        pkg = requirement_to_package(line, source.label)
+        pkg = _project_package(source, line)
         if line not in source.specs:
             source.specs.append(line)
         if pkg not in source.packages:
@@ -2009,7 +2069,7 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
             if source.pyproject_name is not None and canonicalize_name(req.name) == source.pyproject_name:
                 wanted.extend(_self_reference_extras(source, line, req))
                 continue
-            pkg = requirement_to_package(line, source.label)
+            pkg = _project_package(source, line)
             if line not in source.specs:
                 source.specs.append(line)
             if pkg not in source.packages:  # also in another extra or in dependencies: one row
@@ -2017,6 +2077,14 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
 
     for pkg in source.packages:  # pinned or not: uv leaves out a pinned release's later files too
         pkg.exclude_newer = source.cutoff_for(pkg.key)
+
+
+def _project_package(source: Source, line: str) -> Package:
+    """A pyproject.toml or script requirement, taken from where uv takes it (Source.uv_rules)."""
+    pkg = requirement_to_package(line, source.label)
+    if source.uv_rules is not None:
+        source.uv_rules.apply(pkg)
+    return pkg
 
 
 def requirement_to_package(text: str, origin: str, hashes: frozenset[str] = frozenset()) -> Package:

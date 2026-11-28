@@ -1,4 +1,4 @@
-"""The uv settings uv applies to a uv.lock and a script's lock (#812).
+"""The uv settings uv applies to a pyproject.toml, a script and a uv.lock (#811, #812).
 
 Each expectation was checked against uv 0.13.1 (`uv lock`, `uv sync -v`, `uv run -v`) with public packages."""
 
@@ -100,3 +100,111 @@ def test_dockerfile_uv_sync_refuses_settings_above_the_lock_the_image_doesnt_get
     )
     with pytest.raises(DockerfileError, match=r":4: \.\./uv\.toml sets no-build in a folder above the lock"):
         dockerfile_requirements(app / "Dockerfile", uv_syncs={}, pythons=("3.13",))
+
+
+# #811: [tool.uv] no-binary / no-build settings for pyproject.toml and script inputs.
+
+
+def test_pyproject_no_binary_package_from_the_issue_builds_from_source(tmp_path, capsys, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], '[tool.uv]\nno-binary-package = ["fastlib"]\n'), encoding="utf-8"
+    )
+    assert _results(capsys, tmp_path / "pyproject.toml")[:2] == (1, {"fastlib": "source"})
+    main([str(tmp_path / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--explain"])
+    assert "install policy: [tool.uv] no-binary-package" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ("no-build = true", {"fastlib": "wheel", "nowheels": "missing"}),
+        ("no-binary = true", {"fastlib": "source", "nowheels": "source"}),
+        ('no-build-package = ["nowheels"]', {"fastlib": "wheel", "nowheels": "missing"}),
+    ],
+)
+def test_pyproject_build_restrictions(tmp_path, capsys, fake_pypi, setting, expected):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0", "nowheels==0.9"], f"[tool.uv]\n{setting}\n"), encoding="utf-8"
+    )
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == expected
+
+
+def test_pyproject_uv_toml_beside_it_replaces_its_tool_uv(tmp_path, capsys, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0", "nowheels==0.9"], "[tool.uv]\nno-binary = true\n"), encoding="utf-8"
+    )
+    (tmp_path / "uv.toml").write_text('no-build-package = ["nowheels"]\n', encoding="utf-8")
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == {"fastlib": "wheel", "nowheels": "missing"}
+
+
+def test_pyproject_build_restrictions_apply_to_selected_extras(tmp_path, capsys, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            [],
+            '[project.optional-dependencies]\nfast = ["fastlib==2.0.0"]\n\n'
+            '[tool.uv]\nno-binary-package = ["fastlib"]\n',
+        ),
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "pyproject.toml", "--extra", "fast")[1] == {"fastlib": "source"}
+
+
+def test_workspace_member_gets_the_roots_build_restrictions_not_its_own(tmp_path, capsys, fake_pypi):
+    # uv sync --package a builds from the root's settings and ignores the member's own no-binary-package.
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject([], '[tool.uv.workspace]\nmembers = ["a"]\n\n[tool.uv]\nno-build-package = ["nowheels"]\n', "root"),
+        encoding="utf-8",
+    )
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0", "nowheels==0.9"], '[tool.uv]\nno-binary-package = ["fastlib"]\n', "a"),
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "a" / "pyproject.toml")[1] == {"fastlib": "wheel", "nowheels": "missing"}
+    main([str(tmp_path / "a" / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--explain"])
+    assert "install policy: ../pyproject.toml [tool.uv] no-build-package" in capsys.readouterr().out
+
+
+def test_unsure_workspace_membership_with_build_restrictions_is_refused(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject([], '[tool.uv.workspace]\nmembers = ["**/a"]\n\n[tool.uv]\nno-binary = true\n', "root"),
+        encoding="utf-8",
+    )
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], "[tool.uv]\nno-build = false\n", "a"), encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match="can't tell whether this is a member of the workspace"):
+        load_inputs([str(tmp_path / "a" / "pyproject.toml")])
+
+
+def test_script_block_build_restrictions_from_the_issue(tmp_path, capsys, fake_pypi):
+    (tmp_path / "demo.py").write_text(
+        '# /// script\n# dependencies = ["fastlib==2.0.0"]\n# [tool.uv]\n# no-binary-package = ["fastlib"]\n'
+        '# ///\nprint("hi")\n',
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "demo.py")[1] == {"fastlib": "source"}
+
+
+def test_script_joins_its_block_with_a_uv_toml_above(tmp_path, capsys, fake_pypi):
+    # uv run (from any folder) applies the nearest settings from the script's folder up, joined with its block's.
+    (tmp_path / "uv.toml").write_text('no-binary-package = ["fastlib"]\n', encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "demo.py").write_text(
+        '# /// script\n# dependencies = ["fastlib==2.0.0", "nowheels==0.9"]\n# [tool.uv]\n'
+        '# no-build-package = ["nowheels"]\n# ///\n',
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "scripts" / "demo.py")[1] == {"fastlib": "source", "nowheels": "missing"}
+
+
+@pytest.mark.parametrize("name", ["pyproject.toml", "demo.py"])
+def test_deps_refuses_build_restrictions_it_cant_apply_to_dependencies(tmp_path, capsys, fake_pypi, name):
+    if name == "demo.py":
+        text = '# /// script\n# dependencies = ["fastlib"]\n# [tool.uv]\n# no-build = true\n# ///\n'
+    else:
+        text = _pyproject(["fastlib"], "[tool.uv]\nno-build = true\n")
+    (tmp_path / name).write_text(text, encoding="utf-8")
+    assert main([str(tmp_path / name), "-p", "3.13", "-t", "linux-x86_64", "--deps"]) == 2
+    assert "[tool.uv] no-build, which uv applies to the dependencies it resolves too" in capsys.readouterr().err

@@ -582,6 +582,12 @@ kept where wheelgap doesn't read them (check a lockfile instead).
 
 `check_lockfile()` and `wheelgap diff` don't read `pyproject.toml` as an input.
 
+**uv settings:** the requirements are answered the way uv installs them. uv's `no-build`, `no-binary`,
+`no-build-package` and `no-binary-package` are applied as for a [`uv.lock`](#uvlock), from the nearest `uv.toml` or
+`pyproject.toml` `[tool.uv]` from the file's folder up (for a uv workspace member, the workspace root's settings, as
+uv ignores the member's own). `--deps` refuses a file that sets one. When wheelgap can't tell whether the file is a
+workspace member and the answer would depend on it, it's an input error.
+
 uv's `exclude-newer` upload cutoff is applied: see [Resolution upload cutoffs](#resolution-upload-cutoffs).
 
 ## Python scripts
@@ -619,6 +625,10 @@ flags use ([which names leave the run](how-it-works.md#pypi-origin)). [`--fix`](
 lines to add to the block for `uv run`. To check what the script installs, pass its lock instead
 (`example.py.lock`, from `uv lock --script`), which is read as a [`uv.lock`](#uvlock). Without `--deps`,
 `check_lockfile()` and `wheelgap diff` don't read a script.
+
+The block's build restrictions are applied as in a [`pyproject.toml`](#pyprojecttoml), with the block's settings
+combined with the nearest `uv.toml` or `pyproject.toml` `[tool.uv]` from the script's folder up, as `uv run` combines
+them (see [uv.lock](#uvlock)).
 
 A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 
