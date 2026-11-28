@@ -670,7 +670,7 @@ def _uv_layer(found: tuple[Path, dict], folder: Path, own: Path | None) -> _UvLa
     table = "uv.toml" if config.name == "uv.toml" else "[tool.uv]"
     if config == own or (table == "uv.toml" and config.parent == folder):
         return _UvLayer(settings, config, table, table)
-    shown = os.path.relpath(config, folder)
+    shown = Path(os.path.relpath(config, folder)).as_posix()  # one spelling on every OS, as in a pyproject.toml
     return _UvLayer(settings, config, table, shown if table == "uv.toml" else f"{shown} [tool.uv]")
 
 
