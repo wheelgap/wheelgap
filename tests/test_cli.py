@@ -6810,3 +6810,41 @@ def test_pyproject_non_table_tool_exits_with_source_error(capsys, tmp_path, fake
     assert "[tool] must be a table" in payload["message"]
     assert payload["type"] == "SourceError"
     assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("metadata_toml", "expected"),
+    [
+        ("[package.metadata]\nprovides-extras = [1]\n", "provides-extras must be a list of strings"),
+        ("metadata = []\n", "metadata must be a table"),
+        ('[package.metadata]\nprovides-extras = "abc"\n', "provides-extras must be a list of strings"),
+        ("[package.metadata]\nrequires-dev = []\n", "requires-dev must be a table"),
+    ],
+)
+def test_uv_lock_wrong_type_package_metadata_exits_2_with_json_error(
+    capsys, tmp_path, fake_pypi, metadata_toml, expected
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "proj"\nversion = "0.1.0"\n', encoding="utf-8")
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        'version = 1\nrequires-python = ">=3.13"\n\n'
+        '[[package]]\nname = "purewheel"\nversion = "3.1"\nsource = { registry = "https://pypi.org/simple" }\n\n'
+        '[[package]]\nname = "proj"\nversion = "0.1.0"\nsource = { virtual = "." }\n'
+        'dependencies = [{ name = "purewheel" }]\n' + metadata_toml,
+        encoding="utf-8",
+    )
+
+    # Online, plain and with a selection: the lock is refused before anything is looked up.
+    for extra in ([], ["--all-extras"], ["--group", "dev"]):
+        code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", *extra)
+        assert code == 2 and not out
+        assert f"uv.lock: package proj: {expected}" in err
+        assert "AttributeError" not in err
+        assert fake_pypi == []
+
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--json")
+    assert code == 2
+    payload = json.loads(out)["error"]
+    assert payload["type"] == "SourceError"
+    assert expected in payload["message"]
+    assert fake_pypi == []
