@@ -1092,3 +1092,123 @@ def test_diff_refuses_a_non_table_tool_wheelgap_beside_the_old_side(capsys, tmp_
         f"wheelgap: error: the pyproject.toml beside {old}: [tool.wheelgap] must be a table\n"
     )
     assert fake_pypi == []
+
+
+MIRROR = "https://mirrors.example/pypi/simple"
+
+
+def moved_lock(registry, requires=">=3.14", wheel="fastlib-2.0.0-cp314-cp314-manylinux_2_17_x86_64.whl"):
+    """A uv.lock shaped like jumpserver/jumpserver#17168's (#807): locked for Python 3.14 and newer, so it keeps only
+    the wheels that range can use, with its one package from `registry`."""
+    return (
+        f'version = 1\nrevision = 3\nrequires-python = "{requires}"\n\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\nsource = { editable = "." }\n'
+        'dependencies = [\n    { name = "fastlib" },\n]\n\n'
+        f'[[package]]\nname = "fastlib"\nversion = "2.0.0"\nsource = {{ registry = "{registry}" }}\n'
+        'sdist = { url = "https://files.example/fastlib-2.0.0.tar.gz", hash = "sha256:00", size = 1 }\n'
+        f'wheels = [\n    {{ url = "https://files.example/{wheel}", hash = "sha256:01", size = 1 }},\n]\n'
+    )
+
+
+def write_locks(tmp_path, old, new):
+    for side, text in (("old", old), ("new", new)):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / "uv.lock").write_text(text, encoding="utf-8")
+    return str(tmp_path / "old"), str(tmp_path / "new")
+
+
+def test_diff_skips_a_python_the_lock_leaves_out_after_a_move_to_a_mirror(fake_pypi, tmp_path, capsys):
+    # On 3.13 the PyPI side is looked up again and finds fastlib's cp313 wheel, while the mirror side can't be, so it
+    # keeps the lock's cp314 wheel only and would look like a lost wheel. Neither lock is made for 3.13: not compared.
+    old, new = write_locks(tmp_path, moved_lock("https://pypi.org/simple"), moved_lock(MIRROR))
+    assert main([old, new, "-p", "3.13", "-p", "3.14", "-t", "linux-x86_64"]) == 0
+    out, err = capsys.readouterr()
+    assert out.splitlines() == ["Nothing got worse on the compared targets."]
+    assert "this change drops" not in err
+    assert (
+        "wheelgap: note: didn't compare 3.13 linux-x86_64: both lockfiles are locked for Python >=3.14, which leaves "
+        "out Python 3.13. A lock isn't made for a Python outside its requires-python"
+    ) in err
+    assert main([old, new, "-p", "3.13", "-p", "3.14", "-t", "linux-x86_64", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"] == [] and data["new"] == [] and data["summary"] == {"worse": 0, "new": 0}
+    assert data["not_compared"] == [
+        {
+            "target": "3.13 linux-x86_64",
+            "sides": ["old", "new"],
+            "python": "3.13",
+            "reason": "both lockfiles are locked for Python >=3.14, which leaves out Python 3.13",
+        }
+    ]
+    assert [t["label"] for t in data["targets"]] == ["3.13 linux-x86_64", "3.14 linux-x86_64"]
+
+
+def test_diff_still_compares_the_pythons_both_locks_are_made_for(fake_pypi, tmp_path, capsys):
+    old = moved_lock("https://pypi.org/simple")
+    new = moved_lock(MIRROR, wheel="fastlib-2.0.0-cp315-cp315-manylinux_2_17_x86_64.whl")
+    old, new = write_locks(tmp_path, old, new)
+    assert main([old, new, "-p", "3.13", "-p", "3.14", "-t", "linux-x86_64", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["worse"] == [
+        {
+            "name": "fastlib",
+            "old_versions": ["2.0.0"],
+            "new_versions": ["2.0.0"],
+            "targets": {"3.14 linux-x86_64": {"old_status": "wheel", "new_status": "source"}},
+        }
+    ]
+    assert [e["target"] for e in data["not_compared"]] == ["3.13 linux-x86_64"]
+
+
+def test_diff_says_the_change_dropped_a_python_only_the_new_lock_leaves_out(fake_pypi, tmp_path, capsys):
+    # The bump stopped the lock serving 3.13 (uv sync there now fails): still a note, not exit 1, but said as the
+    # change's doing, apart from a Python both locks leave out (3.11), and the last line doesn't claim the whole run.
+    old = moved_lock("https://pypi.org/simple", ">=3.12", "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl")
+    old, new = write_locks(tmp_path, old, moved_lock(MIRROR))
+    argv = [old, new, "-p", "3.11", "-p", "3.13", "-p", "3.14", "-t", "linux-x86_64"]
+    assert main(argv) == 0
+    out, err = capsys.readouterr()
+    assert out.splitlines() == ["Nothing got worse on the compared targets."]
+    notes = [line for line in err.splitlines() if "compare" in line]
+    assert notes == [
+        "wheelgap: note: this change drops Python 3.13 support: the new lockfile no longer supports Python 3.13 "
+        "(old: >=3.12, new: >=3.14), so installing the new lock there now fails (uv sync refuses a lock on a Python "
+        "outside its requires-python). Not compared: 3.13 linux-x86_64; the drop doesn't count as worse",
+        "wheelgap: note: didn't compare 3.11 linux-x86_64: the old lockfile is locked for Python >=3.12 and the new "
+        "lockfile is locked for Python >=3.14, which leaves out Python 3.11. A lock isn't made for a Python outside "
+        "its requires-python (it may lack the wheels that Python needs, and packages from other indexes can't be "
+        "looked up again), so nothing there counts as worse",
+    ]
+    assert main([*argv, "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["not_compared"][1] == {
+        "target": "3.13 linux-x86_64",
+        "sides": ["new"],
+        "python": "3.13",
+        "reason": "the new lockfile no longer supports Python 3.13 (old: >=3.12, new: >=3.14)",
+    }
+    assert main([old, new, "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["Nothing was compared."]
+
+
+def test_diff_says_a_widened_range_hides_the_new_locks_gaps(fake_pypi, tmp_path, capsys):
+    new = moved_lock("https://pypi.org/simple", ">=3.12", "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl")
+    old = moved_lock("https://pypi.org/simple", ">=3.14", "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl")
+    old, new = write_locks(tmp_path, old, new)
+    assert main([old, new, "-p", "3.13", "-p", "3.14", "-t", "linux-x86_64", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert [(e["target"], e["sides"]) for e in json.loads(out)["not_compared"]] == [("3.13 linux-x86_64", ["old"])]
+    assert "this change drops" not in err
+    assert err.rstrip().endswith(
+        "where only the old lockfile leaves a Python out, the new one's gaps there aren't shown"
+    )
+
+
+def test_diff_names_each_sides_range_when_they_differ(fake_pypi, tmp_path, capsys):
+    old, new = write_locks(tmp_path, moved_lock("https://pypi.org/simple", ">=3.14"), moved_lock(MIRROR, ">=3.14.1"))
+    assert main([old, new, "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)["not_compared"]
+    assert entry["reason"] == (
+        "the old lockfile is locked for Python >=3.14 and the new lockfile is locked for Python >=3.14.1, "
+        "which leaves out Python 3.13"
+    )
