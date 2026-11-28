@@ -279,13 +279,21 @@ Poetry constraint that isn't a PEP 440 specifier (`^3.9`), restrict nothing. Wit
 the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** packages whose source type is `git`, `hg`, `svn`, `bzr`, `directory`, `file` or `url`. A package from
-another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. Old locks that record only
-hashes and no file names are looked up on the index; packages in them from another index are skipped as
-`private index`.
+another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. A package with no file names
+(old locks that record only hashes, or `files = []`, which Poetry writes when the source gave it no hashes) is looked
+up on the index, since Poetry then installs the best file the index has; such a package from another index is skipped
+as `private index`.
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
-next to the lock. `--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
+next to the lock. Without a `pyproject.toml` there that declares them (none, one that can't be read, or one with no
+dependencies at all), wheelgap can't tell a direct dependency that another package needs only under a marker
+(`colorama`, which `click` needs on Windows only) from one installed only under that marker, and Poetry installs a
+direct dependency everywhere. So a package that no dependency installs on a target, and that has no wheel there, is
+`unknown` on that target rather than `n/a`, unless another version of it is installed there. `--explain` and
+`unknown_reasons` in `--json` say why, and a note on stderr names the packages. It counts as any `unknown` does, and
+`--ignore` takes it; where a left-out package has a wheel anyway, the answer is the same either way and nothing changes.
+`--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
 lock doesn't say which Pythons a direct dependency is installed for (`numpy = [{version = "1.26.4", python = "<3.13"},
 ...]` is only in `pyproject.toml`), so the range would report a pin as `missing` on a Python Poetry never installs it
 on.
@@ -328,6 +336,19 @@ answer only for a Python outside the range the project was locked for. It isn't 
 on the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** `git`, `hg`, `svn`, `bzr`, `path`, `url` and `file` packages.
+
+**Lock targets:** a lock made with `pdm lock --platform`, `--python` or `--implementation` records them as
+`[[metadata.targets]]` (a plain `pdm lock` records the project's `requires-python` there), keeps only the packages and
+wheels those targets need, and `pdm install` fails anywhere else ("No compatible lock target found"). wheelgap
+follows PDM as it does [`[tool.uv] environments`](#uvlock): a target you asked for outside them is an error (exit code
+2) naming the targets the lock doesn't cover and the ones it does, and the built-in default platforms are narrowed to
+the ones it covers, with a note. A target is inside when one lock target takes it, as PDM 2.29 decides: its
+`requires_python` takes the target's Python, its `implementation` (if any) is CPython with the target's
+`gil_disabled`, and its `platform` (if any) has the target's operating system (manylinux, musllinux, macOS or
+Windows) and architecture. The glibc, musl or macOS version doesn't count, since PDM installs a `manylinux_2_40` lock
+on glibc 2.36 too, with a warning. A `requires_python` that holds for some patch releases only (`>=3.13.2` for
+`-p 3.13`), and a platform or key PDM doesn't know, can't be decided: wheelgap says so and stops, also with exit code 2.
+To check a target the lock doesn't cover, add it with `pdm lock --append --platform ... --python ...`. The error names each target with its Python, since the Python can be the cause, and when no `-p`, `python` setting or `.python-version` picked it (so it's the one wheelgap runs on), it says so and names a Python the lock covers.
 
 **Dependency groups:** the same selectors work with PDM's meanings, and configured `groups` apply too. Every group the
 lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups locked with

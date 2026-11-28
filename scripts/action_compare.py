@@ -59,6 +59,7 @@ FIX_REASONS = {
     "loses_wheel": "every newer release with a wheel drops one it has elsewhere",
     "uv_may_fork": "every newer release with a wheel drops one it has on another Python",
     "no_binary": "--no-binary, so pip uses no wheel for it",
+    "held_back": "another package's requirement on it rules out the newer release with a wheel",
 }
 RESOLVE_NOTE = "wheelgap doesn't resolve dependencies: the rest of them must allow these releases."
 GAP_WHEEL_NOTE = (
@@ -124,6 +125,8 @@ def fix_cell(fix: object) -> str:
     kind = fix.get("kind")
     if kind == "upgrade":
         text = f"upgrade to {code(fix.get('version'))}"
+        if fix.get("prerelease") is True:
+            text += " (a pre-release)"
         c = fix.get("constraint")
         if isinstance(c, dict) and c.get("allows") is False and isinstance(c.get("requirements"), list):
             reqs = ", ".join(code(r) for r in c["requirements"])

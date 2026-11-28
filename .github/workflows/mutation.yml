@@ -1,0 +1,101 @@
+name: Mutation
+
+# Weekly, overnight: mutation testing of the modules whose answers matter most. mutmut makes small changes to the
+# code (flips a comparison, shifts a boundary, changes a constant) and runs the tests that cover that module. A
+# change the tests still pass with ("survived") is a line no test pins down, so a wrong answer there could ship
+# unnoticed. The run's summary lists the survivors with their diffs: each is a missing test, or code that can go.
+#
+# mutmut 2 on purpose: it runs pytest in a fresh process for every mutant. mutmut 3 runs the suite twice in one
+# process, and some of our tests don't pass the second time, so its results couldn't be trusted here.
+#
+# It reports and never fails on survivors: the job fails only when mutmut itself can't run. Read-only and no
+# secrets: it only reads the repo and installs its dev dependencies.
+
+on:
+  schedule:
+    - cron: "17 1 * * 6" # Saturdays, 01:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+jobs:
+  mutate:
+    name: mutate (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: targets
+            tests: >-
+              tests/test_targets.py tests/test_check.py tests/test_suggest.py tests/test_suggest_targets.py
+              tests/test_uv_selection.py tests/test_explain.py tests/test_fix.py tests/test_sources.py
+          - module: check
+            tests: >-
+              tests/test_check.py tests/test_sources.py tests/test_explain.py tests/test_fix.py tests/test_uv_selection.py
+              tests/test_real_lockfiles.py tests/test_cutoff.py tests/test_fail_on.py tests/test_diff.py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - name: Run mutmut on src/wheelgap/${{ matrix.module }}.py
+        # --CI makes mutmut exit 0 unless the run itself failed (its findings are in the summary, not the exit code);
+        # anything else non-zero, from mutmut or from uv, fails the job.
+        env:
+          MODULE: ${{ matrix.module }}
+          TESTS: ${{ matrix.tests }}
+        run: |
+          rc=0
+          uv run --python 3.12 --group dev --with mutmut==2.5.1 mutmut run --no-progress --CI \
+            --paths-to-mutate "src/wheelgap/${MODULE}.py" \
+            --runner "python -m pytest -x -q -p no:cacheprovider ${TESTS}" || rc=$?
+          echo "mutmut exited with $rc"
+          [ "$rc" -eq 0 ]
+      - name: Summarise
+        if: always()
+        env:
+          MODULE: ${{ matrix.module }}
+        run: |
+          [ -f .mutmut-cache ] || exit 0
+          python3 - <<'EOF' > survivors.txt
+          import sqlite3
+          c = sqlite3.connect(".mutmut-cache")
+          for (i,) in c.execute("select id from Mutant where status = 'bad_survived' order by id"):
+              print(i)
+          EOF
+          {
+            echo "### Mutation testing: src/wheelgap/${MODULE}.py"
+            echo
+            echo '| result | mutants |'
+            echo '|---|---|'
+            python3 -c "
+          import sqlite3
+          for status, n in sqlite3.connect('.mutmut-cache').execute('select status, count(*) from Mutant group by status'):
+              print(f'| {status} | {n} |')"
+            echo
+            echo "Survivors are changes no test caught. The first 40, with their diffs:"
+            echo
+            echo '````text'
+            head -n 40 survivors.txt | while read -r id; do
+              echo "# mutant $id"
+              uv run -q --python 3.12 --group dev --with mutmut==2.5.1 mutmut show "$id" 2>/dev/null | grep -E '^[-+][^-+]' || true
+              echo
+            done
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-${{ matrix.module }}
+          path: |
+            .mutmut-cache
+            survivors.txt
+          if-no-files-found: warn

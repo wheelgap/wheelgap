@@ -760,7 +760,9 @@ opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#p
 
 With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
 (`fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64`) that keeps the wheels the package has on its other
-targets, or each target's nearest when no one release has them all. It looks each package with a gap up on pypi.org
+targets, or each target's nearest when no one release has them all. For a pre-release pin, final releases come
+first: one final release for every target, else one pre-release for every target, else a final release where one fits and a pre-release for the rest; a pre-release is labelled `(a pre-release)`. It
+looks each package with a gap up on pypi.org
 once, only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin), and never changes a status, the
 summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the
 flag. With `--markdown`, it renders suggestions as a Markdown list under the explanation. With `--json`, adds `suggest` to each package with a gap. See
@@ -796,7 +798,8 @@ Following the usual output, say how to fix each gap cell (a package on a target,
 
 1. **Upgrade** to an official release: the nearest newer release with a wheel for that target, as
    [`--suggest`](#suggest) names it (not yanked, `Requires-Python` admitting the target's Python, no pre-release unless
-   the pin is one, and keeping a wheel on every target the package has one on now), with what to run or change for the
+   the pin is one, and then only when no one final release fits every target, in which case the line says it's a
+   pre-release, and keeping a wheel on every target the package has one on now), with what to run or change for the
    input: `uv lock --upgrade-package NAME` for a uv.lock (`uv lock --script SCRIPT --upgrade-package NAME` for a
    script's lock; a bare name, since uv applies `NAME==VERSION` to every Python the lock covers, then check it reached
    VERSION), the new pins for a requirements file, in the file whose line pins the package (a `-r` include's own file;
@@ -804,17 +807,26 @@ Following the usual output, say how to fix each gap cell (a package on a target,
    NAME==VERSION` to regenerate it), `poetry update NAME` or
    `pdm update NAME` for those locks (they stay within `pyproject.toml`'s constraints, so check the release they pick),
    and "upgrade NAME to VERSION" for the other lockfiles. Where wheelgap reads your own requirement for the package (a
-   uv.lock project's dependencies, dependency groups and `[manifest]` constraints, or a ranged requirement in a
+   uv.lock project's dependencies, dependency groups and `[manifest]` constraints whose markers hold on the target,
+   with any `extra == ...` counted as holding since uv locks every extra, or a ranged requirement in a
    requirements file, `pyproject.toml`, script or the command line, as written, or a requirements file's `-c`
    constraints), it says whether the release is within it or the requirement needs relaxing; otherwise it says
-   nothing. A package whose targets need different releases (no one release has wheels for all of them) gets no pin:
+   nothing. With uv's `exclude-newer` (a uv.lock's `[options]`, or a `pyproject.toml`'s or script's own setting), only
+   files uploaded before the cutoff count, as uv sees them; when only a release uploaded after it has the wheel, the
+   line says `needs uv's exclude-newer moved past DATE` (when that release's last file was uploaded), or for a
+   duration `needs uv's exclude-newer duration (P850D) shortened, or set to a time past DATE`, and the what-to-run
+   lines start with that. A cutoff uv recorded in a uv.lock that wheelgap can't read means the package isn't looked
+   up, and a line says so. A package whose targets need different releases (no one release has wheels for all of them) gets no pin:
    a line names each target's release instead. wheelgap doesn't resolve, so the rest of the dependencies must allow
    the release.
 2. **Gap wheel**: when no newer release has the wheel, an unofficial wheel of the pinned version from wheelgap's gap
    wheel index, as below. When both exist, the upgrade comes first and the gap wheel is listed as the fallback
    ("if you can't upgrade NAME"); the gap wheel section opens with "As a fallback" when `--fix` names an upgrade.
 3. **No fix yet**, with the reason (no newer release has a wheel; every one that has drops a wheel elsewhere, naming
-   what the nearest one drops; or `--no-binary`), the package's issue tracker where no newer release has a wheel, and,
+   what the nearest one drops; `--no-binary`; or, with `--deps`, a package whose newer release with the wheel another
+   package in the resolved tree rules out, naming that package and its requirement to upgrade or relax instead; a
+   dependency that only a `-c` constraint or `exclude-newer` holds back gets the upgrade, with that to change, and
+   no line of its own to edit), the package's issue tracker where no newer release has a wheel, and,
    on a free-threaded target whose release has only abi3 wheels, a line saying so. For a uv.lock, when what the newer
    releases drop is only an older Python's wheel because their `Requires-Python` leaves that Python out, uv may lock a
    release per Python: such a gap goes under "Maybe, with uv:", with `uv lock --upgrade-package NAME` to try (and the

@@ -23,12 +23,15 @@ WIN_AMD = "cp314-cp314-win_amd64.whl"
 WIN_ARM = "cp314-cp314-win_arm64.whl"
 
 
-def release(requires=(), files=(ANY,), requires_python=None, yanked=False, sdist=True, json_requires="same"):
+def release(
+    requires=(), files=(ANY,), requires_python=None, yanked=False, sdist=True, json_requires="same", uploaded=None
+):
     """`requires` is what the wheels' metadata files declare; `json_requires`, what PyPI's JSON page says (by
     default the same), which comes from whichever file was uploaded first."""
     requires = list(requires) if requires is not None else None
     return {"requires": requires, "files": list(files), "requires_python": requires_python, "yanked": yanked,
-            "sdist": sdist, "json_requires": requires if json_requires == "same" else json_requires}  # fmt: skip
+            "sdist": sdist, "json_requires": requires if json_requires == "same" else json_requires,
+            "uploaded": uploaded}  # fmt: skip
 
 
 # name -> version -> release. "app" needs lib[crypto]; lib's crypto extra needs crypt, which has no Windows ARM
@@ -76,6 +79,14 @@ INDEX = {
     # dropped's newest release has no Windows ARM wheel; the one before had one (#403).
     "tool": {"1.0": release(["dropped"])},
     "dropped": {"1.0": release(files=(WIN_ARM, LINUX)), "2.0": release(files=(LINUX,))},
+    # holder needs held<2, the last held with no Windows ARM wheel; 2.0 has one (#821).
+    "holder": {"1.0": release(["held<2"])},
+    "held": {
+        "1.0": release(files=(), uploaded="2024-01-01T00:00:00Z"),
+        "1.5": release(files=(), uploaded="2024-02-01T00:00:00Z"),
+        "2.0": release(files=(WIN_ARM,), uploaded="2024-09-01T00:00:00Z"),
+    },
+    "freeparent": {"1.0": release(["held"], uploaded="2024-01-01T00:00:00Z")},  # needs held, any release
 }
 DIFFERING = {
     "differ-1.0-" + WIN_AMD: ["c", "pywin"],
@@ -90,7 +101,8 @@ def index(monkeypatch):
     def entries(name, version, r):
         filenames = [f"{name}-{version}-{tag}" for tag in r["files"]] + [f"{name}-{version}.tar.gz"] * r["sdist"]
         return [{"filename": f, "url": f"https://files.example/{f}", "requires_python": r["requires_python"],
-                 "yanked": r["yanked"]} for f in filenames]  # fmt: skip
+                 "yanked": r["yanked"]} | ({"upload_time_iso_8601": r["uploaded"]} if r["uploaded"] else {})
+                for f in filenames]  # fmt: skip
 
     def fetch_text(url, max_bytes, timeout=20.0, attempts=4):
         calls.append(url)
@@ -1174,3 +1186,93 @@ def test_project_deps_cutoff_applies_to_an_exact_pin(index, tmp_path, capsys):
     assert list(packages) == ["app"]
     assert packages["app"]["version"] is None
     assert "no valid upload_time_iso_8601" in packages["app"]["error"]
+
+
+FIX = ["--deps", "--fix", "-p", "3.14", "-t", "win-arm64", "--no-cache", "--color", "never"]
+
+
+@pytest.mark.parametrize(
+    "line,said,how",
+    [
+        (
+            "held<2",
+            " (needs requirements.txt's held<2 relaxed)",
+            "In requirements.txt, change the requirements to held==2.0.",
+        ),
+        ("held==1.0", "", "In requirements.txt, change the pins to held==2.0."),
+    ],
+)
+def test_fix_names_a_direct_requirements_own_file_and_range(index, capsys, tmp_path, line, said, how):
+    # #821: every package --deps resolves was "--deps", so --fix said "In --deps, change the pins" and lost the range.
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text(line + "\n", encoding="utf-8")
+    assert main([str(reqs), *FIX]) == 1
+    out = capsys.readouterr().out
+    assert f"  held {'1.5' if '<' in line else '1.0'} -> 2.0: win-arm64{said}\n{how}\n" in out
+    assert "--deps," not in out
+
+
+def test_fix_names_the_parent_for_a_dependency_instead_of_a_pin(index, capsys):
+    # holder's held<2 rules 2.0 out, so "use held==2.0" can't install: name holder instead (#821).
+    assert main(["holder==1.0", *FIX]) == 1
+    out = capsys.readouterr().out
+    assert "Use held==2.0" not in out and "Upgrade:" not in out
+    assert (
+        "No fix yet:\n  held 1.5: another package's requirement on it rules out the newer release with a wheel for "
+        "win-arm64 (its 2.0 has the wheel, but holder requires held<2: upgrade or relax holder first)\n"
+    ) in out
+    assert main(["holder==1.0", *FIX, "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    held = next(p for p in data["packages"] if p["name"] == "held")
+    assert held["fix"] == {"win-arm64": {"kind": "none", "reason": "held_back", "abi3_only": False}}
+    assert data["fix_summary"]["none"] == 1 and data["fix_summary"]["upgrade"] == 0
+
+
+def test_fix_names_only_the_parents_whose_requirement_rules_the_upgrade_out(index, capsys):
+    assert main(["holder==1.0", "freeparent==1.0", *FIX]) == 1
+    out = capsys.readouterr().out
+    assert "(its 2.0 has the wheel, but holder requires held<2: upgrade or relax holder first)\n" in out
+    assert "freeparent requires" not in out
+
+
+@pytest.mark.parametrize("held", ["held", "held<1.6"])
+def test_fix_holds_a_direct_requirement_back_when_another_package_caps_it(index, capsys, held):
+    # A direct held that holder also requires (held<2): "change the requirements to held==2.0" can't resolve.
+    assert main([held, "holder==1.0", *FIX]) == 1
+    out = capsys.readouterr().out
+    assert "held==2.0" not in out and "Upgrade:" not in out
+    assert "but holder requires held<2: upgrade or relax holder first)\n" in out
+
+
+def test_fix_names_a_constraint_that_holds_a_dependency_back_not_its_parent(index, capsys, tmp_path):
+    # freeparent allows any held; the -c constraint's held<2 holds it back, so upgrading freeparent wouldn't help.
+    (tmp_path / "constraints.txt").write_text("held<2\n", encoding="utf-8")
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text("freeparent==1.0\n-c constraints.txt\n", encoding="utf-8")
+    assert main([str(reqs), *FIX]) == 1
+    out = capsys.readouterr().out
+    assert (
+        "  held 1.5 -> 2.0: win-arm64 (needs held<2 in the -c constraints of requirements.txt relaxed; "
+        "a dependency of freeparent)\n"
+        "Relax held<2 in the -c constraints of requirements.txt so it allows held==2.0.\n"
+    ) in out
+    assert "upgrade or relax freeparent" not in out and "change the pins" not in out
+
+
+def test_fix_names_the_cutoff_that_holds_a_dependency_back_not_its_parent(index, capsys, tmp_path):
+    # held 2.0 was uploaded after exclude-newer: moving it is the fix, not upgrading freeparent.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["freeparent==1.0"]\n\n'
+        '[tool.uv]\nexclude-newer = "2024-08-01T00:00:00Z"\n',
+        encoding="utf-8",
+    )
+    assert main([str(tmp_path / "pyproject.toml"), *FIX]) == 1
+    out = capsys.readouterr().out
+    assert (
+        "  held 1.5 -> 2.0: win-arm64 (needs uv's exclude-newer moved past 2024-09-01T00:00:00Z; a dependency of "
+        "freeparent)\n"
+        "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-09-01T00:00:00Z: held==2.0 was uploaded after "
+        "its cutoff, so uv can't pick it before that.\n"
+        "wheelgap doesn't resolve"
+    ) in out
+    assert "upgrade or relax" not in out and "change the requirements" not in out
