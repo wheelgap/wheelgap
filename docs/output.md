@@ -227,6 +227,22 @@ rpds-py 0.27.0 on musl-armv7l: ● source
   `flit_core.buildapi` (from `flit-core` or `flit`), `flit.buildapi` (from `flit`), or `poetry.core.masonry.api`
   (from `poetry-core`, without a `build` script). Without a `build-backend`, pip uses setuptools, which can compile
   anything; an in-tree backend (`backend-path`) is named as such.
+- With `--fix`, a gap with no fix on a Linux target that builds from source also says which distro packages provide
+  those needs (only a Rust toolchain, CMake and a C/C++ compiler are mapped; `--explain` isn't needed for this):
+
+  ```text
+  No fix yet:
+    numpy 1.26.4: no newer release has a wheel for musl-armv7l; ask for a wheel: https://github.com/numpy/numpy/issues
+      to build it from source on musl-armv7l, it needs at least a C/C++ compiler: apk add build-base on Alpine (and python3-dev with the distro's own Python)
+  ```
+
+  `musl-*` targets get Alpine's `apk add` (`build-base`, `cmake`, `cargo`) and `linux-*` targets Debian's and
+  Ubuntu's `apt-get install` (`build-essential`, `cmake`, `cargo`). The `python:*` images already have the Python
+  headers; the distro's own Python needs `python3-dev` for a C/C++ build. A distro's Rust can be older than a crate
+  needs, so a Rust build also names [rustup](https://rustup.rs). It's "at least": a library the build links to (BLAS,
+  OpenSSL, libffi) isn't in `[build-system]` and isn't named, and the distro's own build of the package (`apk add
+  py3-numpy`) isn't suggested, since it installs for the distro's Python only. `--json --fix` gives the same as
+  `build_packages` in the cell's [`fix`](#fix).
 - With `--json --explain --build-info`, each package gets `build_requires`: the same requirements, normalized
   (`["maturin<2.0,>=1.9"]`), or `null` when there's no source build or no answer. When build info is off for the
   whole run (see below), the key is left out.
@@ -493,8 +509,9 @@ values have `kind` and that kind's keys:
   `gap_wheel` (the fallback:
   `null`, or `wheel`, `url`, `sha256` and `unofficial: true`);
 - `"gap_wheel"`: `wheel`, `url`, `sha256` and `unofficial: true`;
-- `"none"`: `reason` (`no_newer_release`, `loses_wheel`, `uv_may_fork`, `not_looked_up` or `no_binary`) and
-  `abi3_only`.
+- `"none"`: `reason` (`no_newer_release`, `loses_wheel`, `uv_may_fork`, `not_looked_up` or `no_binary`),
+  `abi3_only` and `build_packages` (`null`, or with [`--build-info`](#build-info) the distro packages to build it
+  from source: `distro`, `command`, `packages`, `needs` and `distro_python`).
 
 The top-level `fix_summary` counts them: `{"gaps": 6, "upgrade": 4, "gap_wheel": 2, "none": 0, "not_looked_up": 0,
 "uv_may_fork": 0}`, where `none` counts only the gaps with no known fix and `gaps` is the sum of the other five. `gap_wheels` still

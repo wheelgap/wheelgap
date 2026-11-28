@@ -5,7 +5,9 @@ preference:
    release with a live, compatible wheel whose Requires-Python admits the target's Python, no pre-release unless the
    pin is one, and that keeps a wheel on every target the package has one on now);
 2. an unofficial gap wheel of the pinned version from wheelgap's gap wheel index (gapwheels.fillable), the fallback;
-3. none, with the reason, and the package's issue tracker where wheelgap has it.
+3. none, with the reason, and the package's issue tracker where wheelgap has it; with --build-info, for a `source`
+   cell on a Linux target, also the distro packages its sdist's build requirements prove the build needs
+   (build.system_packages).
 
 The releases come from the same lookups as --suggest (cli.release_lookups), so only names origin.known_pypi accepts
 are looked up. Like the rest of --fix, nothing here changes a status, the summary or the exit code.
@@ -14,7 +16,7 @@ are looked up. Like the rest of --fix, nothing here changes a status, the summar
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -22,6 +24,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from . import gapwheels
+from .build import RUST, BuildInfo, SystemPackages, system_packages
 from .check import ABI3_ON_FREETHREADED, Row, Status, rejection
 from .sources import Source
 from .suggest import Suggestion
@@ -58,6 +61,8 @@ class Cell:
     drops: tuple[str, tuple[Target, ...]] | None = None
     # LOSES: the project's own requirement that leaves that release out, where it would otherwise be UV_MAY_FORK
     blocked: Constraint | None = None
+    # NONE with a NO_FIX reason, --build-info: what to install to build it from source on the target's distro
+    build: SystemPackages | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,18 @@ def plan(
                 reason = NO_NEWER
             cells.append(Cell(r, t, source, NONE, reason=reason, abi3_only=abi3_only(r, t)))
     return cells
+
+
+def with_build(cells: list[Cell], build_info: dict[int, BuildInfo]) -> list[Cell]:
+    """The cells, with `build` set on each one with no fix (a NO_FIX reason) whose target builds the release from
+    source, where `build_info` (--build-info's answers, by id() of the package) proves what the build needs."""
+    out = []
+    for c in cells:
+        info = build_info.get(id(c.row.package))
+        if c.kind == NONE and c.reason in NO_FIX and info is not None and c.row.results[c.target] == Status.SOURCE:
+            c = replace(c, build=system_packages(info, c.target))
+        out.append(c)
+    return out
 
 
 def _uv_specifiers(source: Source, key: str) -> list[str] | None:
@@ -402,6 +419,30 @@ def _none_line(name: str, pinned: str, cs: list[Cell], multi_py: bool, ask: str 
     return line + (f"; ask for a wheel: {ask}" if ask and any(c.reason == NO_NEWER for c in cs) else "")
 
 
+def build_text(packages: SystemPackages, labels: str, code: Callable[[str], str] = _plain) -> str:
+    """'to build it from source on musl-armv7l, it needs at least a C/C++ compiler: `apk add build-base` on Alpine
+    (and python3-dev with Alpine's own Python)'."""
+    text = (
+        f"to build it from source on {labels}, it needs at least {' and '.join(packages.needs)}: "
+        f"{code(packages.command)} on {packages.distro}"
+    )
+    extra = []
+    if packages.distro_python:
+        extra.append(f"and {' '.join(map(code, packages.distro_python))} with the distro's own Python")
+    if RUST in packages.needs:
+        extra.append("or rustup from https://rustup.rs where the distro's Rust is older than the package needs")
+    return text + (f" ({'; '.join(extra)})" if extra else "")
+
+
+def _build_lines(cs: list[Cell], multi_py: bool, code: Callable[[str], str]) -> list[str]:
+    """One line per set of distro packages among these cells (one package's), for the targets it's for."""
+    by: dict[SystemPackages, list[Cell]] = {}
+    for c in cs:
+        if c.build is not None:
+            by.setdefault(c.build, []).append(c)
+    return [build_text(packages, _labels(each, multi_py), code) for packages, each in by.items()]
+
+
 def _lines(
     cells: list[Cell],
     multi_py: bool,
@@ -442,8 +483,12 @@ def _lines(
     # Not looked up: the why lines below say so, as they're not known to have no fix; nor are uv's maybe-forks.
     none, forks = (
         [
-            item + _none_line(name, pinned, cs, multi_py, issues_urls.get(id(cs[0].row.package)), code)
+            line
             for (name, pinned, _), cs in _by_package([c for c in cells if c.kind == NONE and c.reason in which]).items()
+            for line in [
+                item + _none_line(name, pinned, cs, multi_py, issues_urls.get(id(cs[0].row.package)), code),
+                *(f"{' ' * len(item)}  {b}" for b in _build_lines(cs, multi_py, code)),
+            ]
         ]
         for which in (NO_FIX, (UV_MAY_FORK,))
     )
@@ -533,4 +578,20 @@ def to_json(cell: Cell) -> dict[str, object]:
         }
     if cell.kind == GAP_WHEEL and cell.fill is not None:
         return {"kind": GAP_WHEEL, **_gap_wheel_json(cell.fill)}
-    return {"kind": NONE, "reason": cell.reason, "abi3_only": cell.abi3_only}
+    return {
+        "kind": NONE,
+        "reason": cell.reason,
+        "abi3_only": cell.abi3_only,
+        "build_packages": None if cell.build is None else build_json(cell.build),
+    }
+
+
+def build_json(packages: SystemPackages) -> dict[str, object]:
+    """--json --fix --build-info's (and the MCP's) `build_packages`."""
+    return {
+        "distro": packages.distro,
+        "command": packages.command,
+        "packages": list(packages.packages),
+        "needs": list(packages.needs),
+        "distro_python": list(packages.distro_python),
+    }

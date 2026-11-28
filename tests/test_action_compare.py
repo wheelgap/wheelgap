@@ -472,7 +472,12 @@ def test_diff_fix_is_exactly_what_fix_says_for_the_new_lockfile(fake_pypi, gap_w
     nativeext = data["new"][0]["targets"]
     assert {t: side["fix"] for t, side in nativeext.items()} == main["nativeext"]
     assert nativeext["linux-x86_64"]["fix"]["kind"] == "gap_wheel"
-    assert nativeext["musl-aarch64"]["fix"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": False}
+    assert nativeext["musl-aarch64"]["fix"] == {
+        "kind": "none",
+        "reason": "no_newer_release",
+        "abi3_only": False,
+        "build_packages": None,
+    }
     assert data["fix_summary"] == {
         "gaps": 3,
         "upgrade": 1,

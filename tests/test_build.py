@@ -1273,3 +1273,108 @@ def test_says_when_build_info_is_off(capsys, tmp_path, fake_files, monkeypatch, 
     if not args:  # --offline turns it off without a word (it can't take --index-url's lookups anyway)
         _, _, err = run(capsys, lock, *TARGETS, "--explain", "--build-info", "--offline")
         assert "--build-info" not in err
+
+
+# --fix --build-info (#740): for a gap with no fix on a Linux target, the distro packages to build it from source.
+MUSL = build_targets(["3.13"], ["musl-armv7l"])
+
+
+@pytest.mark.parametrize(
+    ("requires", "backend", "targets", "command", "distro_python"),
+    [
+        (["maturin>=1,<2"], None, LINUX, "apt-get install cargo", ()),  # PyO3 needs no Python.h
+        (["maturin>=1,<2"], None, MUSL, "apk add cargo", ()),
+        (["meson-python", "cython"], None, MUSL, "apk add build-base", ("python3-dev",)),
+        (["scikit-build-core"], None, LINUX, "apt-get install cmake build-essential", ("python3-dev",)),
+        (["setuptools-rust", "cython"], None, MUSL, "apk add cargo build-base", ("python3-dev",)),
+        (["maturin", "cmake"], None, LINUX, "apt-get install cargo cmake build-essential", ("python3-dev",)),
+    ],
+)
+def test_system_packages(requires, backend, targets, command, distro_python):
+    (target,) = targets
+    found = build.system_packages(info(requires, backend), target)
+    assert found is not None
+    assert (found.command, found.distro_python) == (command, distro_python)
+    assert found.command == ("apk add " if target.platform.startswith("musl-") else "apt-get install ") + " ".join(
+        found.packages
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "backend", "targets"),
+    [
+        (["maturin"], None, WINDOWS),  # not a Linux target
+        (["maturin"], None, build_targets(["3.13"], ["macos-arm64"])),
+        (["setuptools", "wheel"], None, LINUX),  # setuptools may compile or not: nothing is proven
+        (["flit-core"], "flit_core.buildapi", LINUX),  # a pure backend
+        (["maturin; sys_platform == 'win32'", "setuptools"], None, LINUX),  # the marker leaves Linux out
+    ],
+)
+def test_no_system_packages(requires, backend, targets):
+    (target,) = targets
+    assert build.system_packages(info(requires, backend), target) is None
+
+
+FIX_TARGETS = ("-p", "3.13", "-t", "linux-x86_64,musl-x86_64,win-amd64", "--color", "never", "--fix")
+CARGO = "it needs at least a Rust toolchain: "
+
+
+def test_fix_names_the_distro_packages(capsys, tmp_path, fake_pypi, fake_files):
+    fake_files.files["nowheels-0.9.tar.gz"] = nowheels_sdist(tmp_path)
+    lock = uv_lock(tmp_path)
+    _, out, _ = run(capsys, lock, *FIX_TARGETS)
+    assert "No fix yet:" in out and "to build it" not in out and fake_files.calls == []  # only with --build-info
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info")
+    lines = out.splitlines()
+    head = next(i for i, line in enumerate(lines) if line.startswith("  nowheels 0.9: no newer release has a wheel"))
+    assert lines[head + 1 : head + 3] == [
+        f"    to build it from source on linux-x86_64, {CARGO}apt-get install cargo on Debian or Ubuntu (or rustup "
+        "from https://rustup.rs where the distro's Rust is older than the package needs)",
+        f"    to build it from source on musl-x86_64, {CARGO}apk add cargo on Alpine (or rustup from "
+        "https://rustup.rs where the distro's Rust is older than the package needs)",
+    ]
+    assert "win-amd64, it needs" not in out  # no distro to name on Windows
+    assert "build needs" not in out  # --explain's line still needs --explain
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info", "--json")
+    fixes = json.loads(out)["packages"][0]["fix"]
+    assert fixes["linux-x86_64"]["build_packages"] == {
+        "distro": "Debian or Ubuntu",
+        "command": "apt-get install cargo",
+        "packages": ["cargo"],
+        "needs": ["a Rust toolchain"],
+        "distro_python": [],
+    }
+    assert fixes["musl-x86_64"]["build_packages"]["command"] == "apk add cargo"
+    assert fixes["win-amd64"]["build_packages"] is None
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--json")
+    assert json.loads(out)["packages"][0]["fix"]["linux-x86_64"]["build_packages"] is None
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info", "--markdown")
+    assert f"to build it from source on linux-x86_64, {CARGO}`apt-get install cargo` on Debian or Ubuntu" in out
+
+
+def test_fix_build_packages_with_a_compiler(capsys, tmp_path, fake_pypi, fake_files):
+    pyproject = b'[build-system]\nrequires = ["setuptools", "cython>=3"]\nbuild-backend = "setuptools.build_meta"\n'
+    fake_files.files["nowheels-0.9.tar.gz"] = nowheels_sdist(tmp_path, pyproject)
+    _, out, _ = run(capsys, uv_lock(tmp_path), *FIX_TARGETS, "--build-info")
+    assert (
+        "    to build it from source on musl-x86_64, it needs at least a C/C++ compiler: apk add build-base on Alpine "
+        "(and python3-dev with the distro's own Python)"
+    ) in out
+
+
+def test_fix_build_packages_only_where_nothing_else_fixes_it(capsys, tmp_path, fake_pypi, fake_files):
+    # laggard 1.0 builds from source everywhere; 1.2 has a musl-x86_64 wheel, so an upgrade fixes that target and
+    # only linux-x86_64 gets a distro line.
+    fake_files.files["laggard-1.0.tar.gz"] = sdist(
+        tmp_path, member("laggard-1.0/pyproject.toml", MATURIN), name="laggard-1.0.tar.gz"
+    )
+    args = ("laggard==1.0", "-p", "3.13", "-t", "musl-x86_64,linux-x86_64", "--fix", "--build-info")
+    _, out, _ = run(capsys, *args)
+    assert f"to build it from source on linux-x86_64, {CARGO}apt-get install cargo" in out
+    assert "on musl-x86_64, it needs" not in out
+    _, out, _ = run(capsys, *args, "--json")
+    fixes = json.loads(out)["packages"][0]["fix"]
+    assert fixes["musl-x86_64"]["kind"] == "upgrade" and "build_packages" not in fixes["musl-x86_64"]

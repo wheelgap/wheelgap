@@ -2860,10 +2860,13 @@ def _assert_matches_output_schema(data):
             keys = {
                 "upgrade": {"version", "how", "constraint", "gap_wheel"},
                 "gap_wheel": {"wheel", "url", "sha256", "unofficial"},
-                "none": {"reason", "abi3_only"},
+                "none": {"reason", "abi3_only", "build_packages"},
             }
             for entry in pkg["fix"].values():
                 assert set(entry) == {"kind"} | keys[entry["kind"]]
+                if (build := entry.get("build_packages")) is not None:  # --build-info, a Linux source cell
+                    assert set(build) == {"distro", "command", "packages", "needs", "distro_python"}
+                    assert pkg["results"][next(k for k, v in pkg["fix"].items() if v is entry)] == "source"
         if "gap_wheel" in pkg:
             assert set(pkg["gap_wheel"]) <= set(pkg.get("rejected", {}))
             for label, wheel in pkg["gap_wheel"].items():

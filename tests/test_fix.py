@@ -324,7 +324,12 @@ def test_json_key_only_with_fix(capsys, fake_pypi, gap_wheels):
                 "sha256": "cd" * 32,
                 "unofficial": True,
             },
-            "3.14 win-arm64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+            "3.14 win-arm64": {
+                "kind": "none",
+                "reason": "no_newer_release",
+                "abi3_only": False,
+                "build_packages": None,
+            },
         }
     ]
     for p in data["packages"]:
@@ -1346,7 +1351,7 @@ def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels
     }
     assert fixes["nowheels"] == {
         "win-arm64": {"kind": "gap_wheel", **fallback, "wheel": FT_WHEEL, "url": DOWNLOAD + FT_WHEEL},
-        "win-amd64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+        "win-amd64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False, "build_packages": None},
     }
     # The existing keys are unchanged: every filled cell is in gap_wheels, the fallback one too.
     assert [(w["name"], w["target"]) for w in data["gap_wheels"]] == [("fixme", "win-arm64"), ("nowheels", "win-arm64")]
@@ -1553,7 +1558,12 @@ def test_fix_says_when_only_abi3_wheels_block_free_threaded_python(capsys, fake_
         "free-threaded Python can't use: ask abi3only for a cp314t wheel at https://github.com/example/abi3only/issues\n"
     ) in out
     _, data, _ = gap_wheels_json(capsys, "abi3only==1.0", "-p", "3.14t", "-t", "win-arm64", "--fix")
-    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": True}
+    assert data["packages"][0]["fix"]["win-arm64"] == {
+        "kind": "none",
+        "reason": "no_newer_release",
+        "abi3_only": True,
+        "build_packages": None,
+    }
     _, out, _ = run(capsys, "nowheels==0.9", "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert "abi3" not in out  # only when that's the reason
 
@@ -1598,7 +1608,12 @@ def test_fix_counts_packages_not_looked_up_apart_in_json(capsys, fake_pypi, gap_
         "not_looked_up": 2,
         "uv_may_fork": 0,
     }
-    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "not_looked_up", "abi3_only": False}
+    assert data["packages"][0]["fix"]["win-arm64"] == {
+        "kind": "none",
+        "reason": "not_looked_up",
+        "abi3_only": False,
+        "build_packages": None,
+    }
 
 
 def pyfork_uv_lock():
