@@ -55,6 +55,22 @@ class SourceError(ValueError):
 PoetryExtras = tuple[frozenset[str], frozenset[str]]
 
 
+class MarkerGroup:
+    """A name required on several lines under different markers (sources._merge_requirements). pip takes one release
+    that every line whose marker holds allows, so which package a target installs depends on which lines hold there,
+    all together. `lines` are the requirements, one per marker (the lines under one marker merged), in pip's order;
+    `members` the packages checked for them: each answers for the sets of lines in its `marker_sets`, and the one with
+    the empty set for a target the others can't answer (check.group_answer decides per target). Compared by identity."""
+
+    def __init__(self, lines: list[Package]):
+        self.lines = lines
+        self.members: list[Package] = []
+
+    @property
+    def markers(self) -> list[list[str] | None]:
+        return [line.markers for line in self.lines]
+
+
 @dataclass
 class Package:
     name: str
@@ -121,6 +137,15 @@ class Package:
     project_urls: dict[str, str] | None = None
     home_page: str | None = None
     exclude_newer: datetime | None = field(default=None, repr=False, compare=False)
+    # Requirements files: the line's sha384 and sha512 `--hash` values (`sha512:<hex>`), which no index digest can be
+    # matched against. Beside sha256 ones, they make a target with no fitting listed file `unknown` (check.check).
+    other_hashes: frozenset[str] = frozenset()
+    # Two or more lines' ranges intersected into `spec` (numpy>=2 and numpy<2), so no matching release is a refusal.
+    merged_ranges: bool = False
+    # A name required under several markers: the group, and the sets of its lines this package is the answer for.
+    # The empty set marks the package for targets where a line's marker can't be decided (or a set no package has).
+    marker_group: MarkerGroup | None = None
+    marker_sets: frozenset[frozenset[int]] = frozenset()
 
     @property
     def key(self) -> str:
@@ -2051,8 +2076,8 @@ def _index_option_names(lines: Iterable[str]) -> list[str]:
 
 
 def _abbreviated_include(line: str) -> bool:
-    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
-    doesn't follow: the file it names may set an index."""
+    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which --dockerfile-inputs
+    refuses and the compiled-file hint passes over (_read_requirements follows them, through _line_include)."""
     for token in line.split():
         option = token.split("=", 1)[0]
         if (
@@ -2095,13 +2120,55 @@ def _takes_value(token: str) -> bool:
     return len(matches) == 1 and matches[0] in _VALUE_OPTIONS
 
 
+# The long options of pip's requirements-file parser (build_parser in pip/_internal/req/req_file.py at 26.3), which
+# optparse also reads by any unambiguous prefix: `--cons f` is `--constraint f`, while `--req` is refused as
+# ambiguous (--require-hashes, --requirement).
+_PIP_FILE_OPTIONS = (
+    "--all-releases",
+    "--config-settings",
+    "--constraint",
+    "--editable",
+    "--extra-index-url",
+    "--find-links",
+    "--hash",
+    "--index-url",
+    "--no-binary",
+    "--no-index",
+    "--no-require-hashes",
+    "--only-binary",
+    "--only-final",
+    "--pre",
+    "--prefer-binary",
+    "--pypi-url",
+    "--require-hashes",
+    "--requirement",
+    "--trusted-host",
+    "--use-feature",
+)
+
+
+def _include_option(option: str, label: str) -> str | None:
+    """`--requirement` or `--constraint` for that option or an abbreviation optparse expands to it, else None.
+    SourceError for an abbreviation that could be either one or another option, which pip refuses."""
+    if option in ("--requirement", "--constraint"):
+        return option
+    if len(option) <= 2 or not option.startswith("--") or option in _PIP_FILE_OPTIONS:
+        return None
+    matches = [name for name in _PIP_FILE_OPTIONS if name.startswith(option)]
+    if not {"--requirement", "--constraint"} & set(matches):
+        return None
+    if len(matches) > 1:
+        raise SourceError(f"{label}: pip refuses this line: ambiguous option: {option} ({', '.join(matches)}?)")
+    return matches[0]
+
+
 def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
     """The file pip reads for a line of options, as (whether it's a constraints file, its path). optparse collects
     every -r and -c on the line, and pip follows only the first -r, or the first -c if there's no -r
     (`_parse_and_recurse` in pip/_internal/req/req_file.py). The spellings are `-r f`, `-rf`, `-r=f`,
-    `--requirement f` and `--requirement=f` (and the same for -c). `-r=f` is read as `f`, as wheelgap always has, though
-    pip's optparse would read a file named `=f`. None for a line pip reads as an editable
-    requirement, or one with an abbreviated include, which _abbreviated_include reports instead."""
+    `--requirement f` and `--requirement=f` (and the same for -c), and the abbreviations optparse expands to them
+    (`--cons f`, `--requirem=f`). `-r=f` is read as `f`, as wheelgap always has, though pip's optparse would read a
+    file named `=f`. None for a line pip reads as an editable requirement."""
 
     def editable(token: str) -> bool:
         option = token.partition("=")[0]
@@ -2110,7 +2177,7 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         )
 
     found: dict[bool, list[str]] = {False: [], True: []}
-    unread = ""  # an editable or an abbreviated include, which this function doesn't follow
+    unread = ""  # an editable, which this function doesn't follow
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -2118,22 +2185,15 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         if token == "--":  # optparse reads no options after it
             break
         option, eq, value = token.partition("=")
-        if option in ("--requirement", "--constraint"):
-            name, constraint = option, option == "--constraint"
+        if full := _include_option(option, label):
+            name, constraint = option, full == "--constraint"
         elif token.startswith(("-r", "-c")) and not token.startswith("--"):
             name, constraint = token[:2], token.startswith("-c")
             eq, value = ("=", token[2:].removeprefix("=")) if len(token) > 2 else ("", "")
         else:
             if editable(token):
                 unread = unread or "an editable"
-            elif _abbreviated_include(token):
-                unread = unread or "an abbreviated -r or -c"
-            if (
-                _takes_value(token)
-                or (editable(token) and not eq and token in ("-e", "--editable"))
-                # `--cons -C -r f`: -C is --cons's value, so pip reads the -r
-                or (token.startswith("--") and _abbreviated_include(token) and not eq)
-            ):
+            if _takes_value(token) or (editable(token) and not eq and token in ("-e", "--editable")):
                 i += 1  # optparse takes the next token as this option's value: `--no-binary -r f` names no include
             continue
         if not eq:
@@ -2144,7 +2204,7 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         found[constraint].append(value)
     if unread:
         if editable(tokens[0]) or not (found[False] or found[True]):
-            return None  # read as an editable, or reported by _abbreviated_include, as before
+            return None  # read as an editable, as before
         # pip's answer depends on options wheelgap doesn't read here, so a guess could leave packages out.
         raise SourceError(f"{label}: wheelgap can't read a -r or -c on a line with {unread}: {' '.join(tokens)}")
     if found[False]:
@@ -2434,15 +2494,25 @@ def _merge_requirements(pkgs: list[Package]) -> list[Package]:
     """One package per name and marker, as pip and uv read a name required twice (`-r base.txt` pins numpy==1.26.4,
     the file asks numpy>=1.20): the resolver takes one release that every requirement for the name allows (pip's
     Factory._iter_found_candidates intersects their specifiers), so pip 26.3 installs only numpy 1.26.4, and refuses
-    numpy==2.3.0 with numpy<2. Requirements under different markers apply together only where both markers hold, which
-    each target decides: they stay apart when no target wheelgap knows holds both (`python_version < "3.13"` and
-    `>= "3.13"`), and are left `unknown` when one can (numpy>=1.20 with `numpy<2; sys_platform == "win32"`), unless an
-    unmarked pin already meets the others. conda packages (skip="conda") are another installer's, so never merged."""
+    numpy==2.3.0 with numpy<2. Lines under different markers apply together only where both markers hold, which
+    each target decides, so they become a MarkerGroup: a package per line, and one per set of lines that some
+    environment holds together (numpy>=1.20 with `numpy<2; sys_platform == "win32"` is the two merged on Windows).
+    check.group_answer picks one per target. conda packages (skip="conda") are another installer's, never merged.
+    Merging again (an extra added later) starts from the lines of the groups made before."""
+    unfolded: list[Package] = []
+    seen: set[int] = set()
+    for pkg in pkgs:
+        if pkg.marker_group is None:
+            unfolded.append(pkg)
+        elif id(pkg.marker_group) not in seen:
+            seen.add(id(pkg.marker_group))
+            unfolded.extend(pkg.marker_group.lines)
+    pkgs = unfolded
     groups: dict[str, list[int]] = {}
     for i, pkg in enumerate(pkgs):
         if pkg.skip != "conda":
             groups.setdefault(pkg.key, []).append(i)
-    out: dict[int, Package | None] = {}
+    out: dict[int, list[Package]] = {}
     for indices in groups.values():
         if len(indices) < 2:
             continue
@@ -2450,29 +2520,15 @@ def _merge_requirements(pkgs: list[Package]) -> list[Package]:
         for i in indices:
             markers = pkgs[i].markers
             by_marker.setdefault(None if markers is None else tuple(sorted(set(markers))), []).append(i)
-        merged = []
+        firsts = []
         for members in by_marker.values():
-            out.update(dict.fromkeys(members[1:]))
-            out[members[0]] = _merge_same_marker([pkgs[i] for i in members])
-            merged.append(members[0])
-        if len(merged) < 2:
-            continue
-        unmarked = next((i for i in merged if pkgs[i].markers is None), None)
-        if unmarked is not None and _covers(out[unmarked], [out[i] for i in merged if i != unmarked], unmarked, merged):
-            # Every other requirement applies only where the pin does, and the pin meets it: the pin is the answer.
-            out.update(dict.fromkeys(i for i in merged if i != unmarked))
-            continue
-        rows = [p for i in merged if (p := out[i]) is not None]
-        if any(_can_both_hold(a.markers, b.markers) for k, a in enumerate(rows) for b in rows[k + 1 :]):
-            shown = " and ".join(
-                f"{p.name}{_specifier(p) or ''}" + (f"; {' or '.join(p.markers)}" if p.markers else "") for p in rows
-            )
-            for p in rows:
-                p.error = p.error or (
-                    f"{p.origin} requires {p.name} more than once under different markers ({shown}); where they hold "
-                    "together pip takes a release both allow, and wheelgap doesn't combine them per target"
-                )
-    return [kept for i, pkg in enumerate(pkgs) if (kept := out.get(i, pkg)) is not None]
+            out.update({i: [] for i in members[1:]})
+            out[members[0]] = [_merge_same_marker([pkgs[i] for i in members])]
+            firsts.append(members[0])
+        if len(firsts) > 1:
+            out[firsts[0]] = _marker_group([out[i][0] for i in firsts])
+            out.update({i: [] for i in firsts[1:]})
+    return [kept for i, pkg in enumerate(pkgs) for kept in out.get(i, [pkg])]
 
 
 def _merge_same_marker(entries: list[Package]) -> Package:
@@ -2487,7 +2543,8 @@ def _merge_same_marker(entries: list[Package]) -> Package:
     # checks the download against the first line's: pip 26.3 installs markupsafe for `--hash=<mac wheel>` then
     # `--hash=<linux wheel>` on macOS, and refuses it in the other order. Only one set of hashes, on the first line,
     # reads as that line alone does.
-    if any(entry.hashes and entry.hashes != first.hashes for entry in entries[1:]):
+    hashes = (first.hashes, first.other_hashes)
+    if any((entry.hashes or entry.other_hashes) and (entry.hashes, entry.other_hashes) != hashes for entry in entries):
         error = error or (
             f"the requirements for {first.name} list different --hash options; pip filters the files by the hashes "
             "they all list and checks the download against the first one's, which wheelgap doesn't follow"
@@ -2505,49 +2562,125 @@ def _merge_same_marker(entries: list[Package]) -> Package:
                 )
             error = error or f"the requirements {both} conflict: no release satisfies both (pip and uv refuse this)"
             chosen = pin
-        return replace(chosen, error=error, hashes=first.hashes)
+        return replace(chosen, error=error, hashes=first.hashes, other_hashes=first.other_hashes)
     spec = SpecifierSet()
     for specifier in specifiers:
         spec &= SpecifierSet(specifier)
     ranged = [entry for entry in entries if entry.spec]
     base = ranged[0] if len(ranged) == 1 else first
     written = base.written_spec if len(ranged) == 1 else None
-    return replace(base, spec=str(spec) or None, written_spec=written, error=error, hashes=first.hashes)
+    return replace(
+        base,
+        spec=str(spec) or None,
+        written_spec=written,
+        error=error,
+        hashes=first.hashes,
+        other_hashes=first.other_hashes,
+        merged_ranges=len(ranged) > 1,
+    )
 
 
-def _covers(pin: Package | None, others: list[Package | None], at: int, order: list[int]) -> bool:
-    """Whether an unmarked requirement's pin is what pip installs wherever the marked `others` apply too: it meets each
-    of them, and they list no other hashes (one listing none may follow the pin's line, which pip checks against)."""
-    if pin is None or pin.skip or pin.error or not pin.version:
-        return False
-    for other, index in zip(others, [i for i in order if i != at], strict=True):
-        if other is None or other.skip or other.error:
-            return False
-        specifier = _specifier(other)
-        if specifier and not _allows(pin.version, [specifier]):
-            return False
-        if other.hashes != pin.hashes and (other.hashes or index < at):
-            return False
-    return True
+# More lines than this under different markers are one `unknown` package: the sets of lines are counted per target.
+_MAX_MARKER_LINES = 12
+
+
+def _marker_group(lines: list[Package]) -> list[Package]:
+    """The packages checked for a name required under these different markers (one line each, in pip's order): one
+    per line, one per set of two or more lines that some environment wheelgap can check holds together (merged as pip
+    merges them, and folded into a line's package that checks the same thing), and a last one, `unknown`, for a target
+    none of them answers (check.group_answer)."""
+    group = MarkerGroup(lines)
+    first = lines[0]
+    shown = " and ".join(
+        f"{p.name}{_specifier(p) or ''}" + (f"; {' or '.join(p.markers)}" if p.markers else "") for p in lines
+    )
+    fallback = replace(
+        first,
+        version=None,
+        spec=None,
+        written_spec=None,
+        skip=None,
+        hashes=frozenset(),
+        other_hashes=frozenset(),
+        markers=None
+        if any(line.markers is None for line in lines)
+        else [m for line in lines for m in line.markers or []],
+        error=(
+            f"{first.origin} requires {first.name} under different markers ({shown}), and on this target wheelgap "
+            "can't tell which of them hold (a marker it can't decide here) or which release pip takes for them "
+            "together"
+        ),
+        marker_group=group,
+        marker_sets=frozenset({frozenset()}),
+    )
+    if len(lines) > _MAX_MARKER_LINES:
+        sets: list[frozenset[int]] = []
+    else:
+        sets = [frozenset({i}) for i in range(len(lines))]
+        sets += [s for s in _held_together(group) if len(s) > 1]
+    members: list[Package] = []
+    for held in sets:
+        if len(held) == 1:
+            (i,) = held
+            pkg = replace(lines[i], marker_group=group, marker_sets=frozenset({held}))
+        else:
+            chosen = [lines[i] for i in sorted(held)]
+            merged = _merge_same_marker(chosen)
+            conjunction = [
+                " and ".join(f"({' or '.join(line.markers)})" for line in chosen if line.markers is not None)
+            ]
+            pkg = replace(
+                merged,
+                markers=conjunction if conjunction[0] else None,
+                marker_group=group,
+                marker_sets=frozenset({held}),
+            )
+        # A merged set that checks what a line alone does is that line's package (pywin32==306 under win32 and
+        # Windows markers: one row). Two lines' own packages stay apart, each with its marker, as before.
+        same = next((m for m in members if _same_check(m, pkg)), None) if len(held) > 1 else None
+        if same is None:
+            members.append(pkg)
+        else:
+            same.marker_sets |= pkg.marker_sets
+            same.markers = None if same.markers is None or pkg.markers is None else same.markers + pkg.markers
+    group.members = [*members, fallback]
+    return group.members
+
+
+def _same_check(a: Package, b: Package) -> bool:
+    """Whether two packages of a MarkerGroup check the same release in the same way."""
+    fields = ("version", "spec", "hashes", "other_hashes", "skip", "error", "merged_ranges")
+    return all(getattr(a, f) == getattr(b, f) for f in fields)
 
 
 _MARKER_TARGETS: list[Target] = []
 
 
-def _can_both_hold(a: list[str] | None, b: list[str] | None) -> bool:
-    """Whether a target wheelgap can check (any platform, Python 2.7 or 3.0 to the next 3.x) may install both of two
-    requirements, by their markers (None: always). A marker the target can't decide may hold."""
+def _held_together(group: MarkerGroup) -> list[frozenset[int]]:
+    """The sets of the group's lines that hold, for sure, on some target wheelgap can check (any platform, Python 2.7
+    or 3.0 to the next 3.x), in order. On a target where some markers can't be decided, the set of those that hold
+    for sure counts too: check.group_answer starts from it there."""
     from .check import marker_value  # check imports this module
     from .targets import NEWEST_PYTHON, Target
 
     if not _MARKER_TARGETS:
         pythons = [(2, 7)] + [(3, minor) for minor in range(NEWEST_PYTHON[1] + 2)]
         _MARKER_TARGETS.extend(Target(major, minor, False, name) for name in PLATFORMS for major, minor in pythons)
+    found: dict[frozenset[int], None] = {}
+    for target in _MARKER_TARGETS:
+        values = [
+            True if markers is None else _any_value([marker_value(m, target) for m in markers])
+            for markers in group.markers
+        ]
+        held = frozenset(i for i, value in enumerate(values) if value is True)
+        if held:
+            found[held] = None
+    return sorted(found, key=lambda s: (len(s), sorted(s)))
 
-    def holds(markers: list[str] | None, target: Target) -> bool:
-        return markers is None or any(marker_value(marker, target) is not False for marker in markers)
 
-    return any(holds(a, target) and holds(b, target) for target in _MARKER_TARGETS)
+def _any_value(values: list[bool | None]) -> bool | None:
+    """Whether any of these marker values holds: True, False, or None when that can't be decided."""
+    return True if True in values else None if None in values else False
 
 
 def parse_requirements(
@@ -2820,7 +2953,7 @@ def _requirement_options(
     --only-binary, --all-releases or --only-final as (long name, value) in order, for the install's format and release
     control; what pip ignores there, for a note: each option as (the name it was written with, its long name), and
     words that aren't options, which optparse sets aside, as one entry; the frozenset of sha256 digests from
-    --hash options; and the other algorithms the --hash options use (sha384, sha512), once each. SourceError where
+    --hash options; and the sha384 and sha512 ones, as `algorithm:digest`, in order. SourceError where
     pip refuses the line, or where it applies an option that wheelgap doesn't read (-e)."""
     try:
         tokens = shlex.split(text)
@@ -2831,7 +2964,7 @@ def _requirement_options(
     formats: list[tuple[str, str]] = []
     ignored: list[tuple[str, str]] = []
     sha256_hashes: set[str] = set()
-    other_algorithms: list[str] = []
+    other_hashes: list[str] = []
     k = 0
     while k < len(tokens):
         token = tokens[k]
@@ -2886,8 +3019,8 @@ def _requirement_options(
                 raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
             if algo == "sha256":
                 sha256_hashes.add(digest.lower())
-            elif algo not in other_algorithms:
-                other_algorithms.append(algo)
+            elif f"{algo}:{digest.lower()}" not in other_hashes:
+                other_hashes.append(f"{algo}:{digest.lower()}")
         if kind == "requirement" and "=" not in given_value:
             raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
         if kind == "feature" and value not in _USE_FEATURE_CHOICES:
@@ -2904,7 +3037,7 @@ def _requirement_options(
             # The value pip's callback reads, never a word after another option; the callback applies it to the whole
             # install, exactly as on a line of its own.
             formats.append((name, given_value))
-    return hashed, formats, ignored, frozenset(sha256_hashes), other_algorithms
+    return hashed, formats, ignored, frozenset(sha256_hashes), other_hashes
 
 
 def _read_requirements(
@@ -2921,7 +3054,7 @@ def _read_requirements(
     ignored_options: dict[tuple[Path, str], str] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
-    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options.
+    --extra-index-url, --find-links, --no-index).
     `req_lines` collects requirement lines that aren't constraints, for --deps; `compiler_signs` notes the
     `--hash` options and `# via` comments that mark pip-compile output, in requirement files only.
     `stack` is the chain of files being read, `-r` and `-c` together, as pip keeps it: by the path each
@@ -2967,11 +3100,7 @@ def _read_requirements(
             if (
                 not already_seen
                 and index_options is not None
-                and any(
-                    _names_index_option(text) or _abbreviated_include(text)
-                    for text in (line, " ".join(tokens or []))
-                    if text
-                )
+                and any(_names_index_option(text) for text in (line, " ".join(tokens or [])) if text)
             ):
                 index_options.append(line)
             include = None
@@ -3071,10 +3200,10 @@ def _read_requirements(
             options = " ".join(word for word in words[first_option:] if word)
             hashed = False
             req_hashes: frozenset[str] = frozenset()
-            other_algorithms: list[str] = []
+            other_hashes: list[str] = []
             if options:
                 where = _shown(path, stack) + (f":{number}" if number is not None else "")
-                hashed, formats, ignored, req_hashes, other_algorithms = _requirement_options(options, where)
+                hashed, formats, ignored, req_hashes, other_hashes = _requirement_options(options, where)
                 if ignored_options is not None:
                     for shown, option in ignored:
                         note = f"{where}: pip ignores {shown} after a requirement"
@@ -3103,16 +3232,20 @@ def _read_requirements(
                 append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
                 continue
             pkg = requirement_to_package(line, path.name, hashes=req_hashes)
-            if other_algorithms and not pkg.skip and not constraint:
+            if other_hashes and not pkg.skip and not constraint:
                 # The index gives each file's sha256 only (PyPI's JSON API), so these can't be matched. Dropped, they
                 # would leave no hash filter at all, while pip checks them: it picks the best file, then refuses it if
                 # no listed hash matches (pip 26.3, markupsafe==3.0.2 --hash=sha512:<the sdist's>, on macOS arm64).
-                # With sha256 hashes beside them, a file whose sha256 isn't listed may still match one of these.
-                where = _shown(path, stack) + (f":{number}" if number is not None else "")
-                pkg.error = (
-                    f"{where} lists {' and '.join(other_algorithms)} hashes for {pkg.name}, which wheelgap can't match "
-                    "(the index gives sha256 digests only), so it can't tell which file pip accepts"
-                )
+                # Beside sha256 ones, pip's filter_unallowed_hashes keeps only the files with a listed sha256 where one
+                # fits the target, so they decide there; elsewhere pip checks its pick against these too.
+                pkg.other_hashes = frozenset(other_hashes)
+                if not req_hashes:
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    algorithms = " and ".join(dict.fromkeys(h.partition(":")[0] for h in other_hashes))
+                    pkg.error = (
+                        f"{where} lists {algorithms} hashes for {pkg.name}, which wheelgap can't match (the index "
+                        "gives sha256 digests only), so it can't tell which file pip accepts"
+                    )
             append(pkg)
             if req_lines is not None and not constraint:
                 req_lines.append(line)

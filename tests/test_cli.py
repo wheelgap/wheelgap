@@ -423,6 +423,160 @@ def test_requirements_name_required_twice_is_checked_once(capsys, fake_pypi, tmp
     assert code == 1
 
 
+def _cells(out):
+    """{(name, version): {target: result}} from --json, the rows no target needs left out."""
+    return {
+        (p["name"], p["version"]): {t: r for t, r in p["results"].items() if r != "n/a"}
+        for p in json.loads(out)["packages"]
+        if any(r != "n/a" for r in p["results"].values())
+    }
+
+
+@pytest.mark.parametrize(
+    "lines, args, expected",
+    [
+        # Merged where both hold (Windows: ranged<2 and >=1.5 is 1.9, sdist only), plain elsewhere (2.0, a wheel).
+        (
+            ["ranged>=1.5", 'ranged<2 ; sys_platform == "win32"'],
+            ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"],
+            {("ranged", "2.0"): {"linux-x86_64": "wheel"}, ("ranged", "1.9"): {"win-amd64": "source"}},
+        ),
+        # manim's scipy>=1.13.0 with scipy>=1.15.0 ; python_full_version >= '3.13' (#835 review): the newest
+        # release meets both, so 3.13 checks the same release, in one row.
+        (
+            ["ranged>=1.5", "ranged>=1.9 ; python_full_version >= '3.13'"],
+            ["-p", "3.12", "-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", "2.0"): {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "wheel"}},
+        ),
+        # A patch release can't be decided on 3.13, but 2.0 meets the line either way...
+        (
+            ["ranged>=1.5", "ranged>=1.9 ; python_full_version >= '3.13.1'"],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", "2.0"): {"linux-x86_64": "wheel"}},
+        ),
+        # ...while here it may hold and leave out 2.0: unknown.
+        (
+            ["ranged>=1.5", "ranged<2 ; python_full_version >= '3.13.1'"],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", None): {"linux-x86_64": "unknown"}},
+        ),
+    ],
+)
+def test_requirements_name_required_under_markers_checked_per_target(
+    capsys, fake_pypi, tmp_path, lines, args, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), *args, "--json")
+    assert _cells(out) == expected
+
+
+def test_requirements_identical_line_under_a_marker_stays_checked_on_undecided_targets(capsys, fake_pypi, tmp_path):
+    # vllm cpu.txt's `py-cpuinfo; platform_machine == "aarch64"` with common.txt's `py-cpuinfo` (#835 review): one
+    # row, confident on linux-armv7l too, where platform_machine can't be decided.
+    (tmp_path / "common.txt").write_text("unpinned\n", encoding="utf-8")
+    req = tmp_path / "cpu.txt"
+    req.write_text('-r common.txt\nunpinned; platform_machine == "aarch64"\n', encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.12", "-t", "linux-x86_64,linux-aarch64,linux-armv7l", "--json")
+    assert _cells(out) == {
+        ("unpinned", "4.2"): {"linux-x86_64": "wheel", "linux-aarch64": "wheel", "linux-armv7l": "wheel"}
+    }
+    assert code == 0
+
+
+def test_pyproject_ranges_split_by_python_with_an_extra_are_checked(capsys, fake_pypi, tmp_path):
+    # litellm's pydantic: three ranges split by python_version, and the same name unmarked in an extra.
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0'\ndependencies = [\n"
+        "  \"ranged>=1.5,<3; python_version < '3.14'\",\n"
+        "  \"ranged>=1.9,<3; python_version == '3.14'\",\n"
+        "  \"ranged>=2.0,<3; python_version >= '3.15'\",\n]\n"
+        "[project.optional-dependencies]\nmcp = ['ranged>=1.5,<3']\n",
+        encoding="utf-8",
+    )
+    code, out, _ = run(
+        capsys,
+        str(tmp_path / "pyproject.toml"),
+        "--all-extras",
+        "-p",
+        "3.13",
+        "-p",
+        "3.14",
+        "-t",
+        "linux-x86_64",
+        "--json",
+    )
+    cells = _cells(out)
+    assert {cell for results in cells.values() for cell in results.values()} == {"wheel"}
+    assert {version for _, version in cells} == {"2.0"} and code == 0
+
+
+def test_requirements_ranges_that_allow_nothing_together_are_a_refusal(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged>=2\nranged<2\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"]["linux-x86_64"] == "unknown" and code == 1
+    assert pkg["error"].startswith("no release matches <2,>=2")
+    assert pkg["error"].endswith("(the requirements for it allow no release together, so pip and uv refuse them)")
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        # The sha256 lists the Linux wheel: pip keeps only it where it fits (filter_unallowed_hashes). On Windows
+        # no listed file fits, so pip checks its pick against the sha512 too: unknown.
+        (
+            f"hashpkg==1.0 --hash=sha256:{'1' * 64} --hash=sha512:{'ab' * 64}",
+            {"linux-x86_64": "wheel", "win-amd64": "unknown"},
+        ),
+        # The sdist's sha256 fits everywhere: pip builds it, as with that hash alone.
+        (
+            f"hashpkg==1.0 --hash=sha256:{'3' * 64} --hash=sha512:{'ab' * 64}",
+            {"linux-x86_64": "source", "win-amd64": "source"},
+        ),
+    ],
+)
+def test_requirements_sha256_beside_sha512_decides_where_a_listed_file_fits(
+    capsys, fake_pypi, tmp_path, line, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text(line + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"] == expected
+
+
+@pytest.mark.parametrize("option", ["--cons", "--const", "--constrain="])
+def test_requirements_abbreviated_constraint_is_read(capsys, fake_pypi, tmp_path, option):
+    # pip 26.3 reads `--cons c.txt` as `--constraint c.txt` (optparse takes an unambiguous prefix).
+    (tmp_path / "c.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    sep = "" if option.endswith("=") else " "
+    req.write_text(f"{option}{sep}c.txt\nranged\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert _cells(out) == {("ranged", "1.9"): {"linux-x86_64": "source"}}
+
+
+@pytest.mark.parametrize(
+    "line", ["--cons https://releases.openstack.org/constraints/upper/2023.1", "--const ${CDIR}/c.txt"]
+)
+def test_requirements_abbreviated_unread_constraint_is_refused(capsys, fake_pypi, tmp_path, line):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"{line}\nnumpy\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and f"requirements.txt:1: {line}: pip reads a constraints file" in err
+    assert fake_pypi == []
+
+
+def test_requirements_abbreviated_requirement_is_read(capsys, fake_pypi, tmp_path):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("--requirem base.txt\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert _cells(out) == {("purewheel", "3.1"): {"linux-x86_64": "wheel"}}
+
+
 def test_requirements_sha512_hashes_are_unknown_not_unhashed(capsys, fake_pypi, tmp_path):
     # pip 26.3 picks the wheel, checks it against the sha512 and refuses it; before, wheelgap dropped the hash and said
     # `wheel`.

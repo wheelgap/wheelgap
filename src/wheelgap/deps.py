@@ -474,7 +474,9 @@ def pinned_complete(source: Source) -> bool:
     """A requirements file that's already complete: every requirement pinned, with --hash lines (in hash mode pip
     refuses any dependency the file doesn't pin), so --deps has nothing to resolve."""
     return source.compiled and all(
-        p.version is not None and not p.spec and not p.error for p in source.packages if not p.skip
+        p.version is not None and not p.spec and not p.error
+        for p in source.packages
+        if not p.skip and frozenset() not in p.marker_sets  # a MarkerGroup's `unknown` stand-in isn't a requirement
     )
 
 

@@ -703,17 +703,6 @@ def test_requirements_name_required_twice_is_one_package(tmp_path):
             ['numpy>=1.20 ; sys_platform == "win32"', 'numpy==1.26.4; sys_platform=="win32"'],
             [("numpy", "1.26.4", None, None)],
         ),
-        # Markers no target holds together stay two packages: uv pip compile --universal writes these.
-        (
-            ['numpy==1.26.4 ; python_version < "3.13"', 'numpy==2.3.0 ; python_version >= "3.13"'],
-            [("numpy", "1.26.4", None, None), ("numpy", "2.3.0", None, None)],
-        ),
-        (
-            ['numpy==1.26.4 ; sys_platform == "win32"', 'numpy==2.3.0 ; sys_platform != "win32"'],
-            [("numpy", "1.26.4", None, None), ("numpy", "2.3.0", None, None)],
-        ),
-        # An unmarked pin that meets a marked requirement is what pip installs wherever that one applies too.
-        (["numpy==1.26.4", 'numpy<2 ; sys_platform == "win32"'], [("numpy", "1.26.4", None, None)]),
     ],
 )
 def test_requirements_name_required_twice_merges_as_pip_does(tmp_path, lines, expected):
@@ -737,31 +726,186 @@ def test_requirements_name_required_twice_merges_as_pip_does(tmp_path, lines, ex
             "the requirements numpy==2.3.0 and numpy==1.26.4 conflict: no release satisfies both (pip and uv refuse "
             "this)",
         ),
-        # Where both markers hold (win32 here), pip takes a release both allow, so neither row alone is the answer.
-        (
-            ["numpy>=1.20", 'numpy<2 ; sys_platform == "win32"'],
-            "requirements.txt requires numpy more than once under different markers (numpy>=1.20 and numpy<2; "
-            'sys_platform == "win32"); where they hold together pip takes a release both allow, and wheelgap doesn\'t '
-            "combine them per target",
-        ),
-        (
-            ["numpy==2.3.0", 'numpy<2 ; sys_platform == "win32"'],
-            "requirements.txt requires numpy more than once under different markers (numpy==2.3.0 and numpy<2; "
-            'sys_platform == "win32"); where they hold together pip takes a release both allow, and wheelgap doesn\'t '
-            "combine them per target",
-        ),
-        (
-            ['numpy==1.26.4 ; python_version < "3.13"', 'numpy==2.3.0 ; platform_release >= "6"'],
-            "requirements.txt requires numpy more than once under different markers (numpy==1.26.4; python_version "
-            '< "3.13" and numpy==2.3.0; platform_release >= "6"); where they hold together pip takes a release both '
-            "allow, and wheelgap doesn't combine them per target",
-        ),
     ],
 )
-def test_requirements_name_required_twice_unknown_where_pip_refuses_or_combines(tmp_path, lines, error):
+def test_requirements_name_required_twice_unknown_where_pip_refuses(tmp_path, lines, error):
     path = tmp_path / "requirements.txt"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert {p.error for p in parse_requirements(path).packages} == {error}
+
+
+def _answers(source, pythons, platforms):
+    """Per target, what each name required under several markers is checked as there (check.group_answer): its
+    version, else its range, or "unknown"; an empty list where no line holds."""
+    from wheelgap.check import applies
+
+    out = {}
+    for target in build_targets(pythons, platforms):
+        chosen = [p for p in source.packages if applies(p, target)]
+        out[target.label(True)] = ["unknown" if p.error else p.version or p.spec or "" for p in chosen]
+    return out
+
+
+@pytest.mark.parametrize(
+    "lines, pythons, platforms, expected",
+    [
+        # uv pip compile --universal and multi-arch files: `== X` and `!= X` never hold together, so each target
+        # takes one line. linux-armv7l can't decide platform_machine (armv7l or armv8l), so only it is unknown.
+        (
+            ['numpy==1.26.4 ; platform_machine == "aarch64"', 'numpy==2.2.6 ; platform_machine != "aarch64"'],
+            ["3.12"],
+            ["linux-x86_64", "linux-aarch64", "linux-armv7l"],
+            {"3.12 linux-x86_64": ["2.2.6"], "3.12 linux-aarch64": ["1.26.4"], "3.12 linux-armv7l": ["unknown"]},
+        ),
+        # A patch release splits only its own Python: 3.13 could be 3.13.1 or 3.13.2.
+        (
+            ['numpy==1.26.4 ; python_full_version < "3.13.2"', 'numpy==2.2.6 ; python_full_version >= "3.13.2"'],
+            ["3.12", "3.13", "3.14"],
+            ["linux-x86_64"],
+            {"3.12 linux-x86_64": ["1.26.4"], "3.13 linux-x86_64": ["unknown"], "3.14 linux-x86_64": ["2.2.6"]},
+        ),
+        # Merged on Windows only (pip 26.3 on macOS installs numpy 1.26.4 for the darwin version), plain elsewhere.
+        (
+            ["numpy>=1.20", 'numpy<2 ; sys_platform == "win32"'],
+            ["3.12"],
+            ["linux-x86_64", "win-amd64"],
+            {"3.12 linux-x86_64": [">=1.20"], "3.12 win-amd64": ["<2,>=1.20"]},
+        ),
+        # Both pins where both markers hold (Windows on 3.12): pip and uv refuse; one pin elsewhere.
+        (
+            ['numpy==1.26.4 ; sys_platform == "win32"', 'numpy==2.3.0 ; python_version >= "3.12"'],
+            ["3.11", "3.12"],
+            ["linux-x86_64", "win-amd64"],
+            {
+                "3.11 linux-x86_64": [],
+                "3.11 win-amd64": ["1.26.4"],
+                "3.12 linux-x86_64": ["2.3.0"],
+                "3.12 win-amd64": ["unknown"],
+            },
+        ),
+        # An unmarked pin that meets a marked line is the answer everywhere, as one package.
+        (
+            ["numpy==1.26.4", 'numpy<2 ; sys_platform == "win32"'],
+            ["3.12"],
+            ["linux-x86_64", "win-amd64", "linux-armv7l"],
+            {"3.12 linux-x86_64": ["1.26.4"], "3.12 win-amd64": ["1.26.4"], "3.12 linux-armv7l": ["1.26.4"]},
+        ),
+        # A marker no target decides (platform_release): unknown where it could change the release (3.12: 1.26.4 or
+        # a conflict). On 3.13 only that line may hold, so it counts as needed, as one such line always has.
+        (
+            ['numpy==1.26.4 ; python_version < "3.13"', 'numpy==2.3.0 ; platform_release >= "6"'],
+            ["3.12", "3.13"],
+            ["linux-x86_64"],
+            {"3.12 linux-x86_64": ["unknown"], "3.13 linux-x86_64": ["2.3.0"]},
+        ),
+        # vllm requirements/common.txt:15-16 (#835 review): protobuf for every machine but s390x, a pin for s390x.
+        (
+            [
+                "protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, "
+                '!=6.33.4.*; platform_machine != "s390x"',
+                'protobuf == 7.36.1; platform_machine == "s390x"',
+            ],
+            ["3.12"],
+            ["linux-x86_64", "linux-s390x", "macos-x86_64"],
+            {
+                "3.12 linux-x86_64": [
+                    "!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*,>=5.29.6"
+                ],
+                "3.12 linux-s390x": ["7.36.1"],
+                "3.12 macos-x86_64": [
+                    "!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*,>=5.29.6"
+                ],
+            },
+        ),
+        # vllm requirements/cpu.txt:9-10: the +cpu build on these machines, the plain one on macOS and the rest. On
+        # macOS x86_64 both hold, and ==2.14.0 takes 2.14.0+cpu (PEP 440 local versions), so it's that one.
+        (
+            [
+                'torch==2.14.0+cpu; platform_machine == "x86_64" or platform_machine == "s390x" or platform_machine '
+                '== "aarch64"',
+                'torch==2.14.0; platform_system == "Darwin" or platform_machine == "ppc64le" or platform_machine == '
+                '"riscv64"',
+            ],
+            ["3.12"],
+            ["linux-x86_64", "linux-aarch64", "linux-ppc64le", "macos-arm64", "macos-x86_64", "win-amd64"],
+            {
+                "3.12 linux-x86_64": ["2.14.0+cpu"],
+                "3.12 linux-aarch64": ["2.14.0+cpu"],
+                "3.12 linux-ppc64le": ["2.14.0"],
+                "3.12 macos-arm64": ["2.14.0"],
+                "3.12 macos-x86_64": ["2.14.0+cpu"],
+                "3.12 win-amd64": [],
+            },
+        ),
+        # pywin32-style: one pin under two markers that hold together.
+        (
+            ['pywin32==306 ; sys_platform == "win32"', 'pywin32==306 ; platform_system == "Windows"'],
+            ["3.12"],
+            ["linux-x86_64", "win-amd64", "win-arm64"],
+            {"3.12 linux-x86_64": [], "3.12 win-amd64": ["306"], "3.12 win-arm64": ["306"]},
+        ),
+    ],
+)
+def test_requirements_name_required_under_markers_is_decided_per_target(tmp_path, lines, pythons, platforms, expected):
+    path = tmp_path / "requirements.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert _answers(parse_requirements(path), pythons, platforms) == expected
+
+
+def test_requirements_identical_line_marked_and_unmarked_is_one_package(tmp_path):
+    # vllm requirements/cpu.txt:29 `py-cpuinfo; platform_machine == "aarch64"` with common.txt:10 `py-cpuinfo`: the
+    # marked line asks nothing more, so it's the unmarked line's package everywhere, linux-armv7l too.
+    (tmp_path / "common.txt").write_text("py-cpuinfo\n", encoding="utf-8")
+    path = tmp_path / "cpu.txt"
+    path.write_text('-r common.txt\npy-cpuinfo; platform_machine == "aarch64"\n', encoding="utf-8")
+    source = parse_requirements(path)
+    answers = _answers(source, ["3.12"], ["linux-x86_64", "linux-aarch64", "linux-armv7l"])
+    assert answers == dict.fromkeys(answers, [""])
+    from wheelgap.check import applies
+
+    targets = build_targets(["3.12"], ["linux-x86_64", "linux-aarch64", "linux-armv7l"])
+    assert len({id(p) for p in source.packages for t in targets if applies(p, t)}) == 1
+
+
+def test_pyproject_identical_pins_under_two_markers_are_one_answer(tmp_path):
+    # yt-dlp's pyproject.toml (pin-curl-cffi, build-curl-cffi): cffi==2.1.1 under implementation_name ==
+    # 'cpython' and under platform_python_implementation != 'PyPy', which hold together on every target.
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0'\ndependencies = [\"cffi==2.1.1 ; implementation_name == 'cpython'\", "
+        "\"cffi==2.1.1 ; platform_python_implementation != 'PyPy'\"]\n",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path / "pyproject.toml")])
+    answers = _answers(src, ["3.12", "3.13"], ["linux-x86_64", "win-amd64", "macos-arm64", "linux-armv7l"])
+    assert answers == dict.fromkeys(answers, ["2.1.1"])
+
+
+def test_requirements_uv_universal_output_answers_every_target(fixtures):
+    # Real `uv pip compile --universal` output: python_full_version forks, platform_machine and sys_platform ones
+    # (torch's nvidia and triton lines). Every target takes exactly one line per name, never the unknown stand-in.
+    source = parse_requirements(fixtures / "uv-universal-requirements.txt")
+    platforms = ["linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64", "win-amd64", "win-arm64"]
+    pythons = ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    from wheelgap.check import applies
+
+    forked = {p.key for p in source.packages if p.marker_group is not None}
+    assert {"numpy", "scipy", "matplotlib", "networkx", "ipython", "torch", "triton"} <= forked
+    for target in build_targets(pythons, platforms):
+        chosen = [p for p in source.packages if p.marker_group is not None and applies(p, target)]
+        assert all(p.error is None and p.version for p in chosen), target
+        assert len({p.key for p in chosen}) == len(chosen), target
+    numpy = {
+        t.python: [p.version for p in source.packages if p.key == "numpy" and applies(p, t)]
+        for t in build_targets(pythons, ["linux-x86_64"])
+    }
+    assert numpy == {
+        "3.9": ["2.0.2"],
+        "3.10": ["2.2.6"],
+        "3.11": ["2.4.6"],
+        "3.12": ["2.5.4"],
+        "3.13": ["2.5.4"],
+        "3.14": ["2.5.4"],
+    }
 
 
 def test_requirements_name_required_twice_conflict_across_files_names_both(tmp_path):
@@ -990,18 +1134,19 @@ def test_requirements_format_option_after_include_still_applies(tmp_path):
         ("-r 'unclosed", "pip can't split this line"),
         ("--pre -r", "-r needs a file name"),
         ("--constraint=", "--constraint needs a file name"),
+        # pip 26.3: "ambiguous option: --req (--require-hashes, --requirement?)"
+        ("-r a.txt --req b.txt", "pip refuses this line: ambiguous option: --req (--require-hashes, --requirement?)"),
+        ("-c a.txt --con b.txt", "pip refuses this line: ambiguous option: --con (--config-settings, --constraint?)"),
         # pip's answer would depend on an option wheelgap doesn't read, so it's refused rather than guessed
-        ("-r a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
-        ("-c a.txt --req b.txt", "on a line with an abbreviated -r or -c"),
         ("-r a.txt -e ./localpkg", "on a line with an editable"),
         # the token after an abbreviated include is its value, so the -C here doesn't hide the -r that pip follows
-        ("--cons -C -r a.txt", "on a line with an abbreviated -r or -c"),
+        ("--cons -C -r a.txt", "--cons -C -r a.txt: file not found"),
     ],
 )
 def test_requirements_unreadable_option_line_is_an_error(tmp_path, line, message):
     path = tmp_path / "requirements.txt"
     path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
-    with pytest.raises(SourceError, match="requirements.txt: ") as raised:
+    with pytest.raises(SourceError, match="requirements.txt:") as raised:
         parse_requirements(path)
     assert message in str(raised.value)
 
@@ -2612,8 +2757,8 @@ def test_requirements_hashes_keep_sha256_only_lowercased(tmp_path):
     # pip lowercases the hashes it's given, and only a sha256 can match a file on PyPI, which gives no other digest.
     # A line with sha384/sha512 hashes is unknown: dropped, they would turn the filter off, while pip checks its pick
     # after the download and refuses it on a mismatch (pip 26.3 with markupsafe==3.0.2 --hash=sha512:<the sdist's>
-    # on macOS arm64: "Expected sha512 ..."). Beside sha256 ones they're unknown too: on a target where no file with
-    # a listed sha256 fits, pip takes its best pick and may accept it by its sha512.
+    # on macOS arm64: "Expected sha512 ..."). Beside sha256 ones they're kept, for check.check: where a file with a
+    # listed sha256 fits, pip keeps only those (filter_unallowed_hashes); elsewhere it may accept its pick by them.
     req = tmp_path / "requirements.txt"
     req.write_text(
         f"upper==1.0 --hash=sha256:{'AB' * 32}\n"
@@ -2621,20 +2766,18 @@ def test_requirements_hashes_keep_sha256_only_lowercased(tmp_path):
         f"mixed==1.0 --hash=sha512:{'ef' * 64} --hash=sha256:{'12' * 32}\n"
         f"ranged>=1 --hash=sha512:{'ef' * 64}\n"
     )
-    assert [(p.hashes, p.error) for p in parse_requirements(req).packages] == [
-        (frozenset({"ab" * 32}), None),
+    assert [(p.hashes, p.other_hashes, p.error) for p in parse_requirements(req).packages] == [
+        (frozenset({"ab" * 32}), frozenset(), None),
         (
             frozenset(),
+            frozenset({f"sha512:{'cd' * 64}", f"sha384:{'cd' * 48}"}),
             "requirements.txt:2 lists sha512 and sha384 hashes for other, which wheelgap can't match (the index gives "
             "sha256 digests only), so it can't tell which file pip accepts",
         ),
-        (
-            frozenset({"12" * 32}),
-            "requirements.txt:3 lists sha512 hashes for mixed, which wheelgap can't match (the index gives sha256 "
-            "digests only), so it can't tell which file pip accepts",
-        ),
+        (frozenset({"12" * 32}), frozenset({f"sha512:{'ef' * 64}"}), None),
         (
             frozenset(),
+            frozenset({f"sha512:{'ef' * 64}"}),
             "requirements.txt:4 lists sha512 hashes for ranged, which wheelgap can't match (the index gives sha256 "
             "digests only), so it can't tell which file pip accepts",
         ),
