@@ -480,3 +480,44 @@ def test_text_and_json_name_the_last_release_with_a_wheel(capsys, fake_pypi, mon
     _assert_matches_output_schema(json.loads(data))
     assert pkgs["wheelstopped"]["suggest"] == {} and pkgs["wheelstopped"]["last_with_wheel"] == {"win-arm64": "1.1"}
     assert pkgs["laggard"]["last_with_wheel"] == {}
+
+
+def _at(version, tag, uploaded):
+    return wheel(version, tag, upload_time_iso_8601=uploaded)
+
+
+def test_suggest_applies_uvs_exclude_newer_cutoff():
+    # numpy 2.1.0 has the cp313 wheel but was uploaded after exclude-newer: uv lock can't pick it (#822).
+    from datetime import UTC, datetime
+
+    (linux,) = build_targets(["3.13"], ["linux-x86_64"])
+    lin = "cp313-cp313-manylinux_2_17_x86_64"
+    releases = {
+        "1.0": [_at("1.0", "cp312-cp312-manylinux_2_17_x86_64", "2024-01-01T00:00:00Z")],
+        "1.1": [_at("1.1", "cp312-cp312-manylinux_2_17_x86_64", "2024-07-01T00:00:00Z")],
+        "2.0": [_at("2.0", lin, "2024-08-10T00:00:00Z"), _at("2.0", "py3-none-any", "2024-08-20T00:00:00Z")],
+        "2.1": [_at("2.1", lin, "2024-09-01T00:00:00Z")],
+    }
+    cutoff = datetime(2024, 8, 1, tzinfo=UTC)
+    assert suggest.suggest(releases, "1.0", [linux]).found == {linux: "2.0"}  # no cutoff: as before
+    found = suggest.suggest(releases, "1.0", [linux], cutoff=cutoff)
+    # 2.0 is the nearest past the cutoff; the cutoff must pass its last file, uploaded on 2024-08-20.
+    assert found.found == {} and found.cutoff == cutoff
+    assert found.beyond == {linux: ("2.0", datetime(2024, 8, 20, tzinfo=UTC))}
+    assert suggest.suggest_lines("demo", "1.0", [linux], found, False) == [
+        "demo 1.0 -> 2.0 has wheels for linux-x86_64, but uv's exclude-newer (2024-08-01T00:00:00Z) leaves it out: "
+        "it needs moving past 2024-08-20T00:00:00Z"
+    ]
+    # Within the cutoff, its own release wins; a file uploaded after it doesn't count, the earlier ones do.
+    later = suggest.suggest(releases, "1.0", [linux], cutoff=datetime(2024, 8, 15, tzinfo=UTC))
+    assert later.found == {linux: "2.0"} and later.beyond == {}
+
+
+def test_suggest_with_a_cutoff_skips_a_release_of_unknown_age():
+    from datetime import UTC, datetime
+
+    (linux,) = build_targets(["3.13"], ["linux-x86_64"])
+    releases = {"1.0": [{"filename": "demo-1.0.tar.gz", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}]}
+    releases["1.1"] = [wheel("1.1")]  # no upload time: its age is unknown, so it's never named as within the cutoff
+    found = suggest.suggest(releases, "1.0", [linux], cutoff=datetime(2024, 8, 1, tzinfo=UTC))
+    assert found.found == {} and found.beyond == {}

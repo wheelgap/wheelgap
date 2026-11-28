@@ -1345,6 +1345,7 @@ def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels
             "kind": "upgrade",
             "version": "1.4",
             "prerelease": False,
+            "exclude_newer": None,
             "how": how,
             "constraint": None,
             "gap_wheel": fallback,
@@ -1353,6 +1354,7 @@ def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels
             "kind": "upgrade",
             "version": "1.4",
             "prerelease": False,
+            "exclude_newer": None,
             "how": how,
             "constraint": None,
             "gap_wheel": None,
@@ -1740,6 +1742,7 @@ def test_fix_moves_a_pre_release_pin_to_a_final_release(capsys, fake_pypi, gap_w
         "kind": "upgrade",
         "version": "1.2rc1",
         "prerelease": True,
+        "exclude_newer": None,
         "how": None,
         "constraint": None,
         "gap_wheel": None,
@@ -1792,3 +1795,104 @@ def test_fix_uv_may_fork_when_the_blocking_requirement_doesnt_apply(capsys, fake
     (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
     _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
     assert "Maybe, with uv:\n  pyfork 1.0: " in out and "leaves out" not in out
+
+
+CUTLIB = {
+    "1.0": [{"filename": "cutlib-1.0.tar.gz", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}],
+    "1.1": [{"filename": "cutlib-1.1.tar.gz", "upload_time_iso_8601": "2024-07-01T00:00:00Z"}],
+    "2.0": [
+        {
+            "filename": "cutlib-2.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+            "upload_time_iso_8601": "2024-08-18T10:00:00Z",
+        },
+        {"filename": "cutlib-2.0.tar.gz", "upload_time_iso_8601": "2024-08-18T12:00:00Z"},
+    ],
+}
+
+
+def cutlib_uv_lock(options):
+    return (
+        f'version = 1\nrequires-python = ">=3.13"\n\n{options}\n'
+        '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "cutlib" }]\n\n'
+        '[[package]]\nname = "cutlib"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cutlib-1.0.tar.gz" }\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "options,setting",
+    [
+        ('[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n', "exclude-newer"),
+        (
+            '[options]\nexclude-newer = "2030-01-01T00:00:00Z"\n\n'
+            '[options.exclude-newer-package]\nCutLib = "2024-08-01T00:00:00Z"\n',
+            "exclude-newer-package CutLib",
+        ),
+    ],
+)
+def test_fix_says_a_release_past_exclude_newer_needs_the_cutoff_moved(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options, setting
+):
+    # #822: 2.0 has the wheel but was uploaded after the lock's exclude-newer, so uv lock can't pick it as it stands.
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
+    args = [str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert (
+        f"  cutlib 1.0 -> 2.0: linux-x86_64 (needs uv's {setting} moved past 2024-08-18T12:00:00Z)\n"
+        f"First move uv's {setting} (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z: cutlib==2.0 was uploaded after "
+        "it, so uv can't pick it before that.\n"
+        f"In {tmp_path}, run uv lock --upgrade-package cutlib, then uv sync"
+    ) in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    cell = data["packages"][0]["fix"]["linux-x86_64"]
+    assert cell["version"] == "2.0" and cell["how"].startswith(f"First move uv's {setting} ")
+    assert cell["exclude_newer"] == {
+        "setting": setting,
+        "cutoff": "2024-08-01T00:00:00Z",
+        "move_past": "2024-08-18T12:00:00Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "",
+        '[options]\nexclude-newer = "2024-09-01T00:00:00Z"\n',
+        '[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n\n[options.exclude-newer-package]\ncutlib = false\n',
+    ],
+)
+def test_fix_upgrade_within_exclude_newer_needs_no_move(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
+    args = [str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert "  cutlib 1.0 -> 2.0: linux-x86_64\n" in out and "First move" not in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    assert data["packages"][0]["fix"]["linux-x86_64"]["exclude_newer"] is None
+
+
+def test_fix_looks_nothing_up_when_the_locks_exclude_newer_cant_be_read(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch
+):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock('[options]\nexclude-newer = "last week-ish"\n'), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert "Newer releases of cutlib weren't looked up: the exclude-newer in uv.lock's [options] can't be read (" in out
+    assert not [url for url in fake_pypi if url.endswith("/cutlib/json")]
+
+
+def test_fix_on_a_pyproject_applies_its_exclude_newer(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["cutlib>=1.0"]\n\n'
+        '[tool.uv]\nexclude-newer = "2024-08-01T00:00:00Z"\n',
+        encoding="utf-8",
+    )
+    _, out, _ = run(capsys, str(tmp_path / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert (
+        "  cutlib 1.1 -> 2.0: linux-x86_64 (within your pyproject.toml constraint cutlib>=1.0; needs uv's "
+        "exclude-newer moved past 2024-08-18T12:00:00Z)\n"
+        "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z:"
+    ) in out

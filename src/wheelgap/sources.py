@@ -209,6 +209,8 @@ class Source:
     # graph remains untouched, preserving conservative behavior when no selectors are supplied.
     uv_packages: list[dict] | None = None
     uv_manifest: dict = field(default_factory=dict)
+    # uv.lock only: its [options] table (exclude-newer and the rest, as uv locked with them), for --fix (#822).
+    uv_options: object = None
     uv_pyproject: Path | None = None
     # A script's lock (example.py.lock, from uv lock --script): the script's path, as the lock's was given. uv takes
     # no dependency groups for it from a pyproject.toml beside it, so uv_pyproject is None; --fix's config goes in the
@@ -694,6 +696,7 @@ def parse_uv_lock(path: Path) -> Source:
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
+    source.uv_options = data.get("options")
     if path.name.endswith(".py.lock"):
         source.uv_script = str(path).removesuffix(".lock")  # as given, so --fix's `uv lock --script` runs from here
     else:

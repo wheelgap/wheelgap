@@ -441,6 +441,17 @@
                             "kind": {"enum": ["upgrade", "gap_wheel", "none"], "description": "The way out: upgrade, gap_wheel or none."},
                             "version": {"type": "string", "description": "kind upgrade: the release to move to. wheelgap doesn't resolve dependencies: the rest of them must allow it."},
                             "prerelease": {"type": "boolean", "description": "kind upgrade, from 0.15.0 on: whether version is a pre-release. Only a pre-release pin gets one, and only when no newer final release has a wheel for the target."},
+                            "exclude_newer": {
+                                "type": ["object", "null"],
+                                "description": "kind upgrade, from 0.15.0 on: null, or when the release was uploaded after uv's exclude-newer for this package (so uv can't pick it until the cutoff moves): setting (exclude-newer, or exclude-newer-package NAME), cutoff (the cutoff now) and move_past (when the release's last file was uploaded: the cutoff must be later). Only a release no release within the cutoff can replace gets one.",
+                                "additionalProperties": false,
+                                "required": ["setting", "cutoff", "move_past"],
+                                "properties": {
+                                    "setting": {"type": "string"},
+                                    "cutoff": {"type": "string"},
+                                    "move_past": {"type": "string"}
+                                }
+                            },
                             "how": {"type": "string", "description": "kind upgrade: what to run or change for this input, such as uv lock --upgrade-package NAME for a uv.lock, or the pin to write in a requirements file."},
                             "constraint": {
                                 "type": ["object", "null"],

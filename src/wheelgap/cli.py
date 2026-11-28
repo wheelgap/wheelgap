@@ -1985,13 +1985,21 @@ def release_lookups(
     elsewhere = origin.private_names(sources, simple_index=index_url)
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     asked: dict[str, list[Row]] = {}  # by canonical name: one lookup per package, however many rows it has
+    cutoffs: dict[str, list[datetime.datetime | None]] = {}  # uv's exclude-newer for each row of `asked` (#822)
     kept_in: dict[str, str] = {}
     skipped: dict[int, str] = {}
     for r in gaps:
         # Under --no-binary, pip uses no release's wheels, so a newer one with wheels wouldn't close the gap.
         if r.package.version and not r.package.no_binary and gap_targets(r, targets):
-            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url, private=elsewhere):
+            source = source_of[id(r.package)]
+            if origin.known_pypi(r.package, source, simple_index=index_url, private=elsewhere):
+                try:
+                    cutoff = fix.upload_cutoff(source, r.package)
+                except ValueError as e:  # a release uv can't pick mustn't be named: look nothing up
+                    skipped[id(r.package)] = f"the exclude-newer in {source.label}'s [options] can't be read ({e})"
+                    continue
                 asked.setdefault(r.package.key, []).append(r)
+                cutoffs.setdefault(r.package.key, []).append(cutoff)
             else:
                 kept_in.setdefault(r.package.key, r.package.name)
                 skipped[id(r.package)] = PRIVATE_WHY
@@ -2012,7 +2020,8 @@ def release_lookups(
                 for r in rows
             ]
             for key, rows in asked.items()
-        }
+        },
+        cutoffs=cutoffs,
     )
     if failed and not quiet:
         n = len(failed)

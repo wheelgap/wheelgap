@@ -810,7 +810,10 @@ Following the usual output, say how to fix each gap cell (a package on a target,
    with any `extra == ...` counted as holding since uv locks every extra, or a ranged requirement in a
    requirements file, `pyproject.toml`, script or the command line, as written, or a requirements file's `-c`
    constraints), it says whether the release is within it or the requirement needs relaxing; otherwise it says
-   nothing. A package whose targets need different releases (no one release has wheels for all of them) gets no pin:
+   nothing. With uv's `exclude-newer` (a uv.lock's `[options]`, or a `pyproject.toml`'s or script's own setting), only
+   files uploaded before the cutoff count, as uv sees them; when only a release uploaded after it has the wheel, the
+   line says `needs uv's exclude-newer moved past DATE` (when that release's last file was uploaded) and the
+   what-to-run lines start with moving it. A package whose targets need different releases (no one release has wheels for all of them) gets no pin:
    a line names each target's release instead. wheelgap doesn't resolve, so the rest of the dependencies must allow
    the release.
 2. **Gap wheel**: when no newer release has the wheel, an unofficial wheel of the pinned version from wheelgap's gap
