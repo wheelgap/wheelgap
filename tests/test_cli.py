@@ -6374,14 +6374,19 @@ def test_uv_lock_wrong_type_package_metadata_exits_2_with_json_error(
     lock = tmp_path / "uv.lock"
     lock.write_text(
         'version = 1\nrequires-python = ">=3.13"\n\n'
-        '[[package]]\nname = "proj"\nversion = "0.1.0"\nsource = { virtual = "." }\n' + metadata_toml,
+        '[[package]]\nname = "purewheel"\nversion = "3.1"\nsource = { registry = "https://pypi.org/simple" }\n\n'
+        '[[package]]\nname = "proj"\nversion = "0.1.0"\nsource = { virtual = "." }\n'
+        'dependencies = [{ name = "purewheel" }]\n' + metadata_toml,
         encoding="utf-8",
     )
 
-    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", "--offline")
-    assert code == 2 and not out
-    assert expected in err
-    assert "AttributeError" not in err
+    # Online, plain and with a selection: the lock is refused before anything is looked up.
+    for extra in ([], ["--all-extras"], ["--group", "dev"]):
+        code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", *extra)
+        assert code == 2 and not out
+        assert f"uv.lock: package proj: {expected}" in err
+        assert "AttributeError" not in err
+        assert fake_pypi == []
 
     code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--json")
     assert code == 2
