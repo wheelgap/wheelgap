@@ -971,7 +971,11 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
     sides: list[dict[str, diff.Package]] = []
     sources = []
     # As `wheelgap diff`: a Python a pdm.lock side's targets leave out isn't checked or compared.
-    pdm_skip = diff.pdm_not_covered([diff._pdm_lock_targets(Path(path)) for path in paths], targets)
+    pdm_skip = diff.pdm_not_covered(
+        [diff._pdm_lock_targets(Path(path)) for path in paths],
+        targets,
+        [diff._lock_python_range(Path(path)) for path in paths],
+    )
     checked = [t for t in targets if t not in pdm_skip]
     for path in paths:
         if not checked:

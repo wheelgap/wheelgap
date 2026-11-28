@@ -5264,7 +5264,9 @@ def test_poetry_1x_lock_without_its_pyproject_is_unknown_where_it_could_hide_a_g
     # --explain says why, and --ignore takes it like any other unknown.
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
     assert "colorama 0.4.6 on linux-x86_64: ? unknown\n  no dependency installs it here" in out
-    assert run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--ignore", "colorama")[0] == 0
+    for ignore in ("colorama", "colorama:linux-x86_64"):  # and the note doesn't name it then
+        code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--ignore", ignore)
+        assert code == 0 and "Poetry 1.x" not in err, err
 
 
 def test_poetry_1x_lock_without_its_pyproject_answers_the_rest(capsys, tmp_path, fake_pypi):

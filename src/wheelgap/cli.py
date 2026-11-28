@@ -3112,8 +3112,6 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
-    if not quiet and (roots_note := poetry_roots_note(sources, rows)):
-        print(f"wheelgap: note: {roots_note}", file=sys.stderr)
     if pyodide_lock:
         apply_bundled(rows, targets, pyodide_lock)
     rows.sort(key=lambda r: r.package.key)
@@ -3154,6 +3152,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     for r in rows:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
+    # After --ignore, so an ignored package (or package:target) isn't named.
+    if not quiet and (roots_note := poetry_roots_note(sources, rows)):
+        print(f"wheelgap: note: {roots_note}", file=sys.stderr)
     # A uv.lock checked with --online (sources.restore_uv_python_files): the answer is uv's, and pip's differs.
     pip_refusals = len({(r.package.key, r.package.version) for r in rows if r.package.pip_refuses})
     if pip_refusals and not quiet:

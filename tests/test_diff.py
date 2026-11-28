@@ -1262,3 +1262,26 @@ def test_diff_leaves_out_a_python_the_new_pdm_lock_targets_drop(fake_pypi, fixtu
     assert main([new, new, "-p", "3.12", "-p", "3.13", "-t", "linux-x86_64"]) == 0
     err = capsys.readouterr().err
     assert "the old lockfile's `pdm lock` targets are for Python ==3.13.* and the new lockfile's" in err
+
+
+def test_diff_dropped_python_names_the_other_kind_of_lock_range(fake_pypi, fixtures, tmp_path, capsys):
+    # A move between a uv.lock and a pdm.lock: the reason names the old side's own range, not "any".
+    pdm = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    for side, name, text in (
+        ("uv-old", "uv.lock", moved_lock("https://pypi.org/simple", ">=3.12")),
+        ("pdm", "pdm.lock", pdm),
+    ):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / name).write_text(text, encoding="utf-8")
+    uv_old, pdm_new = str(tmp_path / "uv-old" / "uv.lock"), str(tmp_path / "pdm" / "pdm.lock")
+    assert main([uv_old, pdm_new, "-p", "3.12", "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)["not_compared"]
+    assert entry["reason"] == (
+        "the new lockfile's `pdm lock` targets no longer take Python 3.12 (old: >=3.12, new: ==3.13.*)"
+    )
+    # And the other way: a pdm.lock replaced by a uv.lock locked for >=3.14.
+    (tmp_path / "uv-new").mkdir()
+    (tmp_path / "uv-new" / "uv.lock").write_text(moved_lock("https://pypi.org/simple"), encoding="utf-8")
+    assert main([pdm_new, str(tmp_path / "uv-new" / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)["not_compared"]
+    assert entry["reason"] == "the new lockfile no longer supports Python 3.13 (old: ==3.13.*, new: >=3.14)"

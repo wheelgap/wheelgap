@@ -1559,7 +1559,7 @@ def poetry_roots_reason(source: Source) -> str:
 
 def poetry_roots_note(sources: list[Source], rows: list[Row]) -> str | None:
     """The run's note for the packages poetry_roots_reason made UNKNOWN, naming at most five."""
-    names = list(dict.fromkeys(r.package.name for r in rows if r.unknown_reasons))
+    names = list(dict.fromkeys(r.package.name for r in rows if any(t not in r.ignored for t in r.unknown_reasons)))
     why = "; ".join(source.poetry_roots_unknown for source in sources if source.poetry_roots_unknown)
     if not names or not why:
         return None
