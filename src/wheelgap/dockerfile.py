@@ -2394,7 +2394,8 @@ _UV_HARMLESS_ENV = frozenset(
 )
 # The values uv takes for the settings above that take a fixed kind of value: a value outside it makes uv exit 2 on
 # the command that reads it (or, for a concurrency limit past the largest permit count, crash), so such a line is
-# refused. Each rule is (pattern, what uv takes, largest number or None). Checked against uv 0.13.7's parsers: a
+# refused, on a uv command only (pip doesn't read UV_ variables). Each rule is (pattern, what uv takes, largest number
+# or None). Checked against uv 0.13.7's parsers: a
 # "boolish" switch takes y, yes, t, true, on, 1 and their opposites, in any capitals; a link mode is one of four
 # lowercase words; UV_PYTHON_DOWNLOADS takes those words and 1 or 0 in any capitals; numbers take an optional "+"
 # (a leading zero is fine), the timeout is a u64, the retries a u32, and a concurrency limit is at most 2**61 - 1.
@@ -2419,6 +2420,12 @@ _UV_VALUES: dict[str, tuple[str, str, int | None]] = {
         (r"\+?0*[1-9][0-9]*", "a whole number from 1 to 2305843009213693951", 2**61 - 1),
     ),
 }
+# Read by uv's `uv pip` commands only (they are flags of those subcommands), so `uv sync` doesn't exit on a bad value.
+_UV_PIP_ONLY = frozenset(("UV_SYSTEM_PYTHON", "UV_BREAK_SYSTEM_PACKAGES"))
+# uv reads its number settings as unset when empty (parse_integer_environment_variable); its switches refuse "".
+_UV_EMPTY_UNSET = frozenset(
+    ("UV_HTTP_TIMEOUT", "UV_HTTP_RETRIES", "UV_CONCURRENT_DOWNLOADS", "UV_CONCURRENT_BUILDS", "UV_CONCURRENT_INSTALLS")
+)
 # Words that name a pip or uv configuration file: a command that isn't read and names one may be writing it.
 _CONFIG_WORDS = (
     "pip.conf",
@@ -2499,12 +2506,21 @@ def _uv_value_problem(name: str, value: str | None) -> str | None:
     """Why a value of a UV_ setting makes uv exit 2, as a message naming the setting, the value and the values uv
     takes; None when the value is one uv takes, when the setting has no rule, or when the value isn't known."""
     rule = _UV_VALUES.get(name)
-    if rule is None or value is None:
+    if rule is None or value is None or (value == "" and name in _UV_EMPTY_UNSET):
         return None
     pattern, takes, largest = rule
-    if re.fullmatch(pattern, value) and (largest is None or int(value) <= largest):
+    # The length first: int() refuses a string of more than 4300 digits.
+    digits = value.lstrip("+").lstrip("0")
+    if re.fullmatch(pattern, value) and (
+        largest is None or (len(digits) <= len(str(largest)) and int(digits or "0") <= largest)
+    ):
         return None
     return f"{name}={value} is not a value uv takes: {takes}"
+
+
+def _uv_reads(name: str, install: _Install) -> bool:
+    """Whether the uv command of `install` reads the UV_ setting `name` (pip reads none of them)."""
+    return install.uv and not (install.sync and name in _UV_PIP_ONLY)
 
 
 @dataclass
@@ -2823,7 +2839,8 @@ class _RunReader:
         cwd, cwd_error = workdir, workdir_error
         depth = 0  # inside if, for, while, until or { }
         risky_setting: str | None = None
-        risky_value: str | None = None  # a UV_ setting whose value uv refuses
+        risky_values: dict[str, str] = {}  # UV_ settings on this RUN whose values uv refuses, by name
+        uv_installs: list[_Install] = []  # the uv installs of this RUN, which read those settings
         project_environment = False  # UV_PROJECT_ENVIRONMENT set on this RUN, which a read `uv sync` refuses
         names_installer = False  # a pip or uv command, read or not
         exited: str | None = None  # an `exit` or `return` before the command: it may never run
@@ -2896,8 +2913,8 @@ class _RunReader:
             for name, value in assigns:
                 if _installer_setting(name):
                     risky_setting = name
-                if (problem := _uv_value_problem(name, value.text)) is not None:
-                    risky_value = problem
+                if (problem := _uv_value_problem(name, value.text if value.exact else None)) is not None:
+                    risky_values[name] = problem
                 if name == "UV_PROJECT_ENVIRONMENT":
                     project_environment = True
                 if name == "PATH":
@@ -2921,6 +2938,8 @@ class _RunReader:
             if kind in ("install", "installer-tools", "pip"):
                 names_installer = True
             if isinstance(detail, _Install):
+                if detail.uv:
+                    uv_installs.append(detail)
                 if detail.sync and project_environment:
                     stop(
                         "UV_PROJECT_ENVIRONMENT is set on this RUN, and `uv sync` may then install into an "
@@ -3023,8 +3042,10 @@ class _RunReader:
                         "config file"
                     )
                     break
-        if risky_value and names_installer:
-            stop(risky_value)
+        if problem := next(
+            (p for n, p in risky_values.items() if any(_uv_reads(n, install) for install in uv_installs)), None
+        ):
+            stop(problem)
         if risky_setting and names_installer:
             if risky_setting.endswith(":"):
                 stop(f"{risky_setting} a setting on this RUN may change what pip or uv installs")
@@ -4125,6 +4146,7 @@ def _dockerfile_requirements(
     reader = _RunReader(report, pythons, image_read, copies, dirs)
     env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
     uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
+    uv_value_errors: dict[str, str] = {}  # ENV and ARG UV_ settings whose values uv refuses, for a uv install
     arg_values: dict[str, bool] = {}  # the names in env that an ARG set, and whether --build-arg gave the value
     bash = False  # SHELL ["/bin/bash", "-c"]: `&>` is a redirect, not `&`
     env_names: set[str] = set()  # the names an ENV set
@@ -4388,6 +4410,8 @@ def _dockerfile_requirements(
             raise DockerfileError(reader.config_error)
         if install.uv and reader.uv_config_error:
             raise DockerfileError(reader.uv_config_error)
+        if error := next((e for n, e in uv_value_errors.items() if _uv_reads(n, install)), None):
+            raise DockerfileError(error)
         if install.sync:
             read_sync(install)
             return
@@ -4760,9 +4784,11 @@ def _dockerfile_requirements(
                     # The value is left out: an index URL may hold credentials.
                     run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
                 elif (problem := _uv_value_problem(name, value)) is not None:
-                    run_error = f"line {number}: {keyword} {problem}"
-                elif name == "UV_SYSTEM_PYTHON":
-                    uv_system = value is not None and value.lower() in ("1", "true")
+                    uv_value_errors[name] = f"line {number}: {keyword} {problem}"
+                else:
+                    uv_value_errors.pop(name, None)  # a later value uv takes replaces the refused one
+                    if name == "UV_SYSTEM_PYTHON":
+                        uv_system = value is not None and value.lower() in ("y", "yes", "t", "true", "on", "1")
         elif keyword == "RUN":
             if windows and not _PLAIN_ARGS_RE.fullmatch(_args_after_flags(args, "\\").strip()):
                 raise DockerfileError(

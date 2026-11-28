@@ -5426,28 +5426,80 @@ _UV_VALUE_CASES = [
 ]
 
 
+_UV = "COPY --from=ghcr.io/astral-sh/uv:0.9.1 /uv /uvx /bin/\n"
+_UV_PIP = "uv pip install --system -r requirements.txt"
+_UV_VALUE_FORMS = ["ENV {0}={1}", "ENV {0} {1}", "ARG {0}={1}", "ENV A=1 {0}={1} B=2"]
+
+
 @pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
-@pytest.mark.parametrize("form", ["ENV {0}={1}", "ENV {0} {1}", "ARG {0}={1}", "ENV A=1 {0}={1} B=2"])
+@pytest.mark.parametrize("form", _UV_VALUE_FORMS)
 def test_dockerfile_requirements_reads_uv_settings_with_a_value_uv_takes(tmp_path, name, good, bad, form):
-    lines, report = _inputs(tmp_path, form.format(name, good) + "\n" + _INSTALL)
-    assert lines == [5]
+    lines, report = _inputs(tmp_path, _UV + form.format(name, good) + f"\nRUN {_UV_PIP}\n")
+    assert lines == [6]
     assert report.notes == []
+    lines, report = _inputs(tmp_path, _UV + f"RUN {name}={good} {_UV_PIP}\n")
+    assert lines == [5]
 
 
 @pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
 @pytest.mark.parametrize(
     ("body", "keyword"),
-    [
-        ("ENV {0}={1}\n" + _INSTALL, "ENV "),
-        ("ENV {0} {1}\n" + _INSTALL, "ENV "),
-        ("ARG {0}={1}\n" + _INSTALL, "ARG "),
-        ("ENV A=1 {0}={1} B=2\n" + _INSTALL, "ENV "),
-        ("RUN {0}={1} pip install -r requirements.txt\n", ""),
-    ],
+    [*((form + f"\nRUN {_UV_PIP}\n", form[:4]) for form in _UV_VALUE_FORMS), ("RUN {0}={1} " + _UV_PIP + "\n", "")],
 )
 def test_dockerfile_requirements_refuses_uv_settings_with_a_value_uv_refuses(tmp_path, name, good, bad, body, keyword):
-    with pytest.raises(DockerfileError, match=f":4: {keyword}{re.escape(f'{name}={bad} is not a value uv takes: ')}"):
-        _inputs(tmp_path, body.format(name, bad))
+    with pytest.raises(DockerfileError, match=f":5: {keyword}{re.escape(f'{name}={bad} is not a value uv takes: ')}"):
+        _inputs(tmp_path, _UV + body.format(name, bad))
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+def test_dockerfile_requirements_reads_pip_installs_whatever_the_uv_settings(tmp_path, name, good, bad):
+    # pip doesn't read UV_ variables: a value uv refuses doesn't stop a pip install.
+    assert _inputs(tmp_path, f"ENV {name}={bad}\n" + _INSTALL)[0] == [5]
+    assert _inputs(tmp_path, f"RUN {name}={bad} pip install -r requirements.txt\n")[0] == [4]
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        # A value wheelgap can't resolve isn't known to be one uv refuses.
+        (f"RUN UV_HTTP_TIMEOUT=$TIMEOUT {_UV_PIP}\n", None),
+        (f"ENV UV_LINK_MODE=$MODE\nRUN {_UV_PIP}\n", None),
+        # uv reads an empty number setting as unset, but refuses an empty switch.
+        (f"ENV UV_HTTP_TIMEOUT=\nRUN {_UV_PIP}\n", None),
+        (f"ENV UV_NO_CACHE=\nRUN {_UV_PIP}\n", ":5: ENV UV_NO_CACHE= is not a value uv takes"),
+        # A later value uv takes replaces the refused one.
+        (f"ENV UV_LINK_MODE=bogus\nENV UV_LINK_MODE=copy\nRUN {_UV_PIP}\n", None),
+        # Too many digits for int() is still a refusal, not a crash.
+        (f"ENV UV_HTTP_TIMEOUT={'9' * 5000}\nRUN {_UV_PIP}\n", ":5: ENV UV_HTTP_TIMEOUT=9+ is not a value uv takes"),
+        (f"ENV UV_HTTP_TIMEOUT=+{'0' * 5000}30\nRUN {_UV_PIP}\n", None),
+    ],
+)
+def test_dockerfile_requirements_reads_uv_setting_values_edges(tmp_path, body, error):
+    if error is None:
+        assert _inputs(tmp_path, _UV + body)[0] == [3 + (_UV + body).count("\n")]
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            _inputs(tmp_path, _UV + body)
+
+
+@pytest.mark.parametrize(
+    ("setting", "error"),
+    [
+        ("UV_SYSTEM_PYTHON=maybe", None),  # a `uv pip` flag: uv sync doesn't read it
+        ("UV_BREAK_SYSTEM_PACKAGES=maybe", None),
+        ("UV_LINK_MODE=bogus", ":3: ENV UV_LINK_MODE=bogus is not a value uv takes"),
+        ("UV_NO_EDITABLE=x", ":3: ENV UV_NO_EDITABLE=x is not a value uv takes"),
+    ],
+)
+def test_dockerfile_inputs_uv_sync_refuses_only_uv_settings_it_reads(tmp_path, setting, error):
+    dockerfile = (
+        f"FROM python:3.13\nWORKDIR /app\nENV {setting}\nCOPY uv.lock pyproject.toml ./\nRUN uv sync --locked\n"
+    )
+    if error is None:
+        assert _sync_inputs(tmp_path, dockerfile)[0] == [(5, tmp_path / "uv.lock")]
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            _sync_inputs(tmp_path, dockerfile)
 
 
 _RISKY = (
@@ -5515,6 +5567,8 @@ def test_env_pairs_follow_buildkit():
     [
         ("ENV UV_SYSTEM_PYTHON=1", "uv pip install -r requirements.txt", None),
         ("ENV UV_SYSTEM_PYTHON=true", "uv pip install --no-cache -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=yes", "uv pip install -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=On", "uv pip install -r requirements.txt", None),
         ("ENV UV_SYSTEM_PYTHON=0", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
         ("ENV UV_SYSTEM_PYTHON=$X", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
         (
