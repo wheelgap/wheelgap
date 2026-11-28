@@ -2866,6 +2866,10 @@ def test_diff_lockfiles_leaves_out_a_python_the_locks_arent_made_for(fake_pypi, 
     assert data["ok"] is True
     assert data["not_compared"] == expected["not_compared"]
     assert [e["target"] for e in data["not_compared"]] == ["3.13 linux-x86_64"]
+    (tool,) = [t for t in mcp.TOOLS if t["name"] == "diff_lockfiles"]
+    assert (
+        "when ok is true, check not_compared too, since sides ['new'] means the change dropped" in tool["description"]
+    )
 
 
 def test_diff_lockfiles_identical_files_are_ok(fake_pypi, tmp_path):
