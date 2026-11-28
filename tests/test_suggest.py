@@ -31,7 +31,10 @@ def wheel(version, tag="py3-none-any", **metadata):
         ({"1.1": [wheel("1.1", "cp313-cp313-win_amd64", yanked=True), wheel("1.1")]}, "1.0", "1.1"),
         ({"1.1rc1": [wheel("1.1rc1")]}, "1.0", None),
         ({"1.1.dev1": [wheel("1.1.dev1")], "1.1": [wheel("1.1")]}, "1.0", "1.1"),
-        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [wheel("1.1")]}, "1.1rc1", "1.1rc2"),
+        # A pre-release pin: a final release first (#825), a pre-release only when no final release has the wheel.
+        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [wheel("1.1")]}, "1.1rc1", "1.1"),
+        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [{"filename": "demo-1.1.tar.gz"}]}, "1.1rc1", "1.1rc2"),
+        ({"2.0a1": [wheel("2.0a1")], "2.0": [wheel("2.0")], "1.2": [{"filename": "demo-1.2.tar.gz"}]}, "1.1rc1", "2.0"),
         ({"1.1": [wheel("1.1")]}, "1.1rc1", "1.1"),
         ({"1.1.dev2": [wheel("1.1.dev2")]}, "1.1.dev1", "1.1.dev2"),
         ({"1.0": [wheel("1.0")], "0.9": [wheel("0.9")]}, "1.0", None),
@@ -153,6 +156,45 @@ def test_suggest_keeps_pre_releases_for_a_pre_release_pin():
     assert suggest.suggest({"2.0rc1": [wheel("2.0rc1")], "2.0rc2": [wheel("2.0rc2")]}, "2.0rc1", targets).found == {
         targets[0]: "2.0rc2"
     }
+
+
+LIN312 = "cp312-cp312-manylinux_2_17_x86_64"
+RISCV312 = "cp312-cp312-linux_riscv64"
+
+
+@pytest.mark.parametrize(
+    "releases,expected",
+    [
+        # greenlet 2.0.0rc5 -> 3.0.0a1 although 3.0.0 has the wheel (#825): one final release for every target wins.
+        (
+            {"3.0.0a1": [LIN312, RISCV312], "3.0.0": [LIN312, RISCV312], "3.0.1": [LIN312, RISCV312]},
+            {"linux-x86_64": "3.0.0", "linux-riscv64": "3.0.0"},
+        ),
+        # No final release has the riscv64 wheel, but 3.0.0a1 has both: one pin, the pre-release, not a split.
+        ({"3.0.0a1": [LIN312, RISCV312], "3.0.0": [LIN312]}, {"linux-x86_64": "3.0.0a1", "linux-riscv64": "3.0.0a1"}),
+        # No one release has both: a final release where one fits, and a pre-release for the rest.
+        ({"3.0.0a1": [RISCV312], "3.0.0": [LIN312]}, {"linux-x86_64": "3.0.0", "linux-riscv64": "3.0.0a1"}),
+        # Only a pre-release fits one target, and nothing fits the other: that pre-release alone.
+        ({"3.0.0a1": [LIN312], "3.0.0": []}, {"linux-x86_64": "3.0.0a1"}),
+    ],
+)
+def test_suggest_prefers_one_final_release_then_one_pre_release_then_a_split(releases, expected):
+    linux, riscv = build_targets(["3.12"], ["linux-x86_64", "linux-riscv64"])
+    releases = {v: [wheel(v, tag) for tag in tags] for v, tags in releases.items()}
+    releases["2.0.0rc5"] = releases["2.0.0"] = [{"filename": "demo-2.0.0.tar.gz"}]
+    found = suggest.suggest(releases, "2.0.0rc5", [linux, riscv]).found
+    assert {t.platform: v for t, v in found.items()} == expected
+
+
+def test_suggest_labels_a_pre_release():
+    linux, riscv = build_targets(["3.12"], ["linux-x86_64", "linux-riscv64"])
+    found = {linux: "3.0.0", riscv: "3.0.0a1"}
+    assert suggest.suggest_lines("demo", "2.0.0rc5", [linux, riscv], suggest.Suggestion(found), False) == [
+        "demo 2.0.0rc5 -> 3.0.0a1 (a pre-release) has wheels for linux-riscv64",
+        "demo 2.0.0rc5 -> 3.0.0 has wheels for linux-x86_64",
+    ]
+    releases = {"3.0.0a1": [wheel("3.0.0a1", LIN312)], "3.0.0": [wheel("3.0.0", LIN312)]}
+    assert suggest.suggest(releases, "2.0.0", [linux]).found == {linux: "3.0.0"}  # a final pin, as before
 
 
 def test_a_release_must_keep_the_wheels_the_row_has():
@@ -455,3 +497,44 @@ def test_text_and_json_name_the_last_release_with_a_wheel(capsys, fake_pypi, mon
     _assert_matches_output_schema(json.loads(data))
     assert pkgs["wheelstopped"]["suggest"] == {} and pkgs["wheelstopped"]["last_with_wheel"] == {"win-arm64": "1.1"}
     assert pkgs["laggard"]["last_with_wheel"] == {}
+
+
+def _at(version, tag, uploaded):
+    return wheel(version, tag, upload_time_iso_8601=uploaded)
+
+
+def test_suggest_applies_uvs_exclude_newer_cutoff():
+    # numpy 2.1.0 has the cp313 wheel but was uploaded after exclude-newer: uv lock can't pick it (#822).
+    from datetime import UTC, datetime
+
+    (linux,) = build_targets(["3.13"], ["linux-x86_64"])
+    lin = "cp313-cp313-manylinux_2_17_x86_64"
+    releases = {
+        "1.0": [_at("1.0", "cp312-cp312-manylinux_2_17_x86_64", "2024-01-01T00:00:00Z")],
+        "1.1": [_at("1.1", "cp312-cp312-manylinux_2_17_x86_64", "2024-07-01T00:00:00Z")],
+        "2.0": [_at("2.0", lin, "2024-08-10T00:00:00Z"), _at("2.0", "py3-none-any", "2024-08-20T00:00:00Z")],
+        "2.1": [_at("2.1", lin, "2024-09-01T00:00:00Z")],
+    }
+    cutoff = datetime(2024, 8, 1, tzinfo=UTC)
+    assert suggest.suggest(releases, "1.0", [linux]).found == {linux: "2.0"}  # no cutoff: as before
+    found = suggest.suggest(releases, "1.0", [linux], cutoff=cutoff)
+    # 2.0 is the nearest past the cutoff; the cutoff must pass its last file, uploaded on 2024-08-20.
+    assert found.found == {} and found.cutoff == cutoff
+    assert found.beyond == {linux: ("2.0", datetime(2024, 8, 20, tzinfo=UTC))}
+    assert suggest.suggest_lines("demo", "1.0", [linux], found, False) == [
+        "demo 1.0 -> 2.0 has wheels for linux-x86_64, but uv's exclude-newer (2024-08-01T00:00:00Z) leaves it out: "
+        "it needs moving past 2024-08-20T00:00:00Z"
+    ]
+    # Within the cutoff, its own release wins; a file uploaded after it doesn't count, the earlier ones do.
+    later = suggest.suggest(releases, "1.0", [linux], cutoff=datetime(2024, 8, 15, tzinfo=UTC))
+    assert later.found == {linux: "2.0"} and later.beyond == {}
+
+
+def test_suggest_with_a_cutoff_skips_a_release_of_unknown_age():
+    from datetime import UTC, datetime
+
+    (linux,) = build_targets(["3.13"], ["linux-x86_64"])
+    releases = {"1.0": [{"filename": "demo-1.0.tar.gz", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}]}
+    releases["1.1"] = [wheel("1.1")]  # no upload time: its age is unknown, so it's never named as within the cutoff
+    found = suggest.suggest(releases, "1.0", [linux], cutoff=datetime(2024, 8, 1, tzinfo=UTC))
+    assert found.found == {} and found.beyond == {}

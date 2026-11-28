@@ -276,6 +276,7 @@ without `inputs`, are tool errors.
 | `glibc` | string | `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
 | `musl` | string | `1.2` | musl version for `musl-*` (Alpine) targets. |
 | `macos` | string | `14.0` | Oldest macOS version to support. |
+| `build_info` | boolean | `false` | Also return `build_packages` for each package: download its sdist from PyPI (as `--build-info` does) and say, for each Linux target it builds from source on, which distro packages its build needs (`distro`, `command` such as `apk add --no-cache build-base`, `packages`, `needs`, `distro_python`), as `--fix --build-info` does for a gap with no fix. These are build tools only: libraries the package links against (e.g. libxml2 and libxslt for lxml) aren't named, and `notes` says so. With another index (`WHEELGAP_INDEX_URL`), nothing is downloaded and a note says why `build_packages` is empty. |
 
 #### `suggest_targets`
 

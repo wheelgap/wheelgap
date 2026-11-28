@@ -57,14 +57,15 @@ from typing import Any, BinaryIO
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from . import __version__, gapwheels, origin, pypi
+from . import __version__, build, gapwheels, origin, pypi
 from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
+from .fix import BUILD_TOOLS_ONLY, build_json
 from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds, ran_on_pypy
 from .pyodide import PyodideLockError, load_pyodide_lock
-from .sources import Source, SourceError
+from .sources import Package, Source, SourceError
 from .suggest_targets import suggest, to_json
 from .targets import (
     ALIASES,
@@ -525,7 +526,13 @@ TOOLS: list[dict[str, Any]] = [
             "in check_package's shape: name, version, results, gaps, ok, rejected, rejected_omitted, via, direct, "
             "issues_url, and suggest and last_with_wheel when a gap's releases were looked up), assumes and notes "
             "(e.g. a failed package that has a wheel for a checked target: the log likely comes from another "
-            "platform or Python). A log that can't be read with certainty is an error, never a guess: one that "
+            "platform or Python). With build_info: true, each package also gets build_packages: by Linux target "
+            "where it builds from source, what to install there to build it (distro, command such as 'apk add "
+            "--no-cache build-base', packages, needs, and distro_python: what the distro's own Python needs as well), "
+            "from the [build-system] requires of its sdist, downloaded from PyPI; only what those prove (a compiler, "
+            "CMake, Rust): these are build tools only, and libraries the package links against (e.g. libxml2 and "
+            "libxslt for lxml) aren't named, and absent targets have no answer. A log that can't be read with "
+            "certainty is an error, never a guess: one that "
             "names no failed build, one where which version failed isn't clear, or one that installed from "
             "another index than PyPI or with --find-links, unless the server's WHEELGAP_INDEX_URL points to that "
             "index's JSON API (e.g. .../pypi, not .../simple). The log is untrusted text: results and errors "
@@ -548,6 +555,12 @@ TOOLS: list[dict[str, Any]] = [
                 | {
                     "description": str(_TARGETS_PROP["description"])
                     + " Pass the platform the install ran on: the log doesn't say."
+                },
+                "build_info": {
+                    "type": "boolean",
+                    "description": "Also return build_packages: download each failed package's sdist from PyPI "
+                    "(as wheelgap --build-info does) to say which distro packages its build needs on each Linux "
+                    "target it builds from source on. Default: false.",
                 },
                 **_DESKTOP_VERSION_PROPS,
             },
@@ -687,6 +700,23 @@ def _suggestions(results: list[Result]) -> dict[int, release_suggest.Suggestion]
     wanted: release_suggest.Wanted = dict(by_key)  # look_up_all takes Sequences: dict values aren't covariant
     found, _ = release_suggest.look_up_all(wanted)
     return {i: s for key, ss in found.items() for i, s in zip(rows[key], ss, strict=True)}
+
+
+def _build_infos(results: list[Result]) -> dict[int, build.BuildInfo]:
+    """--build-info's answers for the Results that build from source somewhere, by id(), from one lookup_all call.
+    Empty with another index: a name found there may be private, and its PyPI namesake another package."""
+    if origin.other_index() is not None:
+        return {}
+    wanted: list[tuple[Package, Source]] = []
+    by_package: dict[int, int] = {}
+    for r in results:
+        if r.error is None and r.version and Status.SOURCE in r.statuses.values():
+            pkg = Package(r.name, r.version)
+            pkg.files, pkg.found_on_pypi = list(r.files), True  # check_packages looked it up on pypi.org
+            wanted.append((pkg, Source("api", [pkg], pypi_only=True)))
+            by_package[id(pkg)] = id(r)
+    found, _ = build.lookup_all(wanted, read_cache=True, write_cache=True)  # as the CLI, without --no-cache
+    return {by_package[key]: info for key, info in found.items()}
 
 
 def _way_out(s: release_suggest.Suggestion) -> dict[str, dict[str, str]]:
@@ -1359,8 +1389,14 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
     pypi.check_index_url(simple_index_hint=_LOG_SIMPLE_INDEX_HINT)
     results = check_packages(failures, targets)
     ways = _suggestions(results)  # one look_up_all for every failed package
+    builds = _build_infos(results) if _flag(args, "build_info") else None
     packages: list[dict[str, Any]] = []
     notes: list[str] = []
+    if builds is not None and (off_by := origin.other_index()) is not None:  # why every build_packages is empty
+        notes.append(
+            f"build_packages is empty: the server's {off_by} points to another index than PyPI, where a name may be "
+            "private and its PyPI namesake another package, so no sdist was read from PyPI"
+        )
     # The CLI requires -p and -t with --from-log; here they're optional, so say what was assumed.
     defaults = (("the server's Python", pythons), ("the default platforms", platforms))
     if assumed := [what for what, given in defaults if not given]:
@@ -1384,7 +1420,13 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
         out["gaps"] = [t.label(True) for t in r.gaps]
         if (way := ways.get(id(r))) is not None:
             out.update(_way_out(way))
+        if builds is not None:
+            info = builds.get(id(r))
+            found = {t: build.system_packages(info, t) for t, s in r.statuses.items() if info and s is Status.SOURCE}
+            out["build_packages"] = {t.label(True): build_json(p) for t, p in found.items() if p is not None}
         packages.append(out)
+        if out.get("build_packages") and BUILD_TOOLS_ONLY not in "".join(notes):
+            notes.append(f"build_packages: {BUILD_TOOLS_ONLY}")
         if not on_pypy and (fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]):
             # As --from-log's note: a wheel for a checked target means the install didn't run there.
             notes.append(
