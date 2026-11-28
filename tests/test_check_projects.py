@@ -718,8 +718,10 @@ def test_report_counts_target_level_cells_for_no_referee_inputs(capsys):
     versions = {"uv": "uv", "pip": "pip", "wheelgap": "0", "wheelgap_commit": "abc", "checkout_head": "def"}
     assert script.report(cells, versions, 1.0) == 0
     out = capsys.readouterr().out
-    assert "0 cells: 0 compared, 0 agree, 0 disagree (n/a agree), 0 not compared; " \
+    assert (
+        "0 cells: 0 compared, 0 agree, 0 disagree (n/a agree), 0 not compared; "
         "3 target-level cells outside the rate (3 not compared)." in out
+    )
     assert "Not compared, by reason:" in out
     assert f"       3  {why}" in out
 
