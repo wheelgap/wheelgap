@@ -683,7 +683,7 @@ def _pdm_target_platform(target: Target) -> tuple[str, tuple[int, int] | None, s
     return None if version is None else (family, version, _PDM_ARCHES.get(arch, arch))
 
 
-def _pdm_python_value(requires: str, target: Target) -> bool | None:
+def pdm_python_value(requires: str, target: Target) -> bool | None:
     """Whether a lock target's requires_python takes the target's Python, at every patch release (True), at none
     (False), or at some only (None), probing as _evaluate_atom does for python_full_version."""
     if not requires.strip():
@@ -718,7 +718,7 @@ def pdm_target_value(entry: dict, target: Target) -> bool | None:
     """
     if set(entry) - {"requires_python", "platform", "implementation", "gil_disabled"} or "requires_python" not in entry:
         return None  # PDM 2.29 can't read it either (EnvSpec.from_spec(**entry))
-    values = {_pdm_python_value(entry["requires_python"], target)}
+    values = {pdm_python_value(entry["requires_python"], target)}
     implementation, gil_disabled = entry.get("implementation"), entry.get("gil_disabled", False)
     if implementation:  # wheelgap's targets are CPython
         if implementation not in ("cpython", "pypy", "pyston") or (gil_disabled and implementation != "cpython"):

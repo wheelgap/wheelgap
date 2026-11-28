@@ -698,3 +698,123 @@ def test_diff_fix_for_a_bumped_requirements_pin_from_git(fake_pypi, gap_wheels, 
     assert cli_main(["requirements.txt", *args[:-2], "--fix", "--json"]) == 1
     main = json.loads(capsys.readouterr().out)["packages"][0]["fix"]["linux-x86_64"]
     assert got == main and got["kind"] == "upgrade" and got["version"] == "1.6.0"
+
+
+def moved_lock(registry: str) -> str:
+    """A uv.lock like jumpserver/jumpserver#17168's (#807): locked for Python 3.14 and newer, its package from
+    `registry`."""
+    return (
+        'version = 1\nrevision = 3\nrequires-python = ">=3.14"\n\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\nsource = { editable = "." }\n'
+        'dependencies = [\n    { name = "fastlib" },\n]\n\n'
+        f'[[package]]\nname = "fastlib"\nversion = "2.0.0"\nsource = {{ registry = "{registry}" }}\n'
+        'sdist = { url = "https://files.example/fastlib-2.0.0.tar.gz", hash = "sha256:00", size = 1 }\n'
+        'wheels = [\n    { url = "https://files.example/fastlib-2.0.0-cp314-cp314-manylinux_2_17_x86_64.whl", '
+        'hash = "sha256:01", size = 1 },\n]\n'
+    )
+
+
+def test_a_python_the_lock_leaves_out_is_a_note_not_a_failure(fake_pypi, capsys, tmp_path):
+    """#807, through the Action's path: diff --json, then the report. The base lock is PyPI's and the head moved its
+    package to a mirror; both are locked for 3.14+, so 3.13 isn't compared and the step passes with a note."""
+    for side, registry in (("base", "https://pypi.org/simple"), ("head", "https://mirrors.example/pypi/simple")):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / "uv.lock").write_text(moved_lock(registry), encoding="utf-8")
+    argv = [str(tmp_path / "base" / "uv.lock"), str(tmp_path / "head" / "uv.lock"), "-p", "3.13", "-p", "3.14"]
+    code = diff_main([*argv, "-t", "linux-x86_64", "--json"])
+    assert code == 0
+    (tmp_path / "diff.json").write_text(capsys.readouterr().out, encoding="utf-8")
+    md, body = tmp_path / "report.md", tmp_path / "comment.md"
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", str(code), "--lockfile", "uv.lock"]
+    argv += ["--base", "main", "--markdown", str(md), "--comment-markdown", str(body)]
+    assert ac.main(argv) == 0
+    assert capsys.readouterr().out == (
+        "wheelgap: Nothing got worse on the compared targets. 1 target not compared. The job summary has the details.\n"
+    )
+    for text in (md.read_text(encoding="utf-8"), body.read_text(encoding="utf-8")):
+        assert "Nothing got worse on the compared targets.</p>" in text and "<table>" not in text
+        assert "drops" not in text
+        assert (
+            "<p>Not compared: <code>3&#46;13 linux-x86&#95;64</code>. <code>both lockfiles are locked for Python "
+            "&#62;&#61;3&#46;14&#44; which leaves out Python 3&#46;13</code>: a lock isn't made for a Python outside "
+            "its requires-python, so nothing there counts as worse.</p>"
+        ) in text
+
+
+def test_every_target_left_out_says_nothing_was_compared(tmp_path, capsys):
+    data = diff_report()
+    data["targets"] = [{"label": "linux-x86_64", "python": "3.13", "platform": "linux-x86_64"}]
+    data["not_compared"] = [{"target": "linux-x86_64", "sides": ["new"], "reason": "the new lockfile is locked"}]
+    text = ac.report(data, "", "uv.lock", "main")
+    assert "Nothing was compared.</p>" in text and "Nothing got worse" not in text
+    data["not_compared"] = []
+    assert "Nothing got worse.</p>" in ac.report(data, "", "uv.lock", "main")
+
+
+def test_a_python_the_change_dropped_leads_the_report_and_warns_in_the_log(fake_pypi, capsys, tmp_path):
+    """Only the head lock leaves 3.13 out: the pull request dropped it. Still exit 0 (nothing worse or new), but the
+    summary and comment lead with it and the log gets a ::warning:: line."""
+    for side, requires in (("base", ">=3.12"), ("head", ">=3.14")):
+        (tmp_path / side).mkdir()
+        lock = moved_lock("https://pypi.org/simple").replace('">=3.14"', f'"{requires}"')
+        (tmp_path / side / "uv.lock").write_text(lock, encoding="utf-8")
+    argv = [str(tmp_path / "base" / "uv.lock"), str(tmp_path / "head" / "uv.lock"), "-p", "3.13", "-p", "3.14"]
+    code = diff_main([*argv, "-t", "linux-x86_64", "--json"])
+    assert code == 0
+    (tmp_path / "diff.json").write_text(capsys.readouterr().out, encoding="utf-8")
+    md, body = tmp_path / "report.md", tmp_path / "comment.md"
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", str(code), "--lockfile", "uv.lock"]
+    argv += ["--base", "main", "--markdown", str(md), "--comment-markdown", str(body)]
+    assert ac.main(argv) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "wheelgap: Nothing got worse on the compared targets. 1 target not compared. The job summary has the details.",
+        "::warning::wheelgap: This change drops Python 3.13 support: the new lockfile's requires-python leaves it "
+        "out. The job summary has the details.",
+    ]
+    for text in (md.read_text(encoding="utf-8"), body.read_text(encoding="utf-8")):
+        lines = text.splitlines()
+        at = lines.index(next(line for line in lines if "Nothing got worse on the compared targets." in line))
+        assert lines[at + 2] == (
+            "<p><b>This change drops Python 3&#46;13 support.</b> <code>the new lockfile no longer supports Python "
+            "3&#46;13 &#40;old&#58; &#62;&#61;3&#46;12&#44; new&#58; &#62;&#61;3&#46;14&#41;</code>, so installing the "
+            "new lock there now fails. Not compared: <code>3&#46;13 linux-x86&#95;64</code>; the drop doesn't count "
+            "as worse.</p>"
+        )
+
+
+def test_the_drop_warning_names_only_a_real_version(tmp_path, capsys):
+    data = diff_report()
+    hostile = "3.13\n::error::owned"
+    data["not_compared"] = [{"target": "x", "sides": ["new"], "python": hostile, "reason": "r"}]
+    (tmp_path / "diff.json").write_text(json.dumps(data), encoding="utf-8")
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", "0", "--lockfile", "uv.lock"]
+    assert ac.main([*argv, "--base", "main", "--markdown", str(tmp_path / "r.md")]) == 0
+    log = capsys.readouterr().out.splitlines()
+    assert log[-1] == (
+        "::warning::wheelgap: This change drops a target Python support: the new lockfile's requires-python leaves it "
+        "out. The job summary has the details."
+    )
+    assert not any(line.startswith("::error") for line in log)
+    assert "This change drops Python 3&#46;13&#92;&#117;&#48;&#48;&#48;&#97;&#58;&#58;error" in (
+        tmp_path / "r.md"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "not_compared",
+    [
+        "3.13",
+        [["3.13"]],
+        [{"target": ["x"], "reason": "r"}],
+        [{"target": "3.13"}],
+        [{"target": "x", "reason": "r", "python": 3.13}],
+        [{"target": "x", "reason": "r", "sides": "new"}],
+    ],
+)
+def test_a_malformed_not_compared_is_never_a_pass(tmp_path, capsys, not_compared):
+    data = diff_report()
+    data["not_compared"] = not_compared
+    (tmp_path / "diff.json").write_text(json.dumps(data), encoding="utf-8")
+    argv = ["report", "--diff-json", str(tmp_path / "diff.json"), "--exit-code", "0", "--lockfile", "uv.lock"]
+    assert ac.main([*argv, "--base", "main", "--markdown", str(tmp_path / "r.md")]) == 2
+    assert "printed something other than its report" in (tmp_path / "r.md").read_text(encoding="utf-8")
