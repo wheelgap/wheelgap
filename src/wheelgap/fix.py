@@ -262,6 +262,29 @@ def _hashed(cells: list[Cell]) -> bool:
     return any(c.row.package.hashes for c in cells)
 
 
+def _export_command(source: Source) -> str | None:
+    """The export command a requirements file records in its header, when it has one (#824).
+
+    `uv export`, `poetry export` and `pdm export` write the command that made the file into its first lines. Those
+    files are regenerated from a lock, not edited or pip-compiled: telling the reader to run `pip-compile` gives a
+    command that fails (there is no .in file).
+    """
+    path = source.path
+    if path is None:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[:10]
+    except (OSError, UnicodeError):
+        return None
+    for line in lines:
+        if not line.lstrip().startswith("#"):
+            continue
+        text = line.lstrip("# \t")
+        if any(f"{tool} export" in text for tool in ("uv", "poetry", "pdm")):
+            return text
+    return None
+
+
 def how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) -> list[str]:
     """What to run or change to move `source`'s packages to the releases of these upgrade cells, one line each."""
     pins = _pins(cells)
@@ -293,6 +316,18 @@ def how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) 
             "(widen the constraint if not), then run wheelgap again."
         ]
     if kind == "requirements" and _hashed(cells):
+        exported = _export_command(source)
+        if exported is not None:
+            if "uv export" in exported:
+                names = dict.fromkeys(c.row.package.name for c in cells)
+                update = f"uv lock {' '.join(f'--upgrade-package {n}' for n in names)}"
+            else:
+                tool = "poetry" if "poetry export" in exported else "pdm"
+                update = f"{tool} update {' '.join(dict.fromkeys(c.row.package.name for c in cells))}"
+            return [
+                f"{label} pins hashes and was made by {code(exported)}, so upgrade in its lock with "
+                f"{code(update)}, then re-run the export command at the top of {label}."
+            ]
         return [
             f"{label} pins hashes, so instead of editing the pins to {', '.join(map(code, pins))}, regenerate it: "
             f"{code(f'pip-compile {options}')}, or {code(f'uv pip compile {options}')} with the options you made it "
