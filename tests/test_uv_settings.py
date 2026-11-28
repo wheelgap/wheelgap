@@ -1,4 +1,4 @@
-"""The uv settings uv applies to a pyproject.toml, a script and a uv.lock (#811, #812).
+"""The uv settings and [tool.uv.sources] uv applies to a pyproject.toml, a script and a uv.lock (#810, #811, #812).
 
 Each expectation was checked against uv 0.13.1 (`uv lock`, `uv sync -v`, `uv run -v`) with public packages."""
 
@@ -8,7 +8,7 @@ import pytest
 
 from wheelgap.cli import main
 from wheelgap.dockerfile import DockerfileError, dockerfile_requirements
-from wheelgap.sources import SourceError, load_inputs
+from wheelgap.sources import SourceError, load_inputs, select_pyproject_extras, select_pyproject_groups
 
 _PYPI = "https://pypi.org/simple"
 _FILES = "https://files.pythonhosted.org/packages"
@@ -208,3 +208,159 @@ def test_deps_refuses_build_restrictions_it_cant_apply_to_dependencies(tmp_path,
     (tmp_path / name).write_text(text, encoding="utf-8")
     assert main([str(tmp_path / name), "-p", "3.13", "-t", "linux-x86_64", "--deps"]) == 2
     assert "[tool.uv] no-build, which uv applies to the dependencies it resolves too" in capsys.readouterr().err
+
+
+# #810: [tool.uv.sources] for pyproject.toml and script inputs.
+
+
+def test_pyproject_sources_from_the_issue_are_not_checked_on_pypi(tmp_path, capsys, fake_pypi):
+    # uv builds markupsafe from git and takes torch from download.pytorch.org: PyPI's files answer for neither.
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            ["markupsafe", "torch==2.5.1"],
+            '[tool.uv.sources]\nmarkupsafe = { git = "https://github.com/pallets/markupsafe", tag = "3.0.2" }\n'
+            'torch = { index = "pytorch-cpu" }\n\n'
+            '[[tool.uv.index]]\nname = "pytorch-cpu"\nurl = "https://download.pytorch.org/whl/cpu"\nexplicit = true\n',
+        ),
+        encoding="utf-8",
+    )
+    code, statuses, skipped = _results(capsys, tmp_path / "pyproject.toml")
+    assert statuses == {}
+    assert skipped == {"markupsafe": "git", "torch": "private index"}
+    assert fake_pypi == []
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    ("source", "skip"),
+    [
+        ('{ git = "https://github.com/benjaminp/six", tag = "1.17.0" }', "git"),
+        ('{ url = "https://files.example/fastlib-2.0.0.tar.gz" }', "url"),
+        ('{ path = "../fastlib" }', "path"),
+        ('{ path = "../fastlib", editable = true }', "editable"),
+        ("{ workspace = true }", "workspace"),
+    ],
+)
+def test_pyproject_source_outside_an_index_is_skipped(tmp_path, source, skip):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], f"[tool.uv.sources]\nfastlib = {source}\n"), encoding="utf-8"
+    )
+    (source_,) = load_inputs([str(tmp_path / "pyproject.toml")])
+    assert _by_name(source_)["fastlib"].skip == skip
+
+
+def test_pyproject_index_source_on_pypi_is_still_looked_up(tmp_path, capsys, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            ["fastlib==2.0.0"],
+            f'[tool.uv.sources]\nfastlib = {{ index = "pypi" }}\n\n[[tool.uv.index]]\nname = "pypi"\nurl = "{_PYPI}"\n',
+        ),
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == {"fastlib": "wheel"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # uv takes the git source on Linux and PyPI's release elsewhere (uv lock forks on the marker).
+        '{ git = "https://github.com/kjd/idna", tag = "v3.10", marker = "sys_platform == \'linux\'" }',
+        '[{ index = "a", marker = "sys_platform == \'linux\'" },\n'
+        ' { index = "b", marker = "sys_platform != \'linux\'" }]',
+        '{ index = "a", extra = "cpu" }',
+        # Declared nowhere wheelgap reads: uv refuses it, unless the user's own uv.toml has it.
+        '{ index = "undeclared" }',
+    ],
+)
+def test_pyproject_source_wheelgap_cant_follow_is_unknown(tmp_path, capsys, fake_pypi, source):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            ["fastlib==2.0.0"],
+            f'[tool.uv.sources]\nfastlib = {source}\n\n[[tool.uv.index]]\nname = "a"\nurl = "https://a.example/simple"\n'
+            '[[tool.uv.index]]\nname = "b"\nurl = "https://b.example/simple"\n',
+        ),
+        encoding="utf-8",
+    )
+    code, statuses, _ = _results(capsys, tmp_path / "pyproject.toml")
+    assert statuses == {"fastlib": "unknown"}
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "source", ['"git"', '{ git = "https://g.example/x", path = "x" }', "{ tag = 1 }", "{ workspace = false }"]
+)
+def test_pyproject_source_uv_refuses_is_an_error(tmp_path, source):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], f"[tool.uv.sources]\nfastlib = {source}\n"), encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match=r"\[tool\.uv\.sources\] fastlib"):
+        load_inputs([str(tmp_path / "pyproject.toml")])
+
+
+@pytest.mark.parametrize(
+    ("config", "where"), [("[tool.uv]\nno-sources = true\n", "pyproject.toml"), ("no-sources = true\n", "uv.toml")]
+)
+def test_no_sources_turns_the_sources_off(tmp_path, capsys, fake_pypi, config, where):
+    # uv lock with no-sources takes the package from PyPI, though [tool.uv.sources] names git.
+    tool = '[tool.uv.sources]\nfastlib = { git = "https://g.example/fastlib" }\n'
+    if where == "uv.toml":
+        (tmp_path / "uv.toml").write_text(config, encoding="utf-8")
+    else:
+        tool = config + "\n" + tool
+    (tmp_path / "pyproject.toml").write_text(_pyproject(["fastlib==2.0.0"], tool), encoding="utf-8")
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == {"fastlib": "wheel"}
+
+
+def test_sources_apply_to_selected_extras_and_groups(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            [],
+            '[project.optional-dependencies]\nfast = ["fastlib==2.0.0"]\n\n'
+            '[dependency-groups]\ndev = ["purewheel==3.1"]\n\n'
+            '[tool.uv.sources]\nfastlib = { git = "https://g.example/fastlib" }\npurewheel = { path = "../pw" }\n',
+        ),
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(tmp_path / "pyproject.toml")])
+    select_pyproject_extras(source, ["fast"], all_extras=False)
+    select_pyproject_groups(source, ["dev"], [])
+    assert {name: p.skip for name, p in _by_name(source).items()} == {"fastlib": "git", "purewheel": "path"}
+
+
+def test_workspace_member_gets_the_roots_sources_under_its_own(tmp_path):
+    # uv lock at the root: six comes from the root's git source, idna from the member's own index (uv 0.13.1).
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            ["a"],
+            '[tool.uv.workspace]\nmembers = ["pkgs/*"]\n\n[tool.uv.sources]\na = { workspace = true }\n'
+            'six = { git = "https://github.com/benjaminp/six", tag = "1.17.0" }\n'
+            'fastlib = { git = "https://g.example/fastlib" }\n',
+            name="root",
+        ),
+        encoding="utf-8",
+    )
+    member = tmp_path / "pkgs" / "a"
+    member.mkdir(parents=True)
+    (member / "pyproject.toml").write_text(
+        _pyproject(
+            ["six", "idna", "fastlib==2.0.0"],
+            '[tool.uv.sources]\nidna = { index = "mine" }\nfastlib = { index = "mine" }\n\n'
+            '[[tool.uv.index]]\nname = "mine"\nurl = "https://test.pypi.org/simple"\n',
+            name="a",
+        ),
+        encoding="utf-8",
+    )
+    packages = _by_name(load_inputs([str(member / "pyproject.toml")])[0])
+    assert packages["six"].skip == "git"
+    assert (packages["idna"].skip, packages["idna"].registry) == (None, "https://test.pypi.org/simple")
+    assert packages["fastlib"].registry == "https://test.pypi.org/simple"  # the member's own source wins
+
+
+def test_script_sources_are_read_from_its_block(tmp_path, capsys, fake_pypi):
+    (tmp_path / "demo.py").write_text(
+        '# /// script\n# dependencies = ["fastlib==2.0.0", "purewheel==3.1"]\n#\n# [tool.uv.sources]\n'
+        '# fastlib = { git = "https://g.example/fastlib" }\n# ///\nprint("hi")\n',
+        encoding="utf-8",
+    )
+    code, statuses, skipped = _results(capsys, tmp_path / "demo.py")
+    assert (statuses, skipped) == ({"purewheel": "wheel"}, {"fastlib": "git"})

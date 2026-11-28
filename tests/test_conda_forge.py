@@ -426,7 +426,7 @@ POETRY_LOCK = (
         ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "native-tls = true\n"}, True),
         ({"pyproject.toml": PYPROJECT}, True),
         ({"pyproject.toml": PYPROJECT + "\n[tool.uv]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
-        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.sources]\nnowheels = { index = 'corp' }\n"}, False),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.sources]\nother = { index = 'corp' }\n"}, False),
         ({"pyproject.toml": PYPROJECT + "\n[tool.uv.pip]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
         (
             {

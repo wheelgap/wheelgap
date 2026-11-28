@@ -582,11 +582,16 @@ kept where wheelgap doesn't read them (check a lockfile instead).
 
 `check_lockfile()` and `wheelgap diff` don't read `pyproject.toml` as an input.
 
-**uv settings:** the requirements are answered the way uv installs them. uv's `no-build`, `no-binary`,
+**uv settings and sources:** the requirements are answered the way uv installs them. uv's `no-build`, `no-binary`,
 `no-build-package` and `no-binary-package` are applied as for a [`uv.lock`](#uvlock), from the nearest `uv.toml` or
 `pyproject.toml` `[tool.uv]` from the file's folder up (for a uv workspace member, the workspace root's settings, as
-uv ignores the member's own). `--deps` refuses a file that sets one. When wheelgap can't tell whether the file is a
-workspace member and the answer would depend on it, it's an input error.
+uv ignores the member's own). `--deps` refuses a file that sets one. `[tool.uv.sources]` is followed too, the
+workspace root's included for a member (the member's own entry wins): a `git`, `url`, `path` or `workspace` source is
+skipped with that reason (`editable` for an editable path), and an `index` source takes the package from that
+`[[tool.uv.index]]`, so it's skipped as a private index unless that index is PyPI (or `WHEELGAP_INDEX_URL`). A
+package whose source depends on a marker, extra or group, or names an index none of these files defines, is
+`unknown`. `no-sources = true` turns the sources off. When wheelgap can't tell whether the file is a workspace
+member and the answer would depend on it, it's an input error.
 
 uv's `exclude-newer` upload cutoff is applied: see [Resolution upload cutoffs](#resolution-upload-cutoffs).
 
@@ -626,9 +631,9 @@ lines to add to the block for `uv run`. To check what the script installs, pass 
 (`example.py.lock`, from `uv lock --script`), which is read as a [`uv.lock`](#uvlock). Without `--deps`,
 `check_lockfile()` and `wheelgap diff` don't read a script.
 
-The block's build restrictions are applied as in a [`pyproject.toml`](#pyprojecttoml), with the block's settings
-combined with the nearest `uv.toml` or `pyproject.toml` `[tool.uv]` from the script's folder up, as `uv run` combines
-them (see [uv.lock](#uvlock)).
+The block's `[tool.uv.sources]` and build restrictions are followed as in a [`pyproject.toml`](#pyprojecttoml), with
+the block's settings combined with the nearest `uv.toml` or `pyproject.toml` `[tool.uv]` from the script's folder up,
+as `uv run` combines them (see [uv.lock](#uvlock)).
 
 A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 
