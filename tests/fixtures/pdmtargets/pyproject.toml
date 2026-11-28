@@ -1,0 +1,7 @@
+# Locked with `pdm lock --platform linux --python "==3.13.*"` (PDM 2.29.7): the lock's [[metadata.targets]] say so,
+# and it keeps only MarkupSafe's Linux x86_64 wheels.
+[project]
+name = "demo"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["markupsafe==3.0.2"]

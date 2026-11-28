@@ -1273,3 +1273,157 @@ def test_says_when_build_info_is_off(capsys, tmp_path, fake_files, monkeypatch, 
     if not args:  # --offline turns it off without a word (it can't take --index-url's lookups anyway)
         _, _, err = run(capsys, lock, *TARGETS, "--explain", "--build-info", "--offline")
         assert "--build-info" not in err
+
+
+# --fix --build-info (#740): for a gap with no fix on a Linux target, the distro packages to build it from source.
+MUSL = build_targets(["3.13"], ["musl-armv7l"])
+
+
+APT = "apt-get update && apt-get install -y"  # python:3.X-slim has no apt lists, and without -y apt-get asks
+APK = "apk add --no-cache"
+# cryptography's real [build-system] (44.0.0, and 3.4.8 before maturin): Rust, and C through cffi too, so its install
+# docs list python3-dev for Alpine and Debian.
+CRYPTOGRAPHY_44 = (
+    [
+        "maturin>=1,<2",
+        "cffi>=1.12; platform_python_implementation != 'PyPy'",
+        "setuptools!=74.0.0,!=74.1.0,!=74.1.1,!=74.1.2",
+    ],
+    "maturin",
+)
+CRYPTOGRAPHY_3 = (
+    ["setuptools>=40.6.0", "wheel", "cffi>=1.12; platform_python_implementation != 'PyPy'", "setuptools-rust>=0.11.4"],
+    "setuptools.build_meta",
+)
+
+
+@pytest.mark.parametrize(
+    ("requires", "backend", "targets", "command"),
+    [
+        (["maturin>=1,<2"], None, LINUX, f"{APT} cargo"),
+        (["maturin>=1,<2"], None, MUSL, f"{APK} cargo"),
+        (*CRYPTOGRAPHY_44, LINUX, f"{APT} cargo"),
+        (*CRYPTOGRAPHY_44, MUSL, f"{APK} cargo"),
+        (*CRYPTOGRAPHY_3, MUSL, f"{APK} cargo"),
+        (["meson-python", "cython"], None, MUSL, f"{APK} build-base"),
+        (["scikit-build-core"], None, LINUX, f"{APT} cmake build-essential"),
+        (["setuptools-rust", "cython"], None, MUSL, f"{APK} cargo build-base"),
+        (["maturin", "cmake"], None, LINUX, f"{APT} cargo cmake build-essential"),
+    ],
+)
+def test_system_packages(requires, backend, targets, command):
+    (target,) = targets
+    found = build.system_packages(info(requires, backend), target)
+    assert found is not None
+    # Always the Python headers: a Rust build may compile C through cffi too (cryptography), and they do no harm.
+    assert (found.command, found.distro_python) == (command, ("python3-dev",))
+    assert found.command == (APK if target.platform.startswith("musl-") else APT) + " " + " ".join(found.packages)
+
+
+def test_system_packages_for_cryptography():
+    # The wrong answer this guards against: cryptography's Rust build said distro_python [], but cffi compiles C
+    # against Python.h, so on the distro's own Python the build fails without python3-dev.
+    found = build.system_packages(info(*CRYPTOGRAPHY_44), MUSL[0])
+    assert found is not None and found.needs == (build.RUST,) and found.distro_python == ("python3-dev",)
+
+
+@pytest.mark.parametrize(
+    ("requires", "backend", "targets"),
+    [
+        (["maturin"], None, WINDOWS),  # not a Linux target
+        (["maturin"], None, build_targets(["3.13"], ["macos-arm64"])),
+        (["setuptools", "wheel"], None, LINUX),  # setuptools may compile or not: nothing is proven
+        (["flit-core"], "flit_core.buildapi", LINUX),  # a pure backend
+        (["maturin; sys_platform == 'win32'", "setuptools"], None, LINUX),  # the marker leaves Linux out
+    ],
+)
+def test_no_system_packages(requires, backend, targets):
+    (target,) = targets
+    assert build.system_packages(info(requires, backend), target) is None
+
+
+FIX_TARGETS = ("-p", "3.13", "-t", "linux-x86_64,musl-x86_64,win-amd64", "--color", "never", "--fix")
+CARGO = "it needs at least a Rust toolchain: "
+RUSTUP = "or rustup from https://rustup.rs where the distro's Rust is older than the package needs"
+HEADERS = "and python3-dev with the distro's own Python"
+TOOLS_ONLY = (
+    "these are build tools only: libraries the package links against (e.g. libxml2 and libxslt for lxml) aren't named"
+)
+
+
+def test_fix_names_the_distro_packages(capsys, tmp_path, fake_pypi, fake_files):
+    fake_files.files["nowheels-0.9.tar.gz"] = nowheels_sdist(tmp_path)
+    lock = uv_lock(tmp_path)
+    _, out, _ = run(capsys, lock, *FIX_TARGETS)
+    assert "No fix yet:" in out and "to build it" not in out and fake_files.calls == []  # only with --build-info
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info")
+    lines = out.splitlines()
+    head = next(i for i, line in enumerate(lines) if line.startswith("  nowheels 0.9: no newer release has a wheel"))
+    assert lines[head + 1 : head + 3] == [
+        f"    to build it from source on linux-x86_64, {CARGO}{APT} cargo on Debian or Ubuntu ({HEADERS}; {RUSTUP}); "
+        + TOOLS_ONLY,
+        f"    to build it from source on musl-x86_64, {CARGO}{APK} cargo on Alpine ({HEADERS}; {RUSTUP}); {TOOLS_ONLY}",
+    ]
+    assert "win-amd64, it needs" not in out  # no distro to name on Windows
+    assert "build needs" not in out  # --explain's line still needs --explain
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info", "--json")
+    fixes = json.loads(out)["packages"][0]["fix"]
+    assert fixes["linux-x86_64"]["build_packages"] == {
+        "distro": "Debian or Ubuntu",
+        "command": "apt-get update && apt-get install -y cargo",
+        "packages": ["cargo"],
+        "needs": ["a Rust toolchain"],
+        "distro_python": ["python3-dev"],
+    }
+    assert fixes["musl-x86_64"]["build_packages"]["command"] == "apk add --no-cache cargo"
+    assert fixes["win-amd64"]["build_packages"] is None
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--json")
+    assert json.loads(out)["packages"][0]["fix"]["linux-x86_64"]["build_packages"] is None
+
+    _, out, _ = run(capsys, lock, *FIX_TARGETS, "--build-info", "--markdown")
+    assert (
+        f"to build it from source on linux-x86_64, {CARGO}`{APT} cargo` on Debian or Ubuntu (and `python3-dev` with "
+        f"the distro's own Python; {RUSTUP}); {TOOLS_ONLY}"
+    ) in out
+
+
+def test_fix_build_packages_with_a_compiler(capsys, tmp_path, fake_pypi, fake_files):
+    pyproject = b'[build-system]\nrequires = ["setuptools", "cython>=3"]\nbuild-backend = "setuptools.build_meta"\n'
+    fake_files.files["nowheels-0.9.tar.gz"] = nowheels_sdist(tmp_path, pyproject)
+    _, out, _ = run(capsys, uv_lock(tmp_path), *FIX_TARGETS, "--build-info")
+    assert (
+        "    to build it from source on musl-x86_64, it needs at least a C/C++ compiler: apk add --no-cache "
+        f"build-base on Alpine ({HEADERS}); {TOOLS_ONLY}"
+    ) in out
+
+
+def test_fix_build_packages_only_where_nothing_else_fixes_it(capsys, tmp_path, fake_pypi, fake_files):
+    # laggard 1.0 builds from source everywhere; 1.2 has a musl-x86_64 wheel, so an upgrade fixes that target and
+    # only linux-x86_64 gets a distro line.
+    fake_files.files["laggard-1.0.tar.gz"] = sdist(
+        tmp_path, member("laggard-1.0/pyproject.toml", MATURIN), name="laggard-1.0.tar.gz"
+    )
+    args = ("laggard==1.0", "-p", "3.13", "-t", "musl-x86_64,linux-x86_64", "--fix", "--build-info")
+    _, out, _ = run(capsys, *args)
+    assert f"to build it from source on linux-x86_64, {CARGO}{APT} cargo" in out
+    assert "on musl-x86_64, it needs" not in out
+    _, out, _ = run(capsys, *args, "--json")
+    fixes = json.loads(out)["packages"][0]["fix"]
+    assert fixes["musl-x86_64"]["kind"] == "upgrade" and "build_packages" not in fixes["musl-x86_64"]
+
+
+def test_fix_build_info_skips_the_sdists_of_gaps_an_upgrade_fixes(capsys, tmp_path, fake_pypi, fake_files):
+    # laggard 1.2 has a wheel for every gap here, so there's nothing to build: --fix --build-info reads no sdist.
+    fake_files.files["laggard-1.0.tar.gz"] = sdist(
+        tmp_path, member("laggard-1.0/pyproject.toml", MATURIN), name="laggard-1.0.tar.gz"
+    )
+    args = ("laggard==1.0", "-p", "3.13", "-t", "musl-x86_64,musl-aarch64", "--fix", "--build-info", "--no-cache")
+    _, out, _ = run(capsys, *args)
+    assert "laggard 1.0 -> 1.2" in out and "to build it" not in out
+    assert fake_files.calls == []
+    # With --explain too, its build needs line still reads the sdist.
+    _, out, _ = run(capsys, *args, "--explain")
+    assert "build needs: at least a Rust toolchain" in out
+    assert fake_files.calls == ["https://files.example/laggard-1.0.tar.gz"]

@@ -426,7 +426,7 @@
                     }
                 },
                 "suggest": {
-                    "description": "Present with --explain --suggest, from 0.10.0 on, for a pinned package with a gap whose releases were looked up on PyPI: for each target in rejected, a newer release with a wheel for it (not yanked, Requires-Python admitting the target's Python, and no pre-release unless the checked version is one) that also keeps a wheel on every target where this package is wheel now. The targets get the lowest such release with a wheel for all of them when there is one, otherwise each its own nearest; a target with no such release is left out, so the object can be empty. The release can be outside the input's own version specifier (foo<2 resolving to 1.9 may get 2.1). Absent when the package has no gap, has no version, is covered by a requirements file's --no-binary, wasn't looked up (its index isn't known to be PyPI, or the run uses --index-url or WHEELGAP_INDEX_URL), or its lookup failed or was dropped (a note on stderr says so). It doesn't change results, summary or the exit code.",
+                    "description": "Present with --explain --suggest, from 0.10.0 on, for a pinned package with a gap whose releases were looked up on PyPI: for each target in rejected, a newer release with a wheel for it (not yanked, Requires-Python admitting the target's Python, and no pre-release unless the checked version is one; then one final release for every target, else one pre-release for every target, else a final release where one fits and a pre-release for the rest) that also keeps a wheel on every target where this package is wheel now. The targets get the lowest such release with a wheel for all of them when there is one, otherwise each its own nearest; a target with no such release is left out, so the object can be empty. The release can be outside the input's own version specifier (foo<2 resolving to 1.9 may get 2.1). Absent when the package has no gap, has no version, is covered by a requirements file's --no-binary, wasn't looked up (its index isn't known to be PyPI, or the run uses --index-url or WHEELGAP_INDEX_URL), or its lookup failed or was dropped (a note on stderr says so). It doesn't change results, summary or the exit code.",
                     "type": "object",
                     "additionalProperties": {"type": "string"}
                 },
@@ -440,6 +440,19 @@
                         "properties": {
                             "kind": {"enum": ["upgrade", "gap_wheel", "none"], "description": "The way out: upgrade, gap_wheel or none."},
                             "version": {"type": "string", "description": "kind upgrade: the release to move to. wheelgap doesn't resolve dependencies: the rest of them must allow it."},
+                            "prerelease": {"type": "boolean", "description": "kind upgrade, from 0.15.0 on: whether version is a pre-release. Only a pre-release pin gets one: one final release for every target, else one pre-release for every target, else a final release where one fits and a pre-release for the rest."},
+                            "exclude_newer": {
+                                "type": ["object", "null"],
+                                "description": "kind upgrade, from 0.15.0 on: null, or when the release was uploaded after uv's exclude-newer for this package (so uv can't pick it until the cutoff moves): setting (exclude-newer, or exclude-newer-package NAME), cutoff (the cutoff, or null when it's a duration), span (the duration as written, such as P850D or 850 days, which uv counts back from the time it locks; null for a fixed cutoff) and move_past (when the release's last file was uploaded: the cutoff must be later). Only a release no release within the cutoff can replace gets one.",
+                                "additionalProperties": false,
+                                "required": ["setting", "cutoff", "span", "move_past"],
+                                "properties": {
+                                    "setting": {"type": "string"},
+                                    "cutoff": {"type": ["string", "null"]},
+                                    "span": {"type": ["string", "null"]},
+                                    "move_past": {"type": "string"}
+                                }
+                            },
                             "how": {"type": "string", "description": "kind upgrade: what to run or change for this input, such as uv lock --upgrade-package NAME for a uv.lock, or the pin to write in a requirements file."},
                             "constraint": {
                                 "type": ["object", "null"],
@@ -469,8 +482,9 @@
                             "url": {"type": "string", "description": "kind gap_wheel: where to download the wheel."},
                             "sha256": {"type": "string", "description": "kind gap_wheel: the wheel's SHA-256, as 64 lowercase hex digits."},
                             "unofficial": {"enum": [true], "description": "kind gap_wheel: always true: built by wheelgap from PyPI's sdist (https://wheelgap.github.io/wheels/), not by the package's maintainers."},
+                            "build_packages": {"type": ["object", "null"], "additionalProperties": false, "required": ["distro", "command", "packages", "needs", "distro_python"], "description": "Present from 0.15.0 on (older versions don't write it), kind none: with --build-info, for a reason other than not_looked_up or uv_may_fork on a Linux target that builds the release from source, the distro packages that provide what the sdist's [build-system] requires prove the build needs; null otherwise (no build info, no proven need, or another platform). Only what those requirements prove: these are build tools only, and a library the package links against (libxml2 and libxslt for lxml, BLAS, OpenSSL) isn't named.", "properties": {"distro": {"enum": ["Alpine", "Debian or Ubuntu"], "description": "Alpine for musl-* targets, Debian or Ubuntu for linux-* ones."}, "command": {"type": "string", "description": "What to run, as it stands in a fresh image: apk add --no-cache build-base, or apt-get update && apt-get install -y build-essential."}, "packages": {"type": "array", "items": {"type": "string"}, "description": "The packages command installs."}, "needs": {"type": "array", "items": {"type": "string"}, "description": "What they provide, as --explain's build needs line names it: a Rust toolchain, CMake and a C/C++ compiler, a C/C++ compiler."}, "distro_python": {"type": "array", "items": {"type": "string"}, "description": "Also needed when the build runs on the distro's own Python rather than a python:* image: always python3-dev (the Python headers): a C/C++ build needs them, and so may a Rust one that also compiles C through cffi (cryptography); extra but harmless for a PyO3-only build."}}},
                             "abi3_only": {"type": "boolean", "description": "kind none: true when the target is free-threaded and the checked release has abi3 wheels for its platform, which free-threaded Python can't use (as --explain's reason says); the package needs a cpXYt (or abi3t) wheel."},
-                            "reason": {"enum": ["no_newer_release", "loses_wheel", "uv_may_fork", "not_looked_up", "no_binary"], "description": "kind none: no_newer_release (no newer release has a wheel for this target), loses_wheel (every newer release with one drops a wheel this package has elsewhere), uv_may_fork (a uv.lock where what they drop is only another Python's wheel: uv may lock a release per Python, so try uv lock --upgrade-package NAME and check again), not_looked_up (the releases weren't looked up: the package isn't known to be from PyPI, the run uses another index, or the lookup failed; a line in the text output says which), no_binary (a requirements file's --no-binary: pip uses no wheel for it)."}
+                            "reason": {"enum": ["no_newer_release", "loses_wheel", "uv_may_fork", "not_looked_up", "no_binary", "held_back"], "description": "kind none: no_newer_release (no newer release has a wheel for this target), loses_wheel (every newer release with one drops a wheel this package has elsewhere), uv_may_fork (a uv.lock where what they drop is only another Python's wheel: uv may lock a release per Python, so try uv lock --upgrade-package NAME and check again), not_looked_up (the releases weren't looked up: the package isn't known to be from PyPI, the run uses another index, or the lookup failed; a line in the text output says which), no_binary (a requirements file's --no-binary: pip uses no wheel for it), held_back (from 0.15.0 on, with --deps: another package in the resolved tree requires a range that rules out the newer release with the wheel, so that package must be upgraded or relaxed first)."}
                         }
                     }
                 },
@@ -506,6 +520,11 @@
                     "description": "Present for a uv.lock or a script's lock checked with --online, when the package has files that uv installs and pip would refuse: each such file mapped to why, such as \"requires Python <3.15,>=3.10\". uv checks the Requires-Python lower bound, so these files count in results, which follow uv sync; pip (on an exported requirements file, say) refuses them on these targets' Python. With several Pythons the package has one entry per differing answer, and the key is on the entry for the Python pip refuses. Never empty: left out when pip refuses nothing.",
                     "type": "object",
                     "additionalProperties": {"type": "string", "description": "Keyed by filename, not by target label: why pip refuses that file."}
+                },
+                "unknown_reasons": {
+                    "description": "Present when a target is unknown for a reason other than a failed lookup: a Poetry 1.x poetry.lock checked without a pyproject.toml that declares the project's dependencies, where no dependency installs the package on that target, it has no wheel there, and Poetry installs it anyway if the project requires it directly. Keyed by target label, as results is. Never empty: left out otherwise.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
                 }
             }
         }

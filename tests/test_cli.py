@@ -410,6 +410,222 @@ def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, t
     assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
 
 
+def test_requirements_name_required_twice_is_checked_once(capsys, fake_pypi, tmp_path):
+    # pip installs the one release both requirements allow (pip 26.3: only numpy 1.26.4 for numpy==1.26.4 in a -r
+    # file and numpy>=1.20), not the pin and the newest release side by side.
+    (tmp_path / "base.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r base.txt\nranged>=1.5\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert [(p["name"], p["version"], p["results"]["linux-x86_64"]) for p in json.loads(out)["packages"]] == [
+        ("ranged", "1.9", "source")
+    ]
+    assert code == 1
+
+
+def _cells(out):
+    """{(name, version): {target: result}} from --json, the rows no target needs left out."""
+    return {
+        (p["name"], p["version"]): {t: r for t, r in p["results"].items() if r != "n/a"}
+        for p in json.loads(out)["packages"]
+        if any(r != "n/a" for r in p["results"].values())
+    }
+
+
+@pytest.mark.parametrize(
+    "lines, args, expected",
+    [
+        # Merged where both hold (Windows: ranged<2 and >=1.5 is 1.9, sdist only), plain elsewhere (2.0, a wheel).
+        (
+            ["ranged>=1.5", 'ranged<2 ; sys_platform == "win32"'],
+            ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"],
+            {("ranged", "2.0"): {"linux-x86_64": "wheel"}, ("ranged", "1.9"): {"win-amd64": "source"}},
+        ),
+        # manim's scipy>=1.13.0 with scipy>=1.15.0 ; python_full_version >= '3.13' (#835 review): the newest
+        # release meets both, so 3.13 checks the same release, in one row.
+        (
+            ["ranged>=1.5", "ranged>=1.9 ; python_full_version >= '3.13'"],
+            ["-p", "3.12", "-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", "2.0"): {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "wheel"}},
+        ),
+        # A patch release can't be decided on 3.13, but 2.0 meets the line either way...
+        (
+            ["ranged>=1.5", "ranged>=1.9 ; python_full_version >= '3.13.1'"],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", "2.0"): {"linux-x86_64": "wheel"}},
+        ),
+        # ...while here it may hold and leave out 2.0: unknown.
+        (
+            ["ranged>=1.5", "ranged<2 ; python_full_version >= '3.13.1'"],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("ranged", None): {"linux-x86_64": "unknown"}},
+        ),
+    ],
+)
+def test_requirements_name_required_under_markers_checked_per_target(
+    capsys, fake_pypi, tmp_path, lines, args, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), *args, "--json")
+    assert _cells(out) == expected
+
+
+@pytest.mark.parametrize(
+    "lines, args, expected",
+    [
+        # A line naming a pre-release lets pip take pre-releases for the lines together: pip 26.3 installs
+        # tensorflow 2.22.0rc1 for tensorflow>=2.15 with tensorflow>=2.16.0rc0 on Linux (and grpcio 1.86.0rc1 for
+        # grpcio>=1.80 with grpcio>=1.85.0rc1 on macOS), not the newest final release.
+        (
+            ["prelib>=0.5", 'prelib>=1.0rc1 ; sys_platform == "linux"'],
+            ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"],
+            {("prelib", "2.0rc1"): {"linux-x86_64": "source"}, ("prelib", "1.0"): {"win-amd64": "wheel"}},
+        ),
+        # Where that line may hold (a patch release on 3.13), pip may take 2.0rc1 or 1.0: unknown.
+        (
+            ["prelib>=0.5", 'prelib>=1.0rc1 ; python_full_version >= "3.13.1"'],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("prelib", None): {"linux-x86_64": "unknown"}},
+        ),
+    ],
+)
+def test_requirements_merged_lines_naming_a_pre_release_are_looked_up(
+    capsys, fake_pypi, tmp_path, lines, args, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), *args, "--json")
+    assert _cells(out) == expected
+
+
+def test_requirements_header_counts_a_name_required_under_markers_once(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged==1.5 ; sys_platform == 'win32'\nranged==2.0 ; sys_platform != 'win32'\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--all")
+    assert "· requirements.txt · 1 package · Python 3.13" in out
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    assert json.loads(out)["summary"]["packages"] == 1
+
+
+def test_requirements_identical_line_under_a_marker_stays_checked_on_undecided_targets(capsys, fake_pypi, tmp_path):
+    # vllm cpu.txt's `py-cpuinfo; platform_machine == "aarch64"` with common.txt's `py-cpuinfo` (#835 review): one
+    # row, confident on linux-armv7l too, where platform_machine can't be decided.
+    (tmp_path / "common.txt").write_text("unpinned\n", encoding="utf-8")
+    req = tmp_path / "cpu.txt"
+    req.write_text('-r common.txt\nunpinned; platform_machine == "aarch64"\n', encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.12", "-t", "linux-x86_64,linux-aarch64,linux-armv7l", "--json")
+    assert _cells(out) == {
+        ("unpinned", "4.2"): {"linux-x86_64": "wheel", "linux-aarch64": "wheel", "linux-armv7l": "wheel"}
+    }
+    assert code == 0
+
+
+def test_pyproject_ranges_split_by_python_with_an_extra_are_checked(capsys, fake_pypi, tmp_path):
+    # litellm's pydantic: three ranges split by python_version, and the same name unmarked in an extra.
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0'\ndependencies = [\n"
+        "  \"ranged>=1.5,<3; python_version < '3.14'\",\n"
+        "  \"ranged>=1.9,<3; python_version == '3.14'\",\n"
+        "  \"ranged>=2.0,<3; python_version >= '3.15'\",\n]\n"
+        "[project.optional-dependencies]\nmcp = ['ranged>=1.5,<3']\n",
+        encoding="utf-8",
+    )
+    code, out, _ = run(
+        capsys,
+        str(tmp_path / "pyproject.toml"),
+        "--all-extras",
+        "-p",
+        "3.13",
+        "-p",
+        "3.14",
+        "-t",
+        "linux-x86_64",
+        "--json",
+    )
+    cells = _cells(out)
+    assert {cell for results in cells.values() for cell in results.values()} == {"wheel"}
+    assert {version for _, version in cells} == {"2.0"} and code == 0
+
+
+def test_requirements_ranges_that_allow_nothing_together_are_a_refusal(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged>=2\nranged<2\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"]["linux-x86_64"] == "unknown" and code == 1
+    assert pkg["error"].startswith("no release matches <2,>=2")
+    assert pkg["error"].endswith("(the requirements for it allow no release together, so pip and uv refuse them)")
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        # The sha256 lists the Linux wheel: pip keeps only it where it fits (filter_unallowed_hashes). On Windows
+        # no listed file fits, so pip checks its pick against the sha512 too: unknown.
+        (
+            f"hashpkg==1.0 --hash=sha256:{'1' * 64} --hash=sha512:{'ab' * 64}",
+            {"linux-x86_64": "wheel", "win-amd64": "unknown"},
+        ),
+        # The sdist's sha256 fits everywhere: pip builds it, as with that hash alone.
+        (
+            f"hashpkg==1.0 --hash=sha256:{'3' * 64} --hash=sha512:{'ab' * 64}",
+            {"linux-x86_64": "source", "win-amd64": "source"},
+        ),
+    ],
+)
+def test_requirements_sha256_beside_sha512_decides_where_a_listed_file_fits(
+    capsys, fake_pypi, tmp_path, line, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text(line + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"] == expected
+
+
+@pytest.mark.parametrize("option", ["--cons", "--const", "--constrain="])
+def test_requirements_abbreviated_constraint_is_read(capsys, fake_pypi, tmp_path, option):
+    # pip 26.3 reads `--cons c.txt` as `--constraint c.txt` (optparse takes an unambiguous prefix).
+    (tmp_path / "c.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    sep = "" if option.endswith("=") else " "
+    req.write_text(f"{option}{sep}c.txt\nranged\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert _cells(out) == {("ranged", "1.9"): {"linux-x86_64": "source"}}
+
+
+@pytest.mark.parametrize(
+    "line", ["--cons https://releases.openstack.org/constraints/upper/2023.1", "--const ${CDIR}/c.txt"]
+)
+def test_requirements_abbreviated_unread_constraint_is_refused(capsys, fake_pypi, tmp_path, line):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"{line}\nnumpy\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and f"requirements.txt:1: {line}: pip reads a constraints file" in err
+    assert fake_pypi == []
+
+
+def test_requirements_abbreviated_requirement_is_read(capsys, fake_pypi, tmp_path):
+    (tmp_path / "base.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("--requirem base.txt\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert _cells(out) == {("purewheel", "3.1"): {"linux-x86_64": "wheel"}}
+
+
+def test_requirements_sha512_hashes_are_unknown_not_unhashed(capsys, fake_pypi, tmp_path):
+    # pip 26.3 picks the wheel, checks it against the sha512 and refuses it; before, wheelgap dropped the hash and said
+    # `wheel`.
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1 --hash=sha512:{'ab' * 64}\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "macos-arm64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"]["macos-arm64"] == "unknown" and code == 1
+    assert "lists sha512 hashes for purewheel, which wheelgap can't match" in pkg["error"]
+    assert fake_pypi == []
+
+
 def test_requirements_hashes_filter_files_by_sha256(capsys, fake_pypi, tmp_path):
     # 1. only the sdist's hash -> reports source
     req1 = tmp_path / "req1.txt"
@@ -896,6 +1112,32 @@ def test_poetry_lock_private_index_with_no_files_is_not_looked_up(capsys, tmp_pa
     assert data["skipped"] == [{"name": "acme-utils", "reason": "private index"}]
     assert not data["packages"]
     assert not any("acme" in url for url in fake_pypi)
+
+
+def test_poetry_lock_empty_files_are_looked_up_on_the_index(capsys, tmp_path, fake_pypi):
+    # Poetry writes `files = []` when the source gave it no hashes, and then installs the best file the index has.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "fastlib"\nversion = "2.0.0"\ndescription = ""\noptional = false\n'
+        'python-versions = ">=3.9"\ngroups = ["main"]\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err  # used to be "missing", as if the release had no files at all
+    assert json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+    assert any("fastlib" in url for url in fake_pypi)
+
+
+def test_poetry_lock_empty_files_from_a_private_index_are_skipped(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "fastlib"\nversion = "2.0.0"\ngroups = ["main"]\nfiles = []\n\n'
+        '[package.source]\ntype = "legacy"\nurl = "https://pkgs.example.com/simple"\nreference = "private"\n\n'
+        '[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err
+    assert json.loads(out)["skipped"] == [{"name": "fastlib", "reason": "private index"}]
+    assert fake_pypi == []
 
 
 def test_offline_allows_a_private_index_package_with_no_files(capsys, tmp_path, fake_pypi):
@@ -1893,6 +2135,81 @@ def test_lock_environments_cover_a_default_platform_for_some_pythons_only(capsys
     assert "this lock doesn't cover 3.14 linux-x86_64, 3.14 linux-aarch64: " in err
 
 
+def test_pdm_lock_targets_refuse_a_target_outside_them(capsys, fake_pypi, fixtures):
+    # What PDM 2.29.7 writes for `pdm lock --platform linux --python "==3.13.*"`. MarkupSafe has macOS and aarch64
+    # wheels on PyPI, but the lock kept only the x86_64 Linux ones: these used to be false `source` gaps.
+    lock = fixtures / "pdmtargets" / "pdm.lock"
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "macos-arm64,linux-aarch64,linux-x86_64", "--json")
+    assert code == 2
+    message = json.loads(out)["error"]["message"]
+    assert message == (
+        "pdm.lock: this lock doesn't cover 3.13 macos-arm64, 3.13 linux-aarch64: it was locked for `pdm lock` targets "
+        "only (requires_python ==3.13.*, platform manylinux_2_40_x86_64), so `pdm install` fails there and the lock "
+        "leaves out the packages and wheels other environments need; of the targets asked for it covers 3.13 "
+        "linux-x86_64 (to check the others, lock for them too with `pdm lock --append --platform ... --python ...`)"
+    )
+    assert err == f"wheelgap: error: {message}\n"
+    # glibc 2.36 is older than the lock's manylinux_2_40, which PDM installs anyway (with a warning).
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+    assert run(capsys, str(lock), "-p", "3.14", "-t", "linux-x86_64")[0] == 2  # outside requires_python
+    # The default platforms are narrowed to the ones it covers, as for a uv.lock.
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "--json")
+    assert code == 0 and [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64"]
+    assert (
+        "wheelgap: note: pdm.lock is locked for `pdm lock` targets only, which leave out linux-aarch64, "
+        "macos-arm64, win-amd64: checking the default targets it covers (linux-x86_64)\n"
+    ) in err
+    assert fake_pypi == []
+
+
+def test_pdm_lock_targets_name_the_default_python_when_it_is_the_cause(
+    capsys, fake_pypi, fixtures, tmp_path, monkeypatch
+):
+    # No -p, `python` setting or .python-version: the running Python, which the lock's ==3.13.* leaves out.
+    monkeypatch.setattr(cli, "running_python", lambda: "3.15")
+    (tmp_path / "pdm.lock").write_bytes((fixtures / "pdmtargets" / "pdm.lock").read_bytes())
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"))
+    assert code == 2
+    assert "this lock doesn't cover 3.15 linux-x86_64, 3.15 linux-aarch64, 3.15 macos-arm64, 3.15 win-amd64: " in err
+    assert err.rstrip().endswith(
+        "; Python 3.15 is the default, the one wheelgap runs on (no -p, `python` setting or .python-version): "
+        "pass -p 3.13 for a Python the lock covers, or run `pdm lock --append --python 3.15` to lock for it"
+    )
+    # With -p the Python was asked for, so there's no hint, but the message still names it.
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.15", "-t", "linux-x86_64")
+    assert code == 2 and "doesn't cover 3.15 linux-x86_64: " in err and "is the default" not in err
+
+
+def test_pdm_lock_targets_say_when_free_threading_is_the_cause(capsys, fake_pypi, fixtures, tmp_path):
+    text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    text = text.replace(
+        'platform = "manylinux_2_40_x86_64"\n',
+        'platform = "manylinux_2_40_x86_64"\nimplementation = "cpython"\ngil_disabled = false\n',
+    )
+    (tmp_path / "pdm.lock").write_text(text.replace("==3.13.*", ">=3.13"), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.14t", "-t", "linux-x86_64")
+    assert code == 2 and "doesn't cover 3.14t linux-x86_64: " in err
+    assert "(requires_python >=3.13, platform manylinux_2_40_x86_64, implementation cpython, gil_disabled false)" in err
+    assert run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.14", "-t", "linux-x86_64")[0] == 0
+
+
+def test_pdm_lock_targets_that_a_target_cannot_decide_are_not_guessed(capsys, fake_pypi, fixtures, tmp_path):
+    text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    (tmp_path / "pdm.lock").write_text(text.replace('"==3.13.*"', '">=3.13.2"'), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and out == ""
+    assert "can't tell whether this lock covers 3.13 linux-x86_64: it was locked for `pdm lock` targets only" in err
+    assert "`pdm install` fails outside them; check targets the lock targets decide" in err
+
+
+@pytest.mark.parametrize("targets", ['"linux"', '["linux"]', "[{requires_python = 3}]", '[{gil_disabled = "no"}]'])
+def test_pdm_lock_targets_must_be_tables(capsys, tmp_path, targets):
+    (tmp_path / "pdm.lock").write_text(f"[metadata]\ntargets = {targets}\n", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "`metadata.targets`" in err
+
+
 @pytest.mark.parametrize(
     "marker,target",
     [
@@ -2858,12 +3175,15 @@ def _assert_matches_output_schema(data):
             gap_labels = {k for k, v in pkg["results"].items() if v in ("source", "missing")}
             assert set(pkg["fix"]) <= gap_labels
             keys = {
-                "upgrade": {"version", "how", "constraint", "gap_wheel"},
+                "upgrade": {"version", "prerelease", "exclude_newer", "how", "constraint", "gap_wheel"},
                 "gap_wheel": {"wheel", "url", "sha256", "unofficial"},
-                "none": {"reason", "abi3_only"},
+                "none": {"reason", "abi3_only", "build_packages"},
             }
             for entry in pkg["fix"].values():
                 assert set(entry) == {"kind"} | keys[entry["kind"]]
+                if (build := entry.get("build_packages")) is not None:  # --build-info, a Linux source cell
+                    assert set(build) == {"distro", "command", "packages", "needs", "distro_python"}
+                    assert pkg["results"][next(k for k, v in pkg["fix"].items() if v is entry)] == "source"
         if "gap_wheel" in pkg:
             assert set(pkg["gap_wheel"]) <= set(pkg.get("rejected", {}))
             for label, wheel in pkg["gap_wheel"].items():
@@ -3572,11 +3892,9 @@ def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatc
         "nowheels 0.9 builds from source on linux-x86_64.",
         "::error file=requirements.txt,line=6,title=nowheels 0.9%3A builds from source::"
         "nowheels 0.9 builds from source on win-amd64.",
-        *[  # one per line: requirements.txt line 7 and more/extra.txt line 3
-            "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
-            "ranged 1.9 builds from source on linux-x86_64, win-amd64."
-        ]
-        * 2,
+        # requirements.txt line 7 and more/extra.txt line 3 are one package, as pip installs one ranged 1.9 for both
+        "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
+        "ranged 1.9 builds from source on linux-x86_64, win-amd64.",
         "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
         "winonly 311 can't install on linux-x86_64.",
     ]
@@ -4276,12 +4594,13 @@ def test_github_annotations_deps_inside_constraints(index, capsys, tmp_path, mon
 
 
 @pytest.mark.parametrize("target", ["https://example.invalid/cons.txt", "${CONSTRAINTS}"])
-def test_github_annotations_requirements_unread_constraints(capsys, fake_pypi, tmp_path, monkeypatch, target):
-    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+def test_requirements_unread_constraints_are_refused(capsys, fake_pypi, tmp_path, target):
     req = tmp_path / "a.txt"
-    req.write_text(f"-c {target}\nnowheels==0.9\n", encoding="utf-8")
-    # The parser leaves remote/environment-based constraints unread, so the scanner must too.
-    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,line=2,"]
+    req.write_text(f"-c {target}\nnumpy\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and out == ""
+    assert f"a.txt:1: -c {target}: pip reads a constraints file" in err
+    assert fake_pypi == []  # nothing is checked at its newest release
 
 
 @pytest.mark.parametrize("lines", [None, ["purewheel==3.1", "nowheels==0.9"]])
@@ -4816,7 +5135,7 @@ def test_range_split_one_clean_one_gap_counts_as_one_package(capsys, fake_pypi, 
     assert code == 0
     assert "The 1 package has a wheel for every one of 2 targets, apart from 1 ignored gap." in out
 
-    # Two distinct requirements entries for the same package name still count separately (2), unlike a split range (1).
+    # Two requirements for one name under different markers are one package too, though each keeps its row.
     req = tmp_path / "requirements.txt"
     req.write_text(
         "splitgap==1.0; python_version < '3.10'\nsplitgap==2.0; python_version >= '3.10'\n", encoding="utf-8"
@@ -4825,7 +5144,7 @@ def test_range_split_one_clean_one_gap_counts_as_one_package(capsys, fake_pypi, 
     assert code == 1
     data = json.loads(out)
     assert len(data["packages"]) == 2
-    assert data["summary"]["packages"] == 2
+    assert data["summary"]["packages"] == 1
     assert data["summary"]["with_gaps"] == 1
 
 
@@ -5133,6 +5452,141 @@ def test_poetry_1x_transitive_gap_table_uses_direct_dependency(capsys, tmp_path,
     assert code == 1 and not err
     assert "cryptography (via mcp)" in out
     assert fake_pypi == []
+
+
+# click needs colorama on Windows only, and the project depends on both (#815). colorama has only an sdist here.
+POETRY_1X_CLICK_COLORAMA = (
+    '[[package]]\nname = "click"\nversion = "8.1.7"\n'
+    'files = [{ file = "click-8.1.7-py3-none-any.whl" }]\n\n[package.dependencies]\n'
+    'colorama = {version = "*", markers = "platform_system == \\"Windows\\""}\n\n'
+    '[[package]]\nname = "colorama"\nversion = "0.4.6"\nfiles = [{ file = "colorama-0.4.6.tar.gz" }]\n\n'
+    '[metadata]\nlock-version = "2.0"\n'
+)
+
+
+def test_poetry_1x_lock_without_its_pyproject_is_unknown_where_it_could_hide_a_gap(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64", "--json")
+    assert code == 1  # used to be a pass, with colorama hidden on Linux and no note
+    rows = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert rows["colorama"]["results"] == {"linux-x86_64": "unknown", "win-amd64": "source"}  # not ✓
+    (reason,) = rows["colorama"]["unknown_reasons"].values()
+    assert "the pyproject.toml beside the lock is needed to tell" in reason
+    assert "(there is no pyproject.toml beside poetry.lock)" in reason
+    assert rows["click"]["results"] == {"linux-x86_64": "wheel", "win-amd64": "wheel"}
+    assert "unknown_reasons" not in rows["click"]
+    assert (
+        "wheelgap: note: a Poetry 1.x lock doesn't record the project's own dependencies, and there is no "
+        "pyproject.toml beside poetry.lock: colorama is `unknown` where no dependency installs it"
+    ) in err
+    # --explain says why, and --ignore takes it like any other unknown.
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    assert "colorama 0.4.6 on linux-x86_64: ? unknown\n  no dependency installs it here" in out
+    for ignore in ("colorama", "colorama:linux-x86_64"):  # and the note doesn't name it then
+        code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--ignore", ignore)
+        assert code == 0 and "Poetry 1.x" not in err, err
+
+
+def test_poetry_1x_lock_without_its_pyproject_answers_the_rest(capsys, tmp_path, fake_pypi):
+    # pywin32 has Windows wheels only, and only app-lib's Windows marker installs it: maybe a direct dependency too.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app-lib"\nversion = "1.0"\nfiles = [{ file = "app_lib-1.0-py3-none-any.whl" }]\n\n'
+        '[package.dependencies]\npywin32 = {version = ">=300", markers = "sys_platform == \\"win32\\""}\n'
+        'nowheels = "*"\n\n'
+        '[[package]]\nname = "pywin32"\nversion = "306"\n'
+        'files = [{ file = "pywin32-306-cp313-cp313-win_amd64.whl" }]\n\n'
+        '[[package]]\nname = "nowheels"\nversion = "0.9"\nfiles = [{ file = "nowheels-0.9.tar.gz" }]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    assert code == 1, err
+    rows = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert rows["pywin32"]["results"] == {"linux-x86_64": "unknown", "win-amd64": "wheel"}
+    assert list(rows["pywin32"]["unknown_reasons"]) == ["linux-x86_64"]
+    assert rows["nowheels"]["results"] == {"linux-x86_64": "source", "win-amd64": "source"}
+    assert "unknown_reasons" not in rows["nowheels"]
+    # The Python API gives the same answer and reason.
+    lin, win = wheelgap.make_targets(["3.13"], ["linux-x86_64", "win-amd64"])
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path / "poetry.lock", [lin, win])}
+    assert results["pywin32"].statuses == {lin: Status.UNKNOWN, win: Status.WHEEL}
+    assert "pyproject.toml beside the lock is needed" in results["pywin32"].unknown_reasons[lin]
+    assert results["pywin32"].to_dict()["unknown_reasons"] == {
+        "3.13 linux-x86_64": results["pywin32"].unknown_reasons[lin]
+    }
+
+
+def test_poetry_1x_lock_without_its_pyproject_names_at_most_five_packages(capsys, tmp_path, fake_pypi):
+    names = [f"nvidia-lib{i}" for i in range(7)]
+    lock = '[[package]]\nname = "torch"\nversion = "2"\nfiles = [{ file = "torch-2-py3-none-any.whl" }]\n\n'
+    lock += "[package.dependencies]\n" + "".join(
+        f'{n} = {{version = "*", markers = "sys_platform == \\"linux\\""}}\n' for n in names
+    )
+    wheel = "{}-1-py3-none-manylinux_2_17_x86_64.whl"
+    lock += "".join(
+        f'\n[[package]]\nname = "{n}"\nversion = "1"\nfiles = [{{ file = "{wheel.format(n.replace("-", "_"))}" }}]\n'
+        for n in names
+    )
+    (tmp_path / "poetry.lock").write_text(lock + '\n[metadata]\nlock-version = "2.0"\n', encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64")
+    assert code == 1
+    assert ": nvidia-lib0, nvidia-lib1, nvidia-lib2, nvidia-lib3, nvidia-lib4 and 2 more are `unknown`" in err
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "why"),
+    [
+        ("[tool.ruff]\nline-length = 100\n", "the pyproject.toml beside poetry.lock declares no dependencies"),
+        ("[tool.poetry\n", "the pyproject.toml beside poetry.lock can't be read"),
+    ],
+)
+def test_poetry_1x_lock_with_a_pyproject_that_declares_nothing_is_unknown_too(tmp_path, fake_pypi, pyproject, why):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    # The Python API: the command line refuses a pyproject.toml that isn't TOML for its [tool.wheelgap] table first.
+    (lin,) = wheelgap.make_targets(["3.13"], ["linux-x86_64"])
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path / "poetry.lock", [lin])}
+    assert results["colorama"].statuses == {lin: Status.UNKNOWN}  # a [tool.ruff]-only one used to give ✓
+    assert results["colorama"].unknown_reasons[lin].endswith(f"({why})")
+
+
+def test_poetry_1x_lock_with_its_pyproject_checks_direct_dependencies_everywhere(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    pyproject = '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "^8.1"\ncolorama = "^0.4"\n'
+    (tmp_path / "pyproject.toml").write_bytes(b"\xef\xbb\xbf" + pyproject.encode())  # a BOM is still readable
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1, err
+    (row,) = [p for p in json.loads(out)["packages"] if p["name"] == "colorama"]
+    assert row["results"]["linux-x86_64"] == "source" and "unknown_reasons" not in row
+    assert "note:" not in err
+
+
+def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_has_a_gap(capsys, tmp_path, fake_pypi):
+    # colorama has a pure wheel: needed on Linux or not, the answer is the same.
+    lock = POETRY_1X_CLICK_COLORAMA.replace("colorama-0.4.6.tar.gz", "colorama-0.4.6-py2.py3-none-any.whl")
+    (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64")
+    assert code == 0 and "note:" not in err, err
+
+
+def test_poetry_1x_lock_without_its_pyproject_counts_another_installed_version(capsys, tmp_path, fake_pypi):
+    # On 3.12, app-lib installs numpy 1.26.4 (with a wheel); the left-out 1.24.4 isn't another package to doubt.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app-lib"\nversion = "1.0"\nfiles = [{ file = "app_lib-1.0-py3-none-any.whl" }]\n\n'
+        '[package.dependencies]\nnumpy = [{version = "1.24.4", markers = "python_version < \\"3.9\\""}, '
+        '{version = ">=1.26", markers = "python_version >= \\"3.9\\""}]\n\n'
+        '[[package]]\nname = "numpy"\nversion = "1.24.4"\nfiles = [{ file = "numpy-1.24.4.tar.gz" }]\n\n'
+        '[[package]]\nname = "numpy"\nversion = "1.26.4"\n'
+        'files = [{ file = "numpy-1.26.4-cp312-cp312-manylinux_2_17_x86_64.whl" }]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64", "--json")
+    assert code == 0 and "note:" not in err, err
+    assert {(p["name"], p["version"]): p["results"] for p in json.loads(out)["packages"]} == {
+        ("app-lib", "1.0"): {"linux-x86_64": "wheel"},
+        ("numpy", "1.26.4"): {"linux-x86_64": "wheel"},
+    }
 
 
 def test_a_failing_via_hint_never_costs_the_check(capsys, tmp_path, fake_pypi, monkeypatch):

@@ -227,6 +227,25 @@ rpds-py 0.27.0 on musl-armv7l: ● source
   `flit_core.buildapi` (from `flit-core` or `flit`), `flit.buildapi` (from `flit`), or `poetry.core.masonry.api`
   (from `poetry-core`, without a `build` script). Without a `build-backend`, pip uses setuptools, which can compile
   anything; an in-tree backend (`backend-path`) is named as such.
+- With `--fix`, a gap with no fix on a Linux target that builds from source also says which distro packages provide
+  those needs (only a Rust toolchain, CMake and a C/C++ compiler are mapped; `--explain` isn't needed for this):
+
+  ```text
+  No fix yet:
+    numpy 1.26.4: no newer release has a wheel for musl-armv7l; ask for a wheel: https://github.com/numpy/numpy/issues
+      to build it from source on musl-armv7l, it needs at least a C/C++ compiler: apk add --no-cache build-base on Alpine (and python3-dev with the distro's own Python); these are build tools only: libraries the package links against (e.g. libxml2 and libxslt for lxml) aren't named
+  ```
+
+  `musl-*` targets get Alpine's `apk add --no-cache` (`build-base`, `cmake`, `cargo`) and `linux-*` targets Debian's
+  and Ubuntu's `apt-get update && apt-get install -y` (`build-essential`, `cmake`, `cargo`), so the command runs as
+  it stands in a fresh image such as `python:3.13-slim`, which has no apt package lists. The `python:*` images
+  already have the Python headers; the distro's own Python needs `python3-dev`, which is named for a Rust build too,
+  since one can compile C through cffi as well (cryptography does). A distro's Rust can be older than a crate needs,
+  so a Rust build also names [rustup](https://rustup.rs). It's "at least": these are build tools only, and a library
+  the build links to (libxml2 and libxslt for lxml, BLAS, OpenSSL, libffi) isn't in `[build-system]` and isn't
+  named. Nor is the distro's own build of the package (`apk add py3-numpy`) suggested, since it installs for the
+  distro's Python only. Fedora and RHEL (`dnf`) aren't covered yet. `--json --fix` gives the same as
+  `build_packages` in the cell's [`fix`](#fix).
 - With `--json --explain --build-info`, each package gets `build_requires`: the same requirements, normalized
   (`["maturin<2.0,>=1.9"]`), or `null` when there's no source build or no answer. When build info is off for the
   whole run (see below), the key is left out.
@@ -488,13 +507,18 @@ never changes a status, the summary or the exit code.
 With `--json --fix`, each package also gets `fix`: an object keyed by its gap target labels whose
 values have `kind` and that kind's keys:
 
-- `"upgrade"`: `version` (the release), `how` (what to run or change), `constraint` (`null`, or `file`,
+- `"upgrade"`: `version` (the release), `prerelease` (whether it's a pre-release, named only for a pre-release pin
+  when no one final release fits every target), `exclude_newer` (`null`, or `setting`, `cutoff`, `span` and `move_past` when the
+  release was uploaded after uv's exclude-newer, so the cutoff must move past `move_past` first; for a duration such
+  as `850 days`, `span` is the duration and `cutoff` is `null`, since the time it gives moves every run), `how` (what to run or change), `constraint` (`null`, or `file`,
   `requirements`, `allows` and `via`: your own requirement, or `-c` constraint, and whether the release fits it) and
   `gap_wheel` (the fallback:
   `null`, or `wheel`, `url`, `sha256` and `unofficial: true`);
 - `"gap_wheel"`: `wheel`, `url`, `sha256` and `unofficial: true`;
-- `"none"`: `reason` (`no_newer_release`, `loses_wheel`, `uv_may_fork`, `not_looked_up` or `no_binary`) and
-  `abi3_only`.
+- `"none"`: `reason` (`no_newer_release`, `loses_wheel`, `uv_may_fork`, `not_looked_up`, `no_binary` or, with
+  `--deps`, `held_back`: another package in the resolved tree requires a range that rules out the newer release
+  with the wheel), `abi3_only` and `build_packages` (`null`, or with [`--build-info`](#build-info) the distro
+  packages to build it from source: `distro`, `command`, `packages`, `needs` and `distro_python`).
 
 The top-level `fix_summary` counts them: `{"gaps": 6, "upgrade": 4, "gap_wheel": 2, "none": 0, "not_looked_up": 0,
 "uv_may_fork": 0}`, where `none` counts only the gaps with no known fix and `gaps` is the sum of the other five. `gap_wheels` still
@@ -588,6 +612,10 @@ For a `uv.lock` checked with `--online`, a package with files that uv installs a
 the `Requires-Python` lower bound) also gets `pip_refuses`, with or without `--explain`: those files, each
 mapped to the reason, as in `{"agent_client_protocol-0.11.1-py3-none-any.whl": "requires Python <3.15,>=3.10"}`. Its
 `results` are still uv's. See [uv.lock](inputs.md#uvlock).
+
+A package that is `unknown` on a target for a reason other than a failed lookup gets `unknown_reasons`, with or
+without `--explain`: each such target mapped to why. For now that's a Poetry 1.x `poetry.lock` checked without a
+`pyproject.toml` that declares the project's dependencies; see [poetry.lock](inputs.md#poetrylock).
 
 If an input can't be read (a missing lockfile, an unknown target, a bad `[tool.wheelgap]` value), `--json` prints an
 error object on stdout instead of results, next to the usual `wheelgap: error:` line on stderr and exit code 2:

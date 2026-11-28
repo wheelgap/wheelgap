@@ -31,6 +31,7 @@ from .sources import (
     _line_include,
     parse_requirements,
     requirement_to_package,
+    uv_lock_settings_above,
 )
 from .targets import ALPINE_MUSL, DEBIAN_GLIBC
 
@@ -1604,14 +1605,58 @@ def _names_in_folder(copies: list[_Copy], dirs: set[str], folder: str) -> list[t
     return names
 
 
-def _may_carry_package_json(copies: list[_Copy], dirs: set[str], folder: str) -> bool:
+def _unresolved(text: str) -> bool:
+    """Whether a word is a path wheelgap can't resolve: a variable or a command substitution anywhere in it (as
+    written, since the word isn't exact), or a leading tilde."""
+    return "$" in text or "`" in text or text.startswith("~")
+
+
+def _may_carry_package_json(
+    copies: list[_Copy],
+    dirs: set[str],
+    folder: str,
+    mentions: list[tuple[int, str, str | None]],
+    created: list[tuple[int, str, str | None]],
+) -> bool:
     """Whether a package.json may be in `folder` of the image: an entry the COPY instructions so far may put there
-    (_names_in_folder), or one wheelgap can't list — an unreadable COPY or ADD, or a COPY --from whose tree reaches
-    it. npm runs the scripts of a project's workspaces and file: dependencies for a named install too, so a local
-    `npm install X` is only a plain program while no package.json can be in its working folder yet."""
+    (_names_in_folder), an earlier command that wheelgap doesn't read and that may write the folder, a parent of it
+    or a package.json (`mentions`, with the folder each ran in), a mkdir, touch, ln or install that names its
+    package.json (`created`: a mkdir of the folder itself adds no file), or one wheelgap can't list — an unreadable
+    COPY or ADD, or a COPY --from whose tree reaches it. npm runs the scripts of a project's workspaces and file:
+    dependencies for a named install too, so a local `npm install X` is only a plain program while no package.json
+    can be in its working folder yet."""
     if any(name == "package.json" for name, _ in _names_in_folder(copies, dirs, folder)):
         return True
     target = posixpath.join(folder, "package.json")
+    for _, text, cwd in mentions:
+        if posixpath.basename(text.rstrip("/")) == "package.json" or _unresolved(text):
+            return True  # a package.json by name (a download's URL too), or a path wheelgap can't resolve
+        if text.startswith("--"):
+            # An option names a path only with its value attached: `--target-directory=/srv/web`.
+            texts = [text.partition("=")[2]] if "=" in text else []
+        elif text.startswith("-"):
+            # `-t/srv/web`, `-t.`, `-tdeps/web`: the value after the letter, or (in a cluster such as `-rt/srv`)
+            # from its first slash. A relative one counts only in a known folder, so `-rf` there costs a needless
+            # check, never a warning in every RUN whose folder isn't known.
+            texts = [text[2:]] if cwd is not None else []
+            texts += [text[text.index("/") :]] if "/" in text[2:] else []
+        else:
+            texts = [text]
+        for each in texts:
+            if not each or each.startswith("-") or "://" in each:
+                continue  # an option, or a URL: not a path in the image
+            if cwd is None and not each.startswith("/"):
+                return True  # a relative name in a folder wheelgap doesn't know
+            path = posixpath.normpath(posixpath.join(cwd or "/", each))
+            if fnmatch.fnmatchcase(folder, path) or fnmatch.fnmatchcase(target, path):
+                return True
+            if folder.startswith(path.rstrip("/") + "/"):
+                return True
+    for _, text, cwd in created:
+        if _unresolved(text) or (cwd is None and not text.startswith("/")):
+            return True
+        if fnmatch.fnmatchcase(target, posixpath.normpath(posixpath.join(cwd or "/", text))):
+            return True
     for copy in copies:
         if copy.error:
             return True  # ADD or a COPY that isn't read: what it puts in the image isn't known
@@ -2391,6 +2436,55 @@ _UV_HARMLESS_ENV = frozenset(
     "UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL UV_NO_EDITABLE UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON "
     "UV_SYSTEM_CERTS UV_VERSION".split()
 )
+# `git clone` options that take the next word as their value, and those that take none (git's builtin/clone.c,
+# up to --revision; a short option may also carry its value attached, as in `-bmain`).
+_GIT_CLONE_VALUED = frozenset(
+    "-b --branch -o --origin --depth -c --config --reference --reference-if-able -j --jobs --filter --template "
+    "--separate-git-dir -u --upload-pack --shallow-since --shallow-exclude --server-option --bundle-uri --revision "
+    "--ref-format".split()
+)
+_GIT_CLONE_SWITCHES = frozenset(
+    "-v --verbose -q --quiet --progress --no-progress --reject-shallow --no-reject-shallow -n --no-checkout --checkout "
+    "--bare --mirror -l --local --no-local --no-hardlinks --hardlinks -s --shared --no-shared --dissociate "
+    "--single-branch --no-single-branch --no-tags --tags --shallow-submodules --no-shallow-submodules "
+    "--recurse-submodules --no-recurse-submodules --recursive --also-filter-submodules --remote-submodules "
+    "--no-remote-submodules --sparse --no-sparse -4 --ipv4 -6 --ipv6".split()
+)
+# The values uv takes for the settings above that take a fixed kind of value: a value outside it makes uv exit 2 on
+# the command that reads it (or, for a concurrency limit past the largest permit count, crash), so such a line is
+# refused, on a uv command only (pip doesn't read UV_ variables). Each rule is (pattern, what uv takes, largest number
+# or None). Checked against uv 0.13.7's parsers: a
+# "boolish" switch takes y, yes, t, true, on, 1 and their opposites, in any capitals; a link mode is one of four
+# lowercase words; UV_PYTHON_DOWNLOADS takes those words and 1 or 0 in any capitals; numbers take an optional "+"
+# (a leading zero is fine), the timeout is a u64, the retries a u32, and a concurrency limit is at most 2**61 - 1.
+_UV_BOOLISH = "(?ai:y|yes|t|true|on|1|n|no|f|false|off|0)"
+_UV_NUMBER = r"\+?[0-9]+"
+_UV_TRUE = ("y", "yes", "t", "true", "on", "1")  # the boolish values uv reads as true
+_UV_VALUES: dict[str, tuple[str, str, int | None]] = {
+    **dict.fromkeys(
+        "UV_NO_CACHE UV_COMPILE_BYTECODE UV_NO_PROGRESS UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT "
+        "UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL UV_NO_EDITABLE UV_SYSTEM_PYTHON UV_SYSTEM_CERTS".split(),
+        (_UV_BOOLISH, "1, 0, true, false, yes, no, on or off", None),
+    ),
+    "UV_LINK_MODE": ("clone|copy|hardlink|symlink", "clone, copy, hardlink or symlink", None),
+    "UV_PYTHON_DOWNLOADS": (
+        "(?ai:auto|automatic|manual|never|true|false|1|0)",
+        "auto, automatic, manual, never, true, false, 1 or 0",
+        None,
+    ),
+    "UV_HTTP_TIMEOUT": (_UV_NUMBER, "a whole number of seconds up to 18446744073709551615", 2**64 - 1),
+    "UV_HTTP_RETRIES": (_UV_NUMBER, "a whole number up to 4294967295", 2**32 - 1),
+    **dict.fromkeys(
+        ("UV_CONCURRENT_DOWNLOADS", "UV_CONCURRENT_BUILDS", "UV_CONCURRENT_INSTALLS"),
+        (r"\+?0*[1-9][0-9]*", "a whole number from 1 to 2305843009213693951", 2**61 - 1),
+    ),
+}
+# Read by uv's `uv pip` commands only (they are flags of those subcommands), so `uv sync` doesn't exit on a bad value.
+_UV_PIP_ONLY = frozenset(("UV_SYSTEM_PYTHON", "UV_BREAK_SYSTEM_PACKAGES"))
+# uv reads its number settings as unset when empty (parse_integer_environment_variable); its switches refuse "".
+_UV_EMPTY_UNSET = frozenset(
+    ("UV_HTTP_TIMEOUT", "UV_HTTP_RETRIES", "UV_CONCURRENT_DOWNLOADS", "UV_CONCURRENT_BUILDS", "UV_CONCURRENT_INSTALLS")
+)
 # Words that name a pip or uv configuration file: a command that isn't read and names one may be writing it.
 _CONFIG_WORDS = (
     "pip.conf",
@@ -2465,6 +2559,27 @@ def _installer_setting(name: str) -> bool:
     """Whether an environment variable is a pip or uv setting that may change what is installed. pip reads a name
     that starts with PIP_ (in capitals) and lowercases the rest; uv's names are all capitals."""
     return name.startswith(("PIP_", "UV_")) and name.upper() not in _PIP_HARMLESS_ENV | _UV_HARMLESS_ENV
+
+
+def _uv_value_problem(name: str, value: str | None) -> str | None:
+    """Why a value of a UV_ setting makes uv exit 2, as a message naming the setting, the value and the values uv
+    takes; None when the value is one uv takes, when the setting has no rule, or when the value isn't known."""
+    rule = _UV_VALUES.get(name)
+    if rule is None or value is None or (value == "" and name in _UV_EMPTY_UNSET):
+        return None
+    pattern, takes, largest = rule
+    # The length first: int() refuses a string of more than 4300 digits.
+    digits = value.lstrip("+").lstrip("0")
+    if re.fullmatch(pattern, value) and (
+        largest is None or (len(digits) <= len(str(largest)) and int(digits or "0") <= largest)
+    ):
+        return None
+    return f"{name}={value} is not a value uv takes: {takes}"
+
+
+def _uv_reads(name: str, install: _Install) -> bool:
+    """Whether the uv command of `install` reads the UV_ setting `name` (pip reads none of them)."""
+    return install.uv and not (install.sync and name in _UV_PIP_ONLY)
 
 
 @dataclass
@@ -2754,6 +2869,8 @@ class _RunReader:
                         "can't tell what is installed"
                     )
             self.report.warn(number, "a heredoc script")
+            # What the script writes isn't known: a later local npm install may find a package.json it made.
+            self.mentions.append((number, "$(heredoc)", None))
             return []
         else:
             parser = _Shell(rest, env, bash)
@@ -2783,6 +2900,8 @@ class _RunReader:
         cwd, cwd_error = workdir, workdir_error
         depth = 0  # inside if, for, while, until or { }
         risky_setting: str | None = None
+        risky_values: dict[str, str] = {}  # UV_ settings on this RUN whose values uv refuses, by name
+        uv_installs: list[_Install] = []  # the uv installs of this RUN, which read those settings
         project_environment = False  # UV_PROJECT_ENVIRONMENT set on this RUN, which a read `uv sync` refuses
         names_installer = False  # a pip or uv command, read or not
         exited: str | None = None  # an `exit` or `return` before the command: it may never run
@@ -2855,6 +2974,8 @@ class _RunReader:
             for name, value in assigns:
                 if _installer_setting(name):
                     risky_setting = name
+                if (problem := _uv_value_problem(name, value.text if value.exact else None)) is not None:
+                    risky_values[name] = problem
                 if name == "UV_PROJECT_ENVIRONMENT":
                     project_environment = True
                 if name == "PATH":
@@ -2878,6 +2999,8 @@ class _RunReader:
             if kind in ("install", "installer-tools", "pip"):
                 names_installer = True
             if isinstance(detail, _Install):
+                if detail.uv:
+                    uv_installs.append(detail)
                 if detail.sync and project_environment:
                     stop(
                         "UV_PROJECT_ENVIRONMENT is set on this RUN, and `uv sync` may then install into an "
@@ -2950,6 +3073,8 @@ class _RunReader:
                 if words and (folder := self._writes_folder(words)):
                     written.append(folder if folder.startswith("/") or cwd is not None else "/")
                     anywhere = folder == "/"  # git: any file of the work tree, which the config check leaves out
+                elif words and (folder := self._clone_folder(words)):
+                    written.append(folder)  # the clone's folder, which its URL alone doesn't name
             self.mentions += [(number, text, cwd) for text in written]
             if first in ("mkdir", "touch", "ln", "install"):
                 self.created += [(number, word.text, cwd) for word in words[1:] if not word.text.startswith("-")]
@@ -2980,6 +3105,10 @@ class _RunReader:
                         "config file"
                     )
                     break
+        if problem := next(
+            (p for n, p in risky_values.items() if any(_uv_reads(n, install) for install in uv_installs)), None
+        ):
+            stop(problem)
         if risky_setting and names_installer:
             if risky_setting.endswith(":"):
                 stop(f"{risky_setting} a setting on this RUN may change what pip or uv installs")
@@ -3050,6 +3179,52 @@ class _RunReader:
             if rest and rest[0] in _GIT_WRITES:
                 return "/"
         return None
+
+    @staticmethod
+    def _clone_folder(words: list[_Word]) -> str | None:
+        """The folder `git clone REPO [DIR]` makes: DIR, or the repository's name from REPO (`.git` dropped), under
+        the `-C` folder if one is given."""
+        if posixpath.basename(words[0].text) != "git":
+            return None
+        texts = [word.text for word in words[1:]]
+        base = None
+        while texts and texts[0].startswith("-"):
+            if texts[0] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env") and len(texts) > 1:
+                base = (posixpath.join(base, texts[1]) if base else texts[1]) if texts[0] == "-C" else base
+                texts = texts[2:]
+            else:
+                if texts[0].startswith("-C") and len(texts[0]) > 2:  # `-C/srv`: the folder attached
+                    base = posixpath.join(base, texts[0][2:]) if base else texts[0][2:]
+                texts = texts[1:]
+        if not texts or texts[0] != "clone":
+            return None
+        positional: list[str] = []
+        rest = texts[1:]
+        while rest:
+            text, rest = rest[0], rest[1:]
+            if text == "--":
+                positional += rest
+                break
+            if text in _GIT_CLONE_VALUED:
+                rest = rest[1:]
+            elif (text.startswith("--") and "=" in text) or text in _GIT_CLONE_SWITCHES:
+                continue
+            elif not text.startswith("--") and text[:2] in _GIT_CLONE_VALUED:
+                continue  # `-bmain`, `-j4`: the value attached
+            elif text.startswith("-"):
+                # An option wheelgap doesn't know (or an abbreviation, or short options run together) may take the
+                # next word as its value, so which word is the folder isn't known.
+                return "$(git clone)"
+            else:
+                positional.append(text)
+        if not positional:
+            return None
+        if len(positional) > 1:
+            folder = positional[1]
+        else:
+            name = posixpath.basename(positional[0].rstrip("/").rpartition(":")[2] or positional[0])
+            folder = name.removesuffix(".git") or "."
+        return posixpath.join(base, folder) if base and not folder.startswith("/") else folder
 
     def _path_entry(self, value: str, where: str, cwd: str | None = "/") -> tuple[str, str] | None:
         """What a bare pip, python or uv is once PATH is `value` (see self.path)."""
@@ -3284,7 +3459,9 @@ class _RunReader:
             # Without an explicit prefix npm's project is the nearest folder up the tree with a package.json, so
             # one in any folder above the working folder is the project's own code too.
             folders = [folder] if explicit else list(_up_the_tree(folder))
-            empty = not any(_may_carry_package_json(self.copies, self.dirs, each) for each in folders)
+            empty = not any(
+                _may_carry_package_json(self.copies, self.dirs, each, self.mentions, self.created) for each in folders
+            )
         if spelling := _project_script(base, texts, stdin, empty):
             return "project-scripts", (spelling, shown)
         if base in _PROGRAMS:
@@ -4080,6 +4257,7 @@ def _dockerfile_requirements(
     reader = _RunReader(report, pythons, image_read, copies, dirs)
     env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
     uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
+    uv_value_errors: dict[str, str] = {}  # ENV and ARG UV_ settings whose values uv refuses, for a uv install
     arg_values: dict[str, bool] = {}  # the names in env that an ARG set, and whether --build-arg gave the value
     bash = False  # SHELL ["/bin/bash", "-c"]: `&>` is a redirect, not `&`
     env_names: set[str] = set()  # the names an ENV set
@@ -4248,6 +4426,19 @@ def _dockerfile_requirements(
                 "but no COPY brings it beside the lock in the image, so `uv sync` there doesn't read it, and "
                 "wheelgap's lock check would apply its settings"
             )
+        # With no uv settings beside the lock, the lock check applies the nearest ones above its folder on disk, as uv
+        # does (sources._find_uv_settings). A COPY that brings uv settings was refused above, so the image has none
+        # of them above the project, and checking with them would answer for settings `uv sync` there doesn't read.
+        if (above := uv_lock_settings_above(uv_lock)) is not None:
+            config, keys = above
+            try:
+                shown = Path(os.path.relpath(config, context.absolute())).as_posix()
+            except ValueError:  # another drive on Windows
+                shown = str(config)
+            raise DockerfileError(
+                f"line {number}: {shown} sets {', '.join(keys)} in a folder above the lock on disk, which wheelgap's "
+                "lock check would apply, but no COPY brings it into the image, so `uv sync` there doesn't read it"
+            )
         # uv 0.13.9 reads the .python-version in the project's folder, and with none there one in a folder above it
         # only up to the workspace root (one above a plain project is ignored), so a pin in the sync's folder is
         # read, resolved like the lock (an ignore rule that leaves it out of a copied folder means the image has
@@ -4330,6 +4521,8 @@ def _dockerfile_requirements(
             raise DockerfileError(reader.config_error)
         if install.uv and reader.uv_config_error:
             raise DockerfileError(reader.uv_config_error)
+        if error := next((e for n, e in uv_value_errors.items() if _uv_reads(n, install)), None):
+            raise DockerfileError(error)
         if install.sync:
             read_sync(install)
             return
@@ -4635,6 +4828,7 @@ def _dockerfile_requirements(
                             )
                         )
                     continue
+                own_value = value  # before an ENV of the same name makes it ambiguous
                 if keyword == "ARG" and name in env_names:
                     # BuildKit puts an ARG with a value in the environment over an earlier ENV of the same name
                     # (dispatchArg: `d.state.AddEnv` in dockerfile2llb/convert.go); the classic builder keeps the
@@ -4701,8 +4895,20 @@ def _dockerfile_requirements(
                 if _installer_setting(name):
                     # The value is left out: an index URL may hold credentials.
                     run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
-                elif name == "UV_SYSTEM_PYTHON":
-                    uv_system = value is not None and value.lower() in ("1", "true")
+                elif name in _UV_VALUES:
+                    # `ENV UV_LINK_MODE=$UV_LINK_MODE` passes an ARG on: check the value it expands to. After an ENV
+                    # of the same name, an ARG's own value may be the one a RUN sees, so it is checked too.
+                    seen = own_value
+                    if keyword == "ENV" and seen is None and (written := _written_value(args, name)) is not None:
+                        expanded = _expand_known(written, before)
+                        seen = None if "$" in expanded else expanded
+                    if (problem := _uv_value_problem(name, seen)) is not None:
+                        uv_value_errors[name] = f"line {number}: {keyword} {problem}"
+                    elif seen is not None and name not in reader.ambiguous:
+                        uv_value_errors.pop(name, None)  # a later value uv takes replaces the refused one
+                    # An unknown value keeps an earlier refusal: it may be that value passed on.
+                    if name == "UV_SYSTEM_PYTHON":
+                        uv_system = name not in reader.ambiguous and (seen or "").lower() in _UV_TRUE
         elif keyword == "RUN":
             if windows and not _PLAIN_ARGS_RE.fullmatch(_args_after_flags(args, "\\").strip()):
                 raise DockerfileError(
