@@ -21,6 +21,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
 from . import __version__, cache, condaforge, fix, gapwheels, origin, piwheels
+from . import cutoff as upload_cutoffs
 from . import notes as tracker
 from . import suggest as release_suggest
 from .api import explain_issues_urls, running_python
@@ -1986,6 +1987,9 @@ def release_lookups(
     source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
     asked: dict[str, list[Row]] = {}  # by canonical name: one lookup per package, however many rows it has
     cutoffs: dict[str, list[datetime.datetime | None]] = {}  # uv's exclude-newer for each row of `asked` (#822)
+    now = (
+        upload_cutoffs.current_time()
+    )  # one time for every duration a lock records, as uv takes one each time it locks
     kept_in: dict[str, str] = {}
     skipped: dict[int, str] = {}
     for r in gaps:
@@ -1994,7 +1998,7 @@ def release_lookups(
             source = source_of[id(r.package)]
             if origin.known_pypi(r.package, source, simple_index=index_url, private=elsewhere):
                 try:
-                    cutoff = fix.upload_cutoff(source, r.package)
+                    cutoff = fix.upload_cutoff(source, r.package, now)
                 except ValueError as e:  # a release uv can't pick mustn't be named: look nothing up
                     skipped[id(r.package)] = f"wheelgap can't read {e}"
                     continue

@@ -497,7 +497,8 @@ values have `kind` and that kind's keys:
   `null`, or `wheel`, `url`, `sha256` and `unofficial: true`);
 - `"gap_wheel"`: `wheel`, `url`, `sha256` and `unofficial: true`;
 - `"none"`: `reason` (`no_newer_release`, `loses_wheel`, `uv_may_fork`, `not_looked_up`, `no_binary` or, with
-  `--deps`, `held_back`: a dependency whose newer release with the wheel the requirements on it rule out) and
+  `--deps`, `held_back`: another package in the resolved tree requires a range that rules out the newer release
+  with the wheel) and
   `abi3_only`.
 
 The top-level `fix_summary` counts them: `{"gaps": 6, "upgrade": 4, "gap_wheel": 2, "none": 0, "not_looked_up": 0,

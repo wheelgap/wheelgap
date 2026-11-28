@@ -63,6 +63,8 @@ class _Tree:
     errors: dict[str, str] = field(default_factory=dict)  # key -> why it has no version
     paths: dict[str, list[str]] = field(default_factory=dict)  # key -> names from a top-level requirement down
     imposed: dict[str, set[str]] = field(default_factory=dict)  # key -> specifiers on it from installed edges
+    # key -> (the installed package whose requirement it is, its specifier), for --fix; top-level requirements left out
+    imposers: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
 
 class Resolver:
@@ -325,6 +327,8 @@ class Resolver:
             key = canonicalize_name(req.name)
             spec = str(req.specifier)
             tree.imposed.setdefault(key, set()).add(spec)
+            if path:
+                tree.imposers.setdefault(key, []).append((path[-1], spec))
             wanted = frozenset(canonicalize_name(e) for e in req.extras)
             if key in tree.errors:
                 continue
@@ -547,6 +551,7 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     index: dict[tuple[str, str | None, str | None], int] = {}
     deps_paths: dict[Target, dict[int, list[str]]] = {}
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] = {}
+    deps_imposed: dict[Target, dict[int, list[tuple[str, str]]]] = {}
     for target in targets:
         # pip evaluates a constraint's marker with `extra` as "" (no extras), so `; extra == "s3"` never applies.
         constraints = {key: set(specs) for key, specs in source.constraint_specs.items()}
@@ -567,6 +572,7 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
             )
         reach: dict[int, list[str]] = {}
         direct: dict[int, tuple[str, ...]] = {}
+        imposed: dict[int, list[tuple[str, str]]] = {}
         direct_names = _direct_roots(tree, roots, resolver, target)
         for key, path in tree.paths.items():
             version, error = tree.chosen.get(key), tree.errors.get(key)
@@ -593,10 +599,13 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
             if version is not None and error is not None:
                 packages[i].error = error  # its dependencies couldn't be read: unknown, not a clean bill
             reach[i] = path
+            if key in tree.imposers:
+                imposed[i] = [(resolver.names.get(canonicalize_name(n), n), s) for n, s in tree.imposers[key]]
             if origin_names := direct_names.get(key):
                 direct[i] = tuple(resolver.names.get(name, name) for name in origin_names)
         deps_paths[target] = reach
         deps_direct[target] = direct
+        deps_imposed[target] = imposed
     if fc := source.format_control:  # --no-binary/--only-binary lines apply to the resolved packages too
         for p in packages:
             if not p.skip:
@@ -604,3 +613,4 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     source.packages = packages
     source.deps_paths = deps_paths
     source.deps_direct = deps_direct
+    source.deps_imposed = deps_imposed

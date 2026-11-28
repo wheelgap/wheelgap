@@ -1933,8 +1933,8 @@ def test_fix_reads_the_durations_uv_records_in_a_lock(
     _, out, _ = run(capsys, *args)
     assert (
         "  numpy 1.26.4 -> 2.1.0: linux-x86_64 (within your pyproject.toml constraint numpy>=1.26; "
-        f"needs uv's {setting} duration (P850D) shortened, or set to a time past 2024-08-18T22:13:47Z)\n"
-        f"First shorten uv's {setting} (P850D, a duration), or set it to a time past 2024-08-18T22:13:47Z: "
+        f"needs uv's {setting} span (P850D) shortened, or set to a time past 2024-08-18T22:13:47Z)\n"
+        f"First shorten uv's {setting} span (P850D), or set it to a time past 2024-08-18T22:13:47Z: "
         "numpy==2.1.0 was uploaded after its cutoff, so uv can't pick it before that.\n"
     ) in out
     assert "2024-07-31" not in out
@@ -1966,3 +1966,72 @@ def test_fix_on_a_pyproject_applies_its_exclude_newer(capsys, fake_pypi, gap_whe
         "exclude-newer moved past 2024-08-18T12:00:00Z)\n"
         "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z:"
     ) in out
+    assert "change the requirements" not in out  # its range already allows 2.0: only the cutoff holds it back
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_fix_constraint_note_is_per_target(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, order):
+    # permark<2 on Windows, permark>=1 elsewhere: one note for both targets was right for one of them only (#823).
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "permark",
+        {
+            "1.0": ["permark-1.0.tar.gz"],
+            "2.0": ["permark-2.0-cp314-cp314t-win_arm64.whl", "permark-2.0-cp314-cp314t-musllinux_1_2_x86_64.whl"],
+        },
+    )
+    dist = [
+        '{ name = "permark", specifier = "<2", marker = "sys_platform == \'win32\'" }',
+        '{ name = "permark", specifier = ">=1", marker = "sys_platform != \'win32\'" }',
+    ][::order]
+    lock = fixme_uv_lock(">=1.0").replace("fixme", "permark")
+    lock = lock.replace(
+        'requires-dist = [{ name = "permark", specifier = ">=1.0" }]', f"requires-dist = [{', '.join(dist)}]"
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    targets = ",".join(["musl-x86_64", "win-arm64"][::order])
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", targets, "--fix")
+    assert "  permark 1.0 -> 2.0: musl-x86_64 (within your pyproject.toml constraint permark>=1)\n" in out
+    assert "  permark 1.0 -> 2.0: win-arm64 (needs pyproject.toml's permark<2 relaxed)\n" in out
+
+
+def test_fix_says_first_move_once_for_every_cutoff_setting(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from wheelgap import cutoff
+
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "cutlib2",
+        {v: [{**f, "filename": f["filename"].replace("cutlib", "cutlib2")} for f in fs] for v, fs in CUTLIB.items()},
+    )
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2024, 8, 10, tzinfo=UTC))
+    lock = cutlib_uv_lock(
+        '[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n\n'
+        '[options.exclude-newer-package]\ncutlib2 = { timestamp = "0001-01-01T00:00:00Z", span = "P3D" }\n'
+    )
+    lock = lock.replace(
+        'dependencies = [{ name = "cutlib" }]', 'dependencies = [{ name = "cutlib" }, { name = "cutlib2" }]'
+    )
+    lock += lock[lock.index('[[package]]\nname = "cutlib"') :].replace("cutlib", "cutlib2")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert out.count("First ") == 1
+    assert (
+        "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z, and shorten uv's "
+        "exclude-newer-package cutlib2 span (P3D), or set it to a time past 2024-08-18T12:00:00Z: cutlib==2.0, "
+        "cutlib2==2.0 were uploaded after their cutoff, so uv can't pick them before that.\n"
+    ) in out
+    assert "2024-08-07" not in out  # the time P3D gives this run
+
+
+@pytest.mark.parametrize(
+    "line,what", [("x", "requirements"), ("x>=1", "requirements"), ("x==1", "pins"), ("x==1.*", "requirements")]
+)
+def test_fix_deps_says_pins_only_for_a_line_that_pins(line, what):
+    # --deps resolves every line to one release; a bare name or a range is still not a pin to change.
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    source = Source("requirements.txt", kind="requirements", specs=[line], deps_paths={target: {}})
+    cell = fix.Cell(Row(Package("x", "1"), {target: Status.SOURCE}), target, source, fix.UPGRADE, "2")
+    assert fix.how(source, [cell]) == [f"In requirements.txt, change the {what} to x==2."]

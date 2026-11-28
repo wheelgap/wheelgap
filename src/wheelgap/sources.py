@@ -303,6 +303,9 @@ class Source:
     deps_paths: dict[Target, dict[int, list[str]]] | None = None
     # --deps: all distinct direct requirements that reach each transitive package, per target.
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] | None = None
+    # --deps: per target, the specifier each other package in the tree puts on each package, with that package's name,
+    # for --fix to name the one that rules an upgrade out (#821).
+    deps_imposed: dict[Target, dict[int, list[tuple[str, str]]]] | None = None
 
     def cutoff_for(self, key: str) -> datetime | None:
         """The upload cutoff uv applies to this package: its exclude-newer-package entry, else exclude-newer."""

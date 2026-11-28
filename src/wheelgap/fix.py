@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
@@ -67,6 +68,8 @@ class Cell:
     # UPGRADE: when the release was uploaded after uv's exclude-newer for the package (#822), the cutoff and the time
     # it must be moved past (the upload of the release's last live file); uv can't pick the release before then.
     cutoff: tuple[datetime, datetime] | None = None
+    # HELD_BACK: the packages in the --deps tree whose requirement on it leaves `version` out, with that requirement
+    held: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,13 +112,13 @@ def plan(
         found = suggestions.get(id(r.package))
         for t in gap_targets(r, targets):
             fill = filled.get((id(r), t))
-            if found is not None and transitive(r, t, source) and (t in found.found or t in found.beyond):
-                # --deps: an upgrade of a dependency is outside what the package that requires it allows (#821).
+            newer = None if found is None else found.found.get(t) or found.beyond.get(t, (None,))[0]
+            if newer is not None and (blockers := held_by(r, t, source, newer)):
+                # --deps: another package in the tree requires a range that leaves the upgrade out (#821).
                 if fill is not None:
                     cells.append(Cell(r, t, source, GAP_WHEEL, fill=fill))
                 else:
-                    version = found.found[t] if t in found.found else found.beyond[t][0]
-                    cells.append(Cell(r, t, source, NONE, version=version, reason=HELD_BACK))
+                    cells.append(Cell(r, t, source, NONE, version=newer, reason=HELD_BACK, held=blockers))
                 continue
             if found is not None and t in found.found:
                 cells.append(Cell(r, t, source, UPGRADE, version=found.found[t], fill=fill))
@@ -151,17 +154,35 @@ def plan(
     return cells
 
 
+def held_by(row: Row, target: Target, source: Source, version: str) -> tuple[tuple[str, str], ...]:
+    """--deps: the other packages in the resolved tree whose requirement on the row's package leaves `version` out,
+    with that requirement (#821). Empty without --deps, and when none does: then what holds it back is a -c constraint,
+    the cutoff or the user's own range, which the upgrade line names."""
+    if source.deps_imposed is None:
+        return ()
+    index = next((i for i, p in enumerate(source.packages) if p is row.package), None)
+    out = []
+    for parent, spec in source.deps_imposed.get(target, {}).get(index, []) if index is not None else []:
+        try:
+            if spec and not SpecifierSet(spec).contains(Version(version), prereleases=True):
+                out.append((parent, f"{row.package.name}{spec}"))
+        except (InvalidSpecifier, InvalidVersion):
+            continue
+    return tuple(dict.fromkeys(out))
+
+
 def transitive(row: Row, target: Target, source: Source) -> bool:
     """--deps: whether the row's package is reached through another package on the target (not a direct requirement)."""
     return source.deps_paths is not None and len(row.via.get(target, ())) > 1
 
 
-def upload_cutoff(source: Source, pkg: Package) -> datetime | None:
+def upload_cutoff(source: Source, pkg: Package, now: datetime | None = None) -> datetime | None:
     """uv's exclude-newer for a package, which `uv lock --upgrade-package` applies too (#822): from a uv.lock's
     [options] (exclude-newer-package, else exclude-newer-span, a duration counted back from now as uv counts it each
     time it locks, else exclude-newer), or as a pyproject.toml or script sets it (Package.exclude_newer); None for
-    other inputs. ValueError, naming the setting, when one uv recorded in a uv.lock can't be read."""
-    return _cutoff(source, pkg)[0]
+    other inputs. ValueError, naming the setting, when one uv recorded in a uv.lock can't be read. A duration counts
+    back from `now` (default: the current time): pass one time for the whole run."""
+    return _cutoff(source, pkg, now)[0]
 
 
 def cutoff_span(source: Source, pkg: Package) -> str | None:
@@ -172,7 +193,7 @@ def cutoff_span(source: Source, pkg: Package) -> str | None:
         return None
 
 
-def _cutoff(source: Source, pkg: Package) -> tuple[datetime | None, str | None]:
+def _cutoff(source: Source, pkg: Package, now: datetime | None = None) -> tuple[datetime | None, str | None]:
     if source.kind != "uv":
         setting = cutoff_setting(source, pkg.key)
         span = next(
@@ -202,11 +223,11 @@ def _cutoff(source: Source, pkg: Package) -> tuple[datetime | None, str | None]:
             # uv records a duration as { timestamp = "0001-01-01T00:00:00Z", span = "P850D" }: the span counts.
             if isinstance(value, dict):
                 value = value["span"] if "span" in value else value.get("timestamp")
-            return parse_cutoff(value), value if isinstance(value, str) and is_duration(value) else None
+            return parse_cutoff(value, now), value if isinstance(value, str) and is_duration(value) else None
         if (span := options.get("exclude-newer-span")) is not None:
-            return parse_cutoff(span), span if isinstance(span, str) else None
+            return parse_cutoff(span, now), span if isinstance(span, str) else None
         if (value := options.get("exclude-newer")) is not None:
-            return parse_cutoff(value), value if isinstance(value, str) and is_duration(value) else None
+            return parse_cutoff(value, now), value if isinstance(value, str) and is_duration(value) else None
     except ValueError:
         what = f"exclude-newer-package for {named[pkg.key][0]}" if pkg.key in named else "exclude-newer"
         raise ValueError(f"the {what} {recorded}") from None
@@ -229,7 +250,7 @@ def cutoff_text(cell: Cell, code: Callable[[str], str]) -> str:
     setting = cutoff_setting(cell.source, cell.row.package.key)
     past = describe(cell.cutoff[1])
     if (span := cutoff_span(cell.source, cell.row.package)) is not None:
-        return f"needs uv's {code(setting)} duration ({span}) shortened, or set to a time past {past}"
+        return f"needs uv's {code(setting)} span ({span}) shortened, or set to a time past {past}"
     return f"needs uv's {code(setting)} moved past {past}"
 
 
@@ -401,30 +422,61 @@ def how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) 
     """What to run or change to move `source`'s packages to the releases of these upgrade cells, one line each; first,
     for releases uploaded after uv's exclude-newer, what to move it past (#822)."""
     first = _cutoff_lines(cells, code)
-    return first + _how(source, cells, code) if first else _how(source, cells, code)
+    edits = [c for c in cells if not _no_edit(c)]
+    relax = _relax_lines([c for c in cells if _no_edit(c)], code)
+    if not (first or relax or edits):  # a --deps dependency nothing seen holds back: pin it in the input
+        edits = cells
+    return first + relax + (_how(source, edits, code) if edits else [])
+
+
+def _no_edit(c: Cell) -> bool:
+    """Whether the input has nothing to change for this cell beyond what the cutoff and relax lines say: a --deps
+    dependency, which has no line of its own, or a pyproject.toml's or script's requirement that already allows the
+    release, held back only by the cutoff."""
+    if transitive(c.row, c.target, c.source):
+        return True
+    return (
+        c.cutoff is not None
+        and c.source.kind in ("pyproject", "script")
+        and ((own := constraint(c)) is None or own.allows)
+    )
+
+
+def _relax_lines(cells: list[Cell], code: Callable[[str], str]) -> list[str]:
+    """For cells with no line of their own to change, the user's own requirement or -c constraint to relax."""
+    out: dict[str, None] = {}
+    for c in cells:
+        if (own := constraint(c)) is not None and not own.allows and own.requirements:
+            reqs = ", ".join(map(code, own.requirements))
+            where = f"the -c constraints of {code(own.file)}" if own.via == "constraint" else code(own.file)
+            out[f"Relax {reqs} in {where} so it allows {code(f'{c.row.package.name}=={c.version}')}."] = None
+    return list(out)
 
 
 def _cutoff_lines(cells: list[Cell], code: Callable[[str], str]) -> list[str]:
-    by_setting: dict[tuple[str, str], list[Cell]] = {}
+    """One line for the releases uploaded after uv's exclude-newer: each setting to change, and what to (#822)."""
+    changes: dict[str, list[datetime]] = {}
+    pins: list[str] = []
     for c in cells:
-        if c.cutoff is not None:
-            span = cutoff_span(c.source, c.row.package)
-            # A duration is shown as written: the time it gives moves with every run.
-            now = f"{span}, a duration" if span is not None else describe(c.cutoff[0])
-            by_setting.setdefault((cutoff_setting(c.source, c.row.package.key), now), []).append(c)
-    out = []
-    for (setting, now), cs in by_setting.items():
-        pins, past = _pins(cs), describe(max(c.cutoff[1] for c in cs if c.cutoff is not None))
-        one = len(pins) == 1
-        if now.endswith(", a duration"):
-            change = f"First shorten uv's {code(setting)} ({now}), or set it to a time past {past}"
+        if c.cutoff is None:
+            continue
+        pins += [f"{c.row.package.name}=={c.version}"]
+        setting = cutoff_setting(c.source, c.row.package.key)
+        if (span := cutoff_span(c.source, c.row.package)) is not None:
+            # A duration's cutoff moves with every run: name the duration, never the time it gives now.
+            change = f"shorten uv's {code(setting)} span ({span}), or set it to a time past {{past}}"
         else:
-            change = f"First move uv's {code(setting)} ({now}) past {past}"
-        out.append(
-            f"{change}: {', '.join(map(code, pins))} {'was' if one else 'were'} uploaded after its cutoff, so uv "
-            f"can't pick {'it' if one else 'them'} before that."
-        )
-    return out
+            change = f"move uv's {code(setting)} ({describe(c.cutoff[0])}) past {{past}}"
+        changes.setdefault(change, []).append(c.cutoff[1])
+    if not changes:
+        return []
+    pins = list(dict.fromkeys(pins))
+    one = len(pins) == 1
+    said = ", and ".join(change.format(past=describe(max(times))) for change, times in changes.items())
+    return [
+        f"First {said}: {', '.join(map(code, pins))} {'was' if one else 'were'} uploaded after "
+        f"{'its' if one else 'their'} cutoff, so uv can't pick {'it' if one else 'them'} before that."
+    ]
 
 
 def _how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) -> list[str]:
@@ -491,9 +543,30 @@ def _what(cells: list[Cell]) -> str:
         or c.row.package.written_spec
         or c.row.package.version_from_index
         or c.row.package.key in c.source.constraint_specs
+        or c.source.deps_paths is not None
+        and not _deps_pinned(c.source, c.row.package.key)
         for c in cells
     )
     return "requirements" if ranged else "pins"
+
+
+def _deps_pinned(source: Source, key: str) -> bool:
+    """--deps: whether the input's line for the package pins one release (`==` or `===`, no wildcard); a bare name
+    or a range isn't a pin, though --deps resolved it to one."""
+    lines = []
+    for text in source.specs:
+        try:
+            req = Requirement(text)
+        except InvalidRequirement:
+            return False
+        if canonicalize_name(req.name) == key:
+            lines.append(req)
+    return bool(lines) and all(
+        len(req.specifier) == 1
+        and next(iter(req.specifier)).operator in ("==", "===")
+        and "*" not in str(req.specifier)
+        for req in lines
+    )
 
 
 def constraint_text(c: Constraint, code: Callable[[str], str] = _plain) -> str:
@@ -526,20 +599,18 @@ REASON_TEXT = {
     LOSES: "every newer release with a wheel drops one it has elsewhere",
     UV_MAY_FORK: "every newer release with a wheel drops one it has on another Python",
     NO_BINARY: "--no-binary, so pip uses no wheel for it",
-    HELD_BACK: "it's a dependency, and --deps took the newest release the requirements on it allow",
+    HELD_BACK: "another package's requirement on it rules out the newer release with a wheel",
 }
 
 
 def _reason(reason: str, cs: list[Cell], multi_py: bool) -> str:
     text = f"{REASON_TEXT[reason]} for {_labels(cs, multi_py)}"
     drops = list(dict.fromkeys(c.drops for c in cs if c.drops))
-    if reason == HELD_BACK:  # the newer release with the wheel, and the direct requirements that bring it in
+    if reason == HELD_BACK:  # the newer release with the wheel, what rules it out, and what brings that in
         newer = ", ".join(dict.fromkeys(c.version for c in cs if c.version))
-        through = list(dict.fromkeys(n for c in cs for n in c.row.direct_via.get(c.target, ())))
-        text += f" (its {newer} has the wheel"
-        if through:
-            text += f"; upgrade or relax {', '.join(through)}, which {'brings' if len(through) == 1 else 'bring'} it in"
-        return text + ")"
+        held = list(dict.fromkeys(h for c in cs for h in c.held))
+        text += f" (its {newer} has the wheel, but " + ", ".join(f"{p} requires {req}" for p, req in held)
+        return text + f": upgrade or relax {', '.join(dict.fromkeys(p for p, _ in held))} first)"
     if reason in (LOSES, UV_MAY_FORK) and drops:  # name what the nearest one drops
         lost = "; ".join(
             f"{version} has none for {', '.join(dict.fromkeys(t.label(multi_py) for t in ts))}" for version, ts in drops
@@ -590,16 +661,16 @@ def _lines(
     upgrades = [c for c in cells if c.kind == UPGRADE]
     up = []
     for (name, pinned, version), cs in _by_package(upgrades).items():
-        line = f"{item}{code(f'{name} {pinned} -> {version}')}"
-        if prerelease(version):  # only for a pre-release pin, when no one final release fits every target (#825)
-            line += f" ({PRERELEASE_TEXT})"
-        line += f": {_labels(cs, multi_py)}"
-        notes = [constraint_text(own, code)] if (own := constraint(cs[0])) is not None else []
-        if moved := next((c for c in cs if c.cutoff is not None), None):
-            notes.append(cutoff_text(moved, code))
-        if notes:
-            line += f" ({'; '.join(notes)})"
-        up.append(line)
+        # Per target: a requirement's marker (#823), a cutoff or a --deps path can differ between them.
+        by_notes: dict[tuple[str, ...], list[Cell]] = {}
+        for c in cs:
+            by_notes.setdefault(_notes(c, code), []).append(c)
+        for notes, group in by_notes.items():
+            line = f"{item}{code(f'{name} {pinned} -> {version}')}"
+            if prerelease(version):  # only for a pre-release pin, when no one final release fits every target (#825)
+                line += f" ({PRERELEASE_TEXT})"
+            line += f": {_labels(group, multi_py)}"
+            up.append(line + (f" ({'; '.join(notes)})" if notes else ""))
     versions: dict[int, set[str | None]] = {}
     for c in upgrades:
         versions.setdefault(id(c.row), set()).add(c.version)
@@ -634,6 +705,17 @@ def _lines(
         for why, names in _why_not_looked_up(cells, not_looked_up)
     ]
     return up, ways, none, forks, unlooked
+
+
+def _notes(c: Cell, code: Callable[[str], str]) -> tuple[str, ...]:
+    """What an upgrade line says about one cell: the user's own requirement, the cutoff, and for a --deps dependency
+    what brings it in (it has no line of its own to change)."""
+    notes = [constraint_text(own, code)] if (own := constraint(c)) is not None else []
+    if c.cutoff is not None:
+        notes.append(cutoff_text(c, code))
+    if transitive(c.row, c.target, c.source) and (through := c.row.direct_via.get(c.target)):
+        notes.append(f"a dependency of {', '.join(map(code, through))}")
+    return tuple(notes)
 
 
 def _by_source(cells: list[Cell]) -> dict[int, list[Cell]]:
