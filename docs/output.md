@@ -615,7 +615,8 @@ mapped to the reason, as in `{"agent_client_protocol-0.11.1-py3-none-any.whl": "
 
 A package that is `unknown` on a target for a reason other than a failed lookup gets `unknown_reasons`, with or
 without `--explain`: each such target mapped to why. For now that's a Poetry 1.x `poetry.lock` checked without a
-`pyproject.toml` that declares the project's dependencies; see [poetry.lock](inputs.md#poetrylock).
+`pyproject.toml` that declares the project's dependencies, or one whose project requires the package there only under a
+marker or Python restriction wheelgap can't decide; see [poetry.lock](inputs.md#poetrylock).
 
 If an input can't be read (a missing lockfile, an unknown target, a bad `[tool.wheelgap]` value), `--json` prints an
 error object on stdout instead of results, next to the usual `wheelgap: error:` line on stderr and exit code 2:

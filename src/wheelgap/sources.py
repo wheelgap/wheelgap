@@ -1729,7 +1729,7 @@ def _project_dependencies(pyproject: Path) -> list[Edge] | None:
                 python = entry.get("python", "*")
                 if python != "*":
                     try:
-                        constraint = SpecifierSet(python)
+                        constraint = SpecifierSet(_poetry_python_specifier(python))
                         python_marker = " and ".join(
                             f'python_full_version {clause.operator} "{clause.version}"' for clause in constraint
                         )
@@ -1739,6 +1739,31 @@ def _project_dependencies(pyproject: Path) -> list[Edge] | None:
                 version = entry.get("version") if entry else variant
                 edges.append((name, version if isinstance(version, str) and version != "*" else None, marker, None))
     return edges
+
+
+_POETRY_PYTHON = re.compile(r"\s*([\^~]?)\s*(\d+(?:\.\d+){0,2})\s*")
+
+
+def _poetry_python_specifier(text: str) -> str:
+    """A dependency's Poetry `python` constraint as PEP 440, for the caret, tilde and bare-version forms that aren't
+    PEP 440 (poetry-core 2.x's parse_single_constraint in src/poetry/core/constraints/version/parser.py, turned into a
+    marker by create_nested_marker): `^3.12` is `>=3.12,<4.0`, `~3.12` is `>=3.12,<3.13`, `~3` is `>=3,<4.0`, a bare
+    `3.12` is `python_version == "3.12"`, so `==3.12.*`, and a bare `3.12.1` is `==3.12.1`. Anything else, including
+    a caret on major 0 and a bare major version, comes back unchanged, to be read as PEP 440 or be `unknown`."""
+    m = _POETRY_PYTHON.fullmatch(text) if isinstance(text, str) else None
+    if m is None:
+        return text
+    op, version = m.groups()
+    parts = [int(x) for x in version.split(".")]
+    if (op == "^" and parts[0] > 0) or (op == "~" and len(parts) == 1):
+        return f">={version},<{parts[0] + 1}.0"
+    if op == "~":
+        return f">={version},<{parts[0]}.{parts[1] + 1}"
+    if not op and len(parts) == 2:
+        return f"=={version}.*"
+    if not op and len(parts) == 3:
+        return f"=={version}"
+    return text
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:

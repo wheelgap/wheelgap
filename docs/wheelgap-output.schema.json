@@ -522,7 +522,7 @@
                     "additionalProperties": {"type": "string", "description": "Keyed by filename, not by target label: why pip refuses that file."}
                 },
                 "unknown_reasons": {
-                    "description": "Present when a target is unknown for a reason other than a failed lookup: a Poetry 1.x poetry.lock checked without a pyproject.toml that declares the project's dependencies, where no dependency installs the package on that target, it has no wheel there, and Poetry installs it anyway if the project requires it directly. Keyed by target label, as results is. Never empty: left out otherwise.",
+                    "description": "Present when a target is unknown for a reason other than a failed lookup: a Poetry 1.x poetry.lock checked without a pyproject.toml that declares the project's dependencies, where no dependency installs the package on that target, it has no wheel there, and Poetry installs it anyway if the project requires it directly; or a Poetry 1.x poetry.lock whose pyproject.toml requires the package on that target only under a marker or Python restriction wheelgap can't decide, where it has no wheel. Keyed by target label, as results is. Never empty: left out otherwise.",
                     "type": "object",
                     "additionalProperties": {"type": "string"}
                 }

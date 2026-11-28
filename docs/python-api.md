@@ -164,7 +164,7 @@ Each check returns a `Result` (a list of them for `check_packages()`, `check_loc
 | `bundled_versions`, `bundled_version`, `bundled_version_differs` | with `pyodide_locks`: see [Pyodide](#pyodide) |
 | `issues_url` | the package's issue tracker URL from PyPI metadata, or `None` when absent or not on PyPI |
 | `pip_refuses` | for a `uv.lock` checked with `online=True`: the files uv installs and pip would refuse, each mapped to the reason (`"requires Python <3.15,>=3.10"`); empty otherwise. uv checks the `Requires-Python` lower bound, and `statuses` follow uv. `to_dict()` includes `"pip_refuses"` when it isn't empty |
-| `unknown_reasons` | each target that is `unknown` for a reason other than a failed lookup, mapped to why (a Poetry 1.x lock checked without its project's dependencies: see [poetry.lock](inputs.md#poetrylock)); empty otherwise. `to_dict()` includes `"unknown_reasons"` when it isn't empty |
+| `unknown_reasons` | each target that is `unknown` for a reason other than a failed lookup, mapped to why (a Poetry 1.x lock checked without its project's dependencies, or whose project requires the package there only under a condition wheelgap can't decide: see [poetry.lock](inputs.md#poetrylock)); empty otherwise. `to_dict()` includes `"unknown_reasons"` when it isn't empty |
 | `to_dict()` | the package in the shape of a `--json` package entry, keyed by each target's full label (`"3.13 musl-aarch64"`, with the Python even when only one is checked) |
 
 ### Explaining a gap

@@ -1219,7 +1219,10 @@ def dropped_targets(local: list[str], last: list[tuple[str, str | None]], target
 def reachable(source: Source, target: Target, *, certain: bool = False) -> dict[int, Parent]:
     """Packages installed on `target`, each mapped to the parent it was first reached from.
 
-    The walk is breadth-first from the roots, so following the parents gives a shortest path.
+    The walk is breadth-first from the roots, so following the parents gives a shortest path. With `certain`, a
+    project's own dependency (`root_edges`) whose condition the target can't decide isn't followed; the lock's own
+    edges are followed as without it (a Poetry 1.x lock's `extra == "css"` edge is there because a package asked for
+    the extra, #838).
     """
     if source.uv_selection is not None or source.uv_packages is not None:
         return _uv_reachable(source, target)
@@ -1227,10 +1230,10 @@ def reachable(source: Source, target: Target, *, certain: bool = False) -> dict[
     for i, p in enumerate(source.packages):
         by_name.setdefault(p.key, []).append(i)
 
-    def follow(edge: Edge) -> list[int]:
+    def follow(edge: Edge, *, root: bool = False) -> list[int]:
         name, version, marker, edge_source = edge
         value = marker_value(marker, target)
-        if value is False or (certain and value is None):
+        if value is False or (certain and root and value is None):
             return []
         return _narrow_candidates(
             source,
@@ -1258,7 +1261,7 @@ def reachable(source: Source, target: Target, *, certain: bool = False) -> dict[
                 visit(j, i)
     grouped = sorted(range(len(source.root_edges)), key=lambda k: k in source.root_groups)
     for k in grouped:
-        for j in follow(source.root_edges[k]):
+        for j in follow(source.root_edges[k], root=True):
             visit(j, source.root_groups.get(k))
     while queue:
         i = queue.popleft()
@@ -1606,9 +1609,16 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                     if needed or source.poetry_roots_unknown
                     else Status.NOT_NEEDED
                 )
-                if needed and certain_installed is not None and i not in certain_installed[t]:
-                    # Reached only through a condition (marker or Python restriction) wheelgap can't decide here (#836).
+                if (
+                    needed
+                    and certain_installed is not None
+                    and status not in (Status.WHEEL, Status.NOT_NEEDED)
+                    and i not in certain_installed[t]
+                ):
+                    # Installed only through a project dependency whose marker or Python restriction wheelgap can't
+                    # decide here (#836): a gap if Poetry installs it, nothing if not. A wheel is a wheel either way.
                     status = Status.UNKNOWN
+                    row.unknown_reasons[t] = POETRY_CONDITION_REASON
                 if needed and status is Status.MISSING and resolved.other_hashes:
                     # No file with a listed sha256 fits here, so pip doesn't filter by them (filter_unallowed_hashes)
                     # and checks its pick against the line's sha384/sha512 hashes too, which wheelgap can't match.
@@ -1662,6 +1672,12 @@ def _drop_unused_group_rows(rows: list[Row]) -> list[Row]:
     ]
 
 
+POETRY_CONDITION_REASON = (
+    "the project requires it here only through a dependency whose marker or Python restriction in pyproject.toml "
+    "wheelgap can't decide for this target, so whether Poetry installs it here is unknown"
+)
+
+
 def poetry_roots_reason(source: Source) -> str:
     """Why a package a Poetry 1.x lock's walk leaves out is UNKNOWN on a target (#815)."""
     return (
@@ -1673,7 +1689,14 @@ def poetry_roots_reason(source: Source) -> str:
 
 def poetry_roots_note(sources: list[Source], rows: list[Row]) -> str | None:
     """The run's note for the packages poetry_roots_reason made UNKNOWN, naming at most five."""
-    names = list(dict.fromkeys(r.package.name for r in rows if any(t not in r.ignored for t in r.unknown_reasons)))
+    reasons = {poetry_roots_reason(source) for source in sources if source.poetry_roots_unknown}
+    names = list(
+        dict.fromkeys(
+            r.package.name
+            for r in rows
+            if any(t not in r.ignored and why in reasons for t, why in r.unknown_reasons.items())
+        )
+    )
     why = "; ".join(source.poetry_roots_unknown for source in sources if source.poetry_roots_unknown)
     if not names or not why:
         return None

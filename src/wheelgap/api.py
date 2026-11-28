@@ -139,7 +139,8 @@ class Result:
     issues_url: str | None = None
     pip_refuses: dict[str, str] = field(default_factory=dict)
     # Why a target is UNKNOWN when the lookup didn't fail: a Poetry 1.x lock checked without its project's
-    # dependencies, where no dependency installs the package there but the project may require it directly.
+    # dependencies, where no dependency installs the package there but the project may require it directly; or one
+    # whose project requires it there only under a marker or Python restriction wheelgap can't decide.
     unknown_reasons: dict[Target, str] = field(default_factory=dict)
 
     @property

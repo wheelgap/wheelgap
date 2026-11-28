@@ -288,9 +288,12 @@ as `private index`.
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
 next to the lock. Direct dependencies retain their environment markers and PEP 440 `python` restrictions from
 `pyproject.toml`, including alternative entries and dependency groups. A dependency excluded on a target is `n/a`;
-when its only dependency paths have conditions the target cannot decide, it is `unknown`. This includes patch-level
-Python restrictions and Poetry-specific Python constraints that aren't PEP 440 specifiers (such as `^3.12`). An
-unconditional path to the same package still counts normally.
+when it is installed only through a project dependency whose condition the target can't decide (a patch-level
+Python restriction such as `>=3.12.4` on 3.12, `platform_release`), and it has no wheel there, it is `unknown`, with
+the reason under `--explain` and in `unknown_reasons` in `--json`. Poetry's `^3.12`, `~3.12` and bare `3.12` Python
+constraints are read as `>=3.12,<4.0`, `>=3.12,<3.13` and `==3.12.*`; any other Poetry-only constraint is `unknown`.
+An unconditional path to the same package still counts normally, and the lock's own `extra` edges are followed as
+installed.
 
 Without a `pyproject.toml` beside the lock that declares the project's dependencies (none, one that can't be read, or
 one with no dependencies at all), wheelgap can't tell a direct dependency that another package needs only under a
