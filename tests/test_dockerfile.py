@@ -5381,11 +5381,8 @@ def test_dockerfile_requirements_reads_a_file_no_unread_command_may_have_changed
 _SETTINGS = (
     "PIP_NO_CACHE_DIR PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK PIP_ROOT_USER_ACTION PIP_NO_INPUT PIP_PROGRESS_BAR "
     "PIP_NO_COLOR PIP_DEFAULT_TIMEOUT PIP_TIMEOUT PIP_RETRIES PIP_QUIET PIP_VERBOSE PIP_NO_WARN_SCRIPT_LOCATION "
-    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING UV_NO_CACHE UV_CACHE_DIR "
-    "UV_COMPILE_BYTECODE UV_LINK_MODE UV_NO_PROGRESS UV_HTTP_TIMEOUT UV_HTTP_RETRIES UV_CONCURRENT_DOWNLOADS "
-    "UV_CONCURRENT_BUILDS UV_CONCURRENT_INSTALLS UV_PYTHON_DOWNLOADS UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR UV_TOOL_DIR "
-    "UV_INSTALL_DIR UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL "
-    "UV_NO_EDITABLE UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON UV_SYSTEM_CERTS UV_VERSION "
+    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING UV_CACHE_DIR "
+    "UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR UV_TOOL_DIR UV_INSTALL_DIR UV_PROJECT_ENVIRONMENT UV_VERSION "
     "PYTHONUNBUFFERED "
     "pip_index_url NOTE"
 ).split()
@@ -5399,6 +5396,58 @@ def test_dockerfile_requirements_reads_settings_that_dont_change_what_is_install
     lines, report = _inputs(tmp_path, form.format(name) + "\n" + _INSTALL)
     assert lines == [5]
     assert report.notes == []
+
+
+# A UV_ setting with a fixed kind of value: one value uv takes, and one it refuses (it exits 2 on it).
+_UV_VALUE_CASES = [
+    ("UV_NO_CACHE", "yes", "maybe"),
+    ("UV_COMPILE_BYTECODE", "0", "2"),
+    ("UV_NO_PROGRESS", "off", "maybe"),
+    ("UV_BREAK_SYSTEM_PACKAGES", "TRUE", "maybe"),
+    ("UV_NO_INSTALL_PROJECT", "f", "x"),
+    ("UV_NO_INSTALL_WORKSPACE", "no", "x"),
+    ("UV_NO_INSTALL_LOCAL", "on", "x"),
+    ("UV_NO_EDITABLE", "t", "x"),
+    ("UV_SYSTEM_PYTHON", "1", "maybe"),
+    ("UV_SYSTEM_CERTS", "false", "2"),
+    ("UV_LINK_MODE", "copy", "bogus"),
+    ("UV_LINK_MODE", "hardlink", "Copy"),
+    ("UV_HTTP_TIMEOUT", "30", "abc"),
+    ("UV_HTTP_RETRIES", "0", "-1"),
+    ("UV_CONCURRENT_DOWNLOADS", "4", "0"),
+    ("UV_CONCURRENT_BUILDS", "4", "bogus"),
+    ("UV_CONCURRENT_INSTALLS", "1", "0"),
+    ("UV_PYTHON_DOWNLOADS", "never", "bogus"),
+    ("UV_PYTHON_DOWNLOADS", "1", "yes"),
+    ("UV_HTTP_TIMEOUT", "+5", "18446744073709551616"),
+    ("UV_HTTP_RETRIES", "4294967295", "4294967296"),
+    ("UV_CONCURRENT_DOWNLOADS", "007", "2305843009213693952"),
+    ("UV_CONCURRENT_BUILDS", "4", "+0"),
+]
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+@pytest.mark.parametrize("form", ["ENV {0}={1}", "ENV {0} {1}", "ARG {0}={1}", "ENV A=1 {0}={1} B=2"])
+def test_dockerfile_requirements_reads_uv_settings_with_a_value_uv_takes(tmp_path, name, good, bad, form):
+    lines, report = _inputs(tmp_path, form.format(name, good) + "\n" + _INSTALL)
+    assert lines == [5]
+    assert report.notes == []
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+@pytest.mark.parametrize(
+    ("body", "keyword"),
+    [
+        ("ENV {0}={1}\n" + _INSTALL, "ENV "),
+        ("ENV {0} {1}\n" + _INSTALL, "ENV "),
+        ("ARG {0}={1}\n" + _INSTALL, "ARG "),
+        ("ENV A=1 {0}={1} B=2\n" + _INSTALL, "ENV "),
+        ("RUN {0}={1} pip install -r requirements.txt\n", ""),
+    ],
+)
+def test_dockerfile_requirements_refuses_uv_settings_with_a_value_uv_refuses(tmp_path, name, good, bad, body, keyword):
+    with pytest.raises(DockerfileError, match=f":4: {keyword}{re.escape(f'{name}={bad} is not a value uv takes: ')}"):
+        _inputs(tmp_path, body.format(name, bad))
 
 
 _RISKY = (

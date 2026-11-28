@@ -2392,6 +2392,33 @@ _UV_HARMLESS_ENV = frozenset(
     "UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL UV_NO_EDITABLE UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON "
     "UV_SYSTEM_CERTS UV_VERSION".split()
 )
+# The values uv takes for the settings above that take a fixed kind of value: a value outside it makes uv exit 2 on
+# the command that reads it (or, for a concurrency limit past the largest permit count, crash), so such a line is
+# refused. Each rule is (pattern, what uv takes, largest number or None). Checked against uv 0.13.7's parsers: a
+# "boolish" switch takes y, yes, t, true, on, 1 and their opposites, in any capitals; a link mode is one of four
+# lowercase words; UV_PYTHON_DOWNLOADS takes those words and 1 or 0 in any capitals; numbers take an optional "+"
+# (a leading zero is fine), the timeout is a u64, the retries a u32, and a concurrency limit is at most 2**61 - 1.
+_UV_BOOLISH = "(?i:y|yes|t|true|on|1|n|no|f|false|off|0)"
+_UV_NUMBER = r"\+?[0-9]+"
+_UV_VALUES: dict[str, tuple[str, str, int | None]] = {
+    **dict.fromkeys(
+        "UV_NO_CACHE UV_COMPILE_BYTECODE UV_NO_PROGRESS UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT "
+        "UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL UV_NO_EDITABLE UV_SYSTEM_PYTHON UV_SYSTEM_CERTS".split(),
+        (_UV_BOOLISH, "1, 0, true, false, yes, no, on or off", None),
+    ),
+    "UV_LINK_MODE": ("clone|copy|hardlink|symlink", "clone, copy, hardlink or symlink", None),
+    "UV_PYTHON_DOWNLOADS": (
+        "(?i:auto|automatic|manual|never|true|false|1|0)",
+        "auto, automatic, manual, never, true, false, 1 or 0",
+        None,
+    ),
+    "UV_HTTP_TIMEOUT": (_UV_NUMBER, "a whole number of seconds up to 18446744073709551615", 2**64 - 1),
+    "UV_HTTP_RETRIES": (_UV_NUMBER, "a whole number up to 4294967295", 2**32 - 1),
+    **dict.fromkeys(
+        ("UV_CONCURRENT_DOWNLOADS", "UV_CONCURRENT_BUILDS", "UV_CONCURRENT_INSTALLS"),
+        (r"\+?0*[1-9][0-9]*", "a whole number from 1 to 2305843009213693951", 2**61 - 1),
+    ),
+}
 # Words that name a pip or uv configuration file: a command that isn't read and names one may be writing it.
 _CONFIG_WORDS = (
     "pip.conf",
@@ -2466,6 +2493,18 @@ def _installer_setting(name: str) -> bool:
     """Whether an environment variable is a pip or uv setting that may change what is installed. pip reads a name
     that starts with PIP_ (in capitals) and lowercases the rest; uv's names are all capitals."""
     return name.startswith(("PIP_", "UV_")) and name.upper() not in _PIP_HARMLESS_ENV | _UV_HARMLESS_ENV
+
+
+def _uv_value_problem(name: str, value: str | None) -> str | None:
+    """Why a value of a UV_ setting makes uv exit 2, as a message naming the setting, the value and the values uv
+    takes; None when the value is one uv takes, when the setting has no rule, or when the value isn't known."""
+    rule = _UV_VALUES.get(name)
+    if rule is None or value is None:
+        return None
+    pattern, takes, largest = rule
+    if re.fullmatch(pattern, value) and (largest is None or int(value) <= largest):
+        return None
+    return f"{name}={value} is not a value uv takes: {takes}"
 
 
 @dataclass
@@ -2784,6 +2823,7 @@ class _RunReader:
         cwd, cwd_error = workdir, workdir_error
         depth = 0  # inside if, for, while, until or { }
         risky_setting: str | None = None
+        risky_value: str | None = None  # a UV_ setting whose value uv refuses
         project_environment = False  # UV_PROJECT_ENVIRONMENT set on this RUN, which a read `uv sync` refuses
         names_installer = False  # a pip or uv command, read or not
         exited: str | None = None  # an `exit` or `return` before the command: it may never run
@@ -2856,6 +2896,8 @@ class _RunReader:
             for name, value in assigns:
                 if _installer_setting(name):
                     risky_setting = name
+                if (problem := _uv_value_problem(name, value.text)) is not None:
+                    risky_value = problem
                 if name == "UV_PROJECT_ENVIRONMENT":
                     project_environment = True
                 if name == "PATH":
@@ -2981,6 +3023,8 @@ class _RunReader:
                         "config file"
                     )
                     break
+        if risky_value and names_installer:
+            stop(risky_value)
         if risky_setting and names_installer:
             if risky_setting.endswith(":"):
                 stop(f"{risky_setting} a setting on this RUN may change what pip or uv installs")
@@ -4715,6 +4759,8 @@ def _dockerfile_requirements(
                 if _installer_setting(name):
                     # The value is left out: an index URL may hold credentials.
                     run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
+                elif (problem := _uv_value_problem(name, value)) is not None:
+                    run_error = f"line {number}: {keyword} {problem}"
                 elif name == "UV_SYSTEM_PYTHON":
                     uv_system = value is not None and value.lower() in ("1", "true")
         elif keyword == "RUN":
