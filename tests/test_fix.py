@@ -1425,6 +1425,26 @@ def test_fix_names_the_included_file_whose_range_holds_an_upgrade_back(capsys, f
     assert "In common/requirements.txt, change the requirements to fixme==1.3.\n" in out
 
 
+@pytest.mark.parametrize(
+    ("files", "shown"),
+    [
+        ({"requirements.txt": "fixme<1.3\n"}, "svc/requirements.txt"),
+        ({"requirements.txt": "-r common.txt\n", "common.txt": "fixme<1.3\n"}, "svc/common.txt"),
+    ],
+)
+def test_fix_names_a_subfolder_inputs_file_by_the_subfolder_label(
+    capsys, fake_pypi, gap_wheels, tmp_path, files, shown
+):
+    # A folder whose one input is svc/requirements.txt labels it so: the note and the change line name the file
+    # there, not a bare requirements.txt that reads as the folder's own.
+    (tmp_path / "svc").mkdir()
+    for name, text in files.items():
+        (tmp_path / "svc" / name).write_text(text, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert f"(needs {shown}'s fixme<1.3 relaxed)\n" in out
+    assert f"In {shown}, change the requirements to fixme==1.3.\n" in out
+
+
 def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
     _, out, _ = run(capsys, _fixme_requirements(tmp_path, "fixme<1.3\n"), "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out

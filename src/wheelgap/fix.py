@@ -13,6 +13,7 @@ are looked up. Like the rest of --fix, nothing here changes a status, the summar
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -180,7 +181,7 @@ def constraint(cell: Cell) -> Constraint | None:
         except InvalidSpecifier:
             same = False
         # A requirements file names the file whose line it is: a -r include's, not the top file's (#826).
-        file = (pkg.origin if source.kind == "requirements" else None) or source.label
+        file = _origin_file(pkg.origin, source) if source.kind == "requirements" else source.label
         specs = [written if same and written else pkg.spec]
     else:
         return None
@@ -188,6 +189,16 @@ def constraint(cell: Cell) -> Constraint | None:
         return None
     specs = [s for s in specs if s]  # a bare name bounds nothing
     return _judged(cell, specs, [f"{pkg.name}{s}" for s in specs], file, "requirement")
+
+
+def _origin_file(origin: str | None, source: Source) -> str:
+    """The requirements file whose line it is, as the source's label names files: the top file is the label itself
+    (a subfolder's is `svc/requirements.txt`), and an include's path, relative to the top file, sits in the label's
+    folder."""
+    if not origin or (source.path is not None and origin == source.path.name):
+        return source.label
+    folder = posixpath.dirname(source.label)
+    return posixpath.normpath(posixpath.join(folder, origin)) if folder else origin
 
 
 def _judged(cell: Cell, specs: list[str], shown: list[str], file: str, via: str) -> Constraint | None:
@@ -304,7 +315,7 @@ def how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) 
         # The file whose line pins it: a -r include's, not the top file's.
         by_file: dict[str, list[Cell]] = {}
         for c in cells:
-            by_file.setdefault(c.row.package.origin or source.label, []).append(c)
+            by_file.setdefault(_origin_file(c.row.package.origin, source), []).append(c)
         return [
             f"In {code(f)}, change the {_what(cs)} to {', '.join(map(code, _pins(cs)))}." for f, cs in by_file.items()
         ]
