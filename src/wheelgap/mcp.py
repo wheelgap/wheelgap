@@ -473,7 +473,10 @@ TOOLS: list[dict[str, Any]] = [
             "OLD NEW --json` does, and report what got worse: 'worse' lists packages whose status dropped on a target "
             "(e.g. wheel → source after a version bump), 'new' lists added packages with a gap, and 'ok' is true only "
             "when both are empty. A package that can no longer be checked (unknown, or now from git, a path, a URL or a"
-            " private index) counts as worse; 'unchecked' names packages unknown on both sides at the same version. "
+            " private index) counts as worse; 'unchecked' names packages unknown on both sides at the same version, "
+            "and 'not_compared' the targets whose Python either lockfile's requires-python leaves out, which aren't "
+            "compared and never count as worse: when ok is true, check not_compared too, since sides ['new'] means the "
+            "change dropped that Python (uv sync there now fails). "
             "Pass the old lockfile as 'old' under its own file name, since the name says how to read it: e.g. `mkdir -p"
             " /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock` (this works after the upgrade too, until it's "
             "committed). Unlike `wheelgap diff`, the project's [tool.wheelgap] settings don't apply: pass python, "
@@ -966,6 +969,7 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
     if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
         targets = diff.lock_default_targets(paths, targets)[0]
     sides = []
+    sources = []
     for path in paths:
         try:
             # As in `wheelgap diff`: no offline mode, so a lock made for other Pythons is re-checked on the index
@@ -980,7 +984,9 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         packages = diff.merge(results, targets)
         diff.add_skipped(packages, source, targets)
         sides.append(packages)
-    report = diff.compare(sides[0], sides[1], targets)
+        sources.append(source)
+    # As `wheelgap diff` (#807): a target whose Python either lock's requires-python leaves out isn't compared.
+    report = diff.compare(sides[0], sides[1], targets, diff.not_covered(sources, targets))
     data: dict[str, Any] = json.loads(diff.json_report(report, targets))
     del data["version"]  # the server's version is in its serverInfo (initialize's, or the result's _meta)
     data["ok"] = not report.worse and not report.new
