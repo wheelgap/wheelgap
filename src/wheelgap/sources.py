@@ -774,20 +774,97 @@ class UvRules:
     """What uv does to a pyproject.toml or script's requirements beyond what they say (#810, #811): the build
     restrictions in the settings it applies, and [tool.uv.sources], by canonical name (each entry with the file
     it's in), which take a requirement from git, a path, a URL, a workspace member or a named index instead of the
-    default one. `indexes` maps the names of [[tool.uv.index]] entries to their URLs."""
+    default one. `indexes` maps the names of the [[tool.uv.index]] entries a source may name to their URLs, and
+    `package_index` says where uv takes a requirement without a source of its own from (_UvPackageIndex)."""
 
     policy: _BuildPolicy
     sources: dict[str, tuple[object, Path]]
     indexes: dict[str, str]
+    package_index: _UvPackageIndex
 
     def apply(self, pkg: Package) -> None:
         if pkg.skip:  # a direct URL: not from an index whatever the settings
             return
         if not self.policy.no_sources and (found := self.sources.get(pkg.key)) is not None:
             _apply_uv_source(pkg, *found, self.indexes)
-            if pkg.skip or pkg.error:
-                return
+        else:
+            self.package_index.apply(pkg)
+        if pkg.skip or pkg.error:
+            return
         self.policy.apply(pkg)
+
+
+def _is_pypi_index(url: str) -> bool:
+    return url.rstrip("/") == "https://pypi.org/simple"
+
+
+def _shown_index(url: str) -> str:
+    """An index URL for a note, without the user and password it may hold."""
+    try:
+        return urlparse(url)._replace(netloc=urlparse(url).netloc.rpartition("@")[2]).geturl()
+    except ValueError:
+        return "an index URL wheelgap can't parse"
+
+
+@dataclass
+class _UvPackageIndex:
+    """Where uv takes a requirement that has no [tool.uv.sources] entry from, when it isn't PyPI alone: `default`, an
+    index in place of PyPI (an [[tool.uv.index]] with `default = true`, index-url or default-index), which no PyPI
+    answer may stand for; `no_index`, the setting that turns every index off; or `extra`, an index (an
+    [[tool.uv.index]] that isn't `explicit`, extra-index-url) or find-links that uv may take the package from before
+    PyPI (its first-index strategy), each as a note names it. Verified with uv 0.13.1: `uv lock` takes markupsafe from
+    such an index in all four shapes."""
+
+    default: str | None = None
+    no_index: str | None = None
+    extra: str | None = None
+
+    def apply(self, pkg: Package) -> None:
+        if self.no_index is not None:
+            pkg.error = f"{self.no_index} sets no-index, so uv installs {pkg.name} from find-links only"
+        elif self.default is not None:
+            pkg.registry = self.default  # pypi.fill_all skips it as a private index, unless WHEELGAP_INDEX_URL is it
+        elif self.extra is not None:
+            pkg.error = (
+                f"{self.extra}, which uv may take {pkg.name} from before PyPI, and wheelgap doesn't read that index"
+            )
+
+
+def _uv_package_index(tables: list[tuple[dict, str]]) -> _UvPackageIndex:
+    """The _UvPackageIndex of uv settings tables, each with how a note names it (`pyproject.toml: [tool.uv]`). Every
+    table that may apply counts, so a PyPI answer is given only when none of them names another index."""
+    found = _UvPackageIndex()
+    for settings, where in tables:
+        defaults: list[str] = []
+        extras: list[str] = []
+        indexes = settings.get("index", [])
+        if not isinstance(indexes, list) or not all(isinstance(i, dict) for i in indexes):
+            raise SourceError(f"{where} index must be a list of tables")
+        for index in indexes:
+            url = index.get("url")
+            if not isinstance(url, str):
+                raise SourceError(f"{where} has an [[index]] whose url isn't a string")
+            if index.get("explicit") is True:
+                continue  # only a [tool.uv.sources] entry that names it uses it
+            (defaults if index.get("default") is True else extras).append(url)
+        for key, into in (("index-url", defaults), ("default-index", defaults)):
+            if key in settings:
+                if not isinstance(settings[key], str):
+                    raise SourceError(f"{where} {key} must be a string")
+                into.append(settings[key])
+        for key in ("extra-index-url", "find-links"):
+            values = settings.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise SourceError(f"{where} {key} must be a list of strings")
+            # find-links is a folder or page of files, never PyPI's index.
+            extras.extend(v if key == "extra-index-url" else f"find-links {v}" for v in values)
+        if settings.get("no-index") is True and found.no_index is None:
+            found.no_index = where
+        if found.default is None and (url := next((u for u in defaults if not _is_pypi_index(u)), None)):
+            found.default = url
+        if found.extra is None and (url := next((u for u in extras if not _is_pypi_index(u)), None)):
+            found.extra = f"{where} names the index {_shown_index(url)}"
+    return found
 
 
 def _apply_uv_source(pkg: Package, entry: object, config: Path, indexes: dict[str, str]) -> None:
@@ -818,10 +895,12 @@ def _apply_uv_source(pkg: Package, entry: object, config: Path, indexes: dict[st
         if not isinstance(value, str):
             raise SourceError(f"{where} has an index that isn't a string")
         if (url := indexes.get(value)) is None:
-            # uv refuses an index it can't find, but it may be in user or system settings, which wheelgap doesn't read.
+            # uv 0.13.1 refuses it ("references an undeclared index"), even when a uv.toml or UV_CONFIG_FILE defines
+            # it: a source's index must be in the project's own pyproject.toml (or the workspace root's), or a
+            # script's block.
             pkg.error = (
-                f"{config.name}: [tool.uv.sources] takes {pkg.name} from the index {value!r}, which none of the uv "
-                "settings wheelgap reads defines, so where uv installs it from isn't known"
+                f"{config.name}: [tool.uv.sources] takes {pkg.name} from the index {value!r}, which no "
+                "[[tool.uv.index]] of the project defines, so uv refuses to install it"
             )
             return
         pkg.registry = url
@@ -835,7 +914,13 @@ def _uv_sources(uv: dict, config: Path) -> dict[str, tuple[object, Path]]:
     sources = uv.get("sources", {})
     if not isinstance(sources, dict):
         raise SourceError(f"{config}: [tool.uv.sources] must be a table")
-    return {canonicalize_name(name): (entry, config) for name, entry in sources.items()}
+    out: dict[str, tuple[object, Path]] = {}
+    for name, entry in sources.items():
+        key = canonicalize_name(name)
+        if key in out:
+            raise SourceError(f"{config}: [tool.uv.sources] names {key!r} twice once normalized")
+        out[key] = (entry, config)
+    return out
 
 
 def _uv_indexes(*tables: object) -> dict[str, str]:
@@ -857,6 +942,8 @@ def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
     own_uv = _table(_table(data, "tool"), "uv")
     sources = _uv_sources(own_uv, path)
     root_index = None
+    # Every settings table that may apply to the default index, so a PyPI answer is given only if none names another.
+    index_tables = [(own_uv, f"{path}: [tool.uv]")]
     if script:
         layers = _script_uv_layers(path, own_uv)
     else:
@@ -868,6 +955,7 @@ def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
             root, root_data, certain = workspace
             root_uv = _table(_table(root_data, "tool"), "uv")
             root_index = root_uv.get("index")
+            index_tables.append((root_uv, f"{root}: [tool.uv]"))
             found = _find_uv_settings(root.parent)
             if certain:
                 sources = {**_uv_sources(root_uv, root), **sources}
@@ -889,8 +977,11 @@ def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
                     )
                 found = alone
         layers = [] if found is None else [_uv_layer(found, folder, own)]
-    indexes = _uv_indexes(own_uv.get("index"), *(layer.settings.get("index") for layer in layers), root_index)
-    return UvRules(_uv_build_policy(layers), sources, indexes)
+    index_tables += [(layer.settings, f"{layer.config}: {layer.table}") for layer in layers]
+    # A source's index must be in the project's own [tool.uv] (or the workspace root's), or a script's block: uv
+    # 0.13.1 refuses one only a uv.toml defines.
+    indexes = _uv_indexes(own_uv.get("index"), root_index)
+    return UvRules(_uv_build_policy(layers), sources, indexes, _uv_package_index(index_tables))
 
 
 def parse_uv_lock(path: Path) -> Source:

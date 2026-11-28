@@ -364,3 +364,91 @@ def test_script_sources_are_read_from_its_block(tmp_path, capsys, fake_pypi):
     )
     code, statuses, skipped = _results(capsys, tmp_path / "demo.py")
     assert (statuses, skipped) == ({"purewheel": "wheel"}, {"fastlib": "git"})
+
+
+_CPU = "https://download.pytorch.org/whl/cpu"
+
+
+@pytest.mark.parametrize(
+    ("tool", "where", "expected", "skipped"),
+    [
+        # uv lock (0.13.1) takes markupsafe from that registry in all of these; with default or index-url it never
+        # asks PyPI. So nothing goes to PyPI: the package is unknown, or skipped as a private index.
+        (f'[[tool.uv.index]]\nname = "pytorch-cpu"\nurl = "{_CPU}"\n', "pyproject.toml", "unknown", None),
+        (
+            f'[[tool.uv.index]]\nname = "pytorch-cpu"\nurl = "{_CPU}"\ndefault = true\n',
+            "pyproject.toml",
+            None,
+            "private index",
+        ),
+        (f'[tool.uv]\nindex-url = "{_CPU}"\n', "pyproject.toml", None, "private index"),
+        (f'[tool.uv]\nextra-index-url = ["{_CPU}"]\n', "pyproject.toml", "unknown", None),
+        (f'default-index = "{_CPU}"\n', "uv.toml", None, "private index"),
+        ('find-links = ["./wheels"]\n', "uv.toml", "unknown", None),
+        ("no-index = true\n", "uv.toml", "unknown", None),
+    ],
+)
+def test_pyproject_index_settings_keep_packages_off_pypi(tmp_path, capsys, fake_pypi, tool, where, expected, skipped):
+    if where == "uv.toml":
+        (tmp_path / "uv.toml").write_text(tool, encoding="utf-8")
+        tool = ""
+    (tmp_path / "pyproject.toml").write_text(_pyproject(["fastlib==2.0.0"], tool), encoding="utf-8")
+    _, statuses, skips = _results(capsys, tmp_path / "pyproject.toml")
+    assert statuses == ({} if expected is None else {"fastlib": expected})
+    assert skips == ({} if skipped is None else {"fastlib": skipped})
+    assert fake_pypi == []
+
+
+def test_extra_index_note_names_the_index_without_its_credentials(tmp_path, capsys, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], '[tool.uv]\nextra-index-url = ["https://me:s3cret@corp.example/simple"]\n'),
+        encoding="utf-8",
+    )
+    main([str(tmp_path / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--explain"])
+    captured = capsys.readouterr()
+    assert "names the index https://corp.example/simple, which uv may take fastlib from" in captured.out + captured.err
+    assert "s3cret" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        '[[tool.uv.index]]\nname = "pypi"\nurl = "https://pypi.org/simple/"\n',
+        f'[[tool.uv.index]]\nname = "cpu"\nurl = "{_CPU}"\nexplicit = true\n',  # only for sources that name it
+    ],
+)
+def test_pyproject_index_settings_that_leave_pypi_the_index(tmp_path, capsys, fake_pypi, tool):
+    (tmp_path / "pyproject.toml").write_text(_pyproject(["fastlib==2.0.0"], tool), encoding="utf-8")
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == {"fastlib": "wheel"}
+
+
+def test_script_block_index_url_keeps_its_packages_off_pypi(tmp_path, capsys, fake_pypi):
+    (tmp_path / "demo.py").write_text(
+        f'# /// script\n# dependencies = ["fastlib==2.0.0"]\n# [tool.uv]\n# index-url = "{_CPU}"\n# ///\n',
+        encoding="utf-8",
+    )
+    assert _results(capsys, tmp_path / "demo.py")[2] == {"fastlib": "private index"}
+    assert fake_pypi == []
+
+
+def test_source_index_defined_only_in_uv_toml_is_unknown(tmp_path, capsys, fake_pypi):
+    # uv lock: "Index `cpu` was found in a project-level `uv.toml`, but indexes referenced via `tool.uv.sources` must
+    # be defined in the project's `pyproject.toml`".
+    (tmp_path / "uv.toml").write_text(f'[[index]]\nname = "cpu"\nurl = "{_CPU}"\nexplicit = true\n', encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0"], '[tool.uv.sources]\nfastlib = { index = "cpu" }\n'), encoding="utf-8"
+    )
+    (source,) = load_inputs([str(tmp_path / "pyproject.toml")])
+    assert "no [[tool.uv.index]] of the project defines" in (_by_name(source)["fastlib"].error or "")
+
+
+def test_sources_naming_one_package_twice_are_an_error(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(
+            ["fastlib==2.0.0"],
+            '[tool.uv.sources]\nfastlib = { git = "https://g.example/a" }\nFastLib = { path = "../b" }\n',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match="names 'fastlib' twice once normalized"):
+        load_inputs([str(tmp_path / "pyproject.toml")])

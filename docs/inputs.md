@@ -589,8 +589,13 @@ uv ignores the member's own). `--deps` refuses a file that sets one. `[tool.uv.s
 workspace root's included for a member (the member's own entry wins): a `git`, `url`, `path` or `workspace` source is
 skipped with that reason (`editable` for an editable path), and an `index` source takes the package from that
 `[[tool.uv.index]]`, so it's skipped as a private index unless that index is PyPI (or `WHEELGAP_INDEX_URL`). A
-package whose source depends on a marker, extra or group, or names an index none of these files defines, is
-`unknown`. `no-sources = true` turns the sources off. When wheelgap can't tell whether the file is a workspace
+package whose source depends on a marker, extra or group is `unknown`, and so is one whose source names an index the
+project's own `[[tool.uv.index]]` (or the workspace root's) doesn't define, which uv refuses even when a `uv.toml`
+defines it. `no-sources = true` turns the sources off. A package without a source of its own goes to PyPI only when
+the uv settings name no other index: with an `[[tool.uv.index]]` marked `default = true`, `index-url` or
+`default-index`, it's skipped as a private index (unless that index is PyPI or `WHEELGAP_INDEX_URL`), and with
+an index that isn't `explicit`, `extra-index-url`, `find-links` or `no-index`, it's `unknown`, since uv may take it
+from there first. Either way its name isn't sent to PyPI. When wheelgap can't tell whether the file is a workspace
 member and the answer would depend on it, it's an input error.
 
 uv's `exclude-newer` upload cutoff is applied: see [Resolution upload cutoffs](#resolution-upload-cutoffs).
