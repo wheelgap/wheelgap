@@ -5152,8 +5152,6 @@ def test_dockerfile_requirements_warns_about_a_local_npm_install_with_a_package_
         ("RUN cp -r /tmp/web/. /srv/w* && cd /srv/web && npm install left-pad\n", True),
         # A clone with no folder named: git makes one from the repository's name.
         ("RUN git clone --depth 1 https://example.com/web.git && cd web && npm install left-pad\n", True),
-        # A package.json written by a heredoc, whose script wheelgap doesn't read.
-        ("RUN cat <<'EOF' > /app/package.json\n{}\nEOF\nRUN npm install left-pad\n", True),
         # A folder with a variable wheelgap can't resolve in the middle of it.
         ("ARG NAME\nRUN tar xf /tmp/web.tar -C /srv/$NAME && cd /srv/web && npm install left-pad\n", True),
         # An earlier RUN in an unrelated folder leaves the npm install a plain program.
@@ -5174,6 +5172,18 @@ def test_dockerfile_requirements_checks_package_json_made_by_an_earlier_run(tmp_
     if warns:
         with pytest.raises(DockerfileError, match="runs the project's own code"):
             dockerfile_requirements(path, constraints={}, dependencies=True)
+
+
+def test_dockerfile_requirements_checks_npm_install_after_a_heredoc_package_json(tmp_path):
+    # A package.json written by a heredoc, whose script wheelgap doesn't read: the npm install after it isn't passed
+    # over. The pip install comes before the heredoc, since one after it would stop the answer (line 6199's rule).
+    head = "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"
+    body = _INSTALL + "RUN cat <<'EOF' > /app/package.json\n{}\nEOF\nRUN npm install left-pad\n"
+    path = _context(tmp_path, head + body, ("requirements.txt",))
+    report = InputsReport()
+    dockerfile_requirements(path, report=report, uv_installs=set(), constraints={})
+    assert report.warnings
+    assert [spelling for _, spelling, *_ in report.scripts] == ["npm install"]  # not passed over
 
 
 def test_dockerfile_requirements_warns_about_an_npm_install_below_a_package_json(tmp_path):
