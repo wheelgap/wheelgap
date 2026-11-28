@@ -1631,8 +1631,18 @@ def _may_carry_package_json(
     for _, text, cwd in mentions:
         if posixpath.basename(text.rstrip("/")) == "package.json" or _unresolved(text):
             return True  # a package.json by name (a download's URL too), or a path wheelgap can't resolve
-        if text.startswith("-") or "://" in text:
-            continue  # an option or a URL: not a path in the image
+        if text.startswith("-"):
+            # An option names a path only with its value attached: `--target-directory=/srv/web`, `-t/srv/web`.
+            if text.startswith("--") and "=" in text:
+                text = text.partition("=")[2]
+            elif not text.startswith("--") and "/" in text:
+                text = text[text.index("/") :]
+            else:
+                continue
+            if not text or text.startswith("-"):
+                continue
+        if "://" in text:
+            continue  # a URL: not a path in the image
         if cwd is None and not text.startswith("/"):
             return True  # a relative name in a folder wheelgap doesn't know
         path = posixpath.normpath(posixpath.join(cwd or "/", text))
@@ -2424,6 +2434,20 @@ _UV_HARMLESS_ENV = frozenset(
     "UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL UV_NO_EDITABLE UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON "
     "UV_SYSTEM_CERTS UV_VERSION".split()
 )
+# `git clone` options that take the next word as their value, and those that take none (git's builtin/clone.c,
+# up to --revision; a short option may also carry its value attached, as in `-bmain`).
+_GIT_CLONE_VALUED = frozenset(
+    "-b --branch -o --origin --depth -c --config --reference --reference-if-able -j --jobs --filter --template "
+    "--separate-git-dir -u --upload-pack --shallow-since --shallow-exclude --server-option --bundle-uri --revision "
+    "--ref-format".split()
+)
+_GIT_CLONE_SWITCHES = frozenset(
+    "-v --verbose -q --quiet --progress --no-progress --reject-shallow --no-reject-shallow -n --no-checkout --checkout "
+    "--bare --mirror -l --local --no-local --no-hardlinks --hardlinks -s --shared --no-shared --dissociate "
+    "--single-branch --no-single-branch --no-tags --tags --shallow-submodules --no-shallow-submodules "
+    "--recurse-submodules --no-recurse-submodules --recursive --also-filter-submodules --remote-submodules "
+    "--no-remote-submodules --sparse --no-sparse -4 --ipv4 -6 --ipv6".split()
+)
 # Words that name a pip or uv configuration file: a command that isn't read and names one may be writing it.
 _CONFIG_WORDS = (
     "pip.conf",
@@ -3097,16 +3121,15 @@ class _RunReader:
         texts = [word.text for word in words[1:]]
         base = None
         while texts and texts[0].startswith("-"):
-            if texts[0] in ("-C", "-c") and len(texts) > 1:
-                base = texts[1] if texts[0] == "-C" else base
+            if texts[0] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env") and len(texts) > 1:
+                base = (posixpath.join(base, texts[1]) if base else texts[1]) if texts[0] == "-C" else base
                 texts = texts[2:]
             else:
+                if texts[0].startswith("-C") and len(texts[0]) > 2:  # `-C/srv`: the folder attached
+                    base = posixpath.join(base, texts[0][2:]) if base else texts[0][2:]
                 texts = texts[1:]
         if not texts or texts[0] != "clone":
             return None
-        valued = {"-b", "--branch", "-o", "--origin", "--depth", "-c", "--config", "--reference", "-j", "--jobs"}
-        valued |= {"--filter", "--template", "--separate-git-dir", "-u", "--upload-pack", "--shallow-since"}
-        valued |= {"--shallow-exclude", "--server-option", "--bundle-uri", "--reference-if-able"}
         positional: list[str] = []
         rest = texts[1:]
         while rest:
@@ -3114,9 +3137,17 @@ class _RunReader:
             if text == "--":
                 positional += rest
                 break
-            if text in valued:
+            if text in _GIT_CLONE_VALUED:
                 rest = rest[1:]
-            elif not text.startswith("-"):
+            elif (text.startswith("--") and "=" in text) or text in _GIT_CLONE_SWITCHES:
+                continue
+            elif not text.startswith("--") and text[:2] in _GIT_CLONE_VALUED:
+                continue  # `-bmain`, `-j4`: the value attached
+            elif text.startswith("-"):
+                # An option wheelgap doesn't know (or an abbreviation, or short options run together) may take the
+                # next word as its value, so which word is the folder isn't known.
+                return "$(git clone)"
+            else:
                 positional.append(text)
         if not positional:
             return None
