@@ -159,13 +159,24 @@ def plan(
     return cells
 
 
+def _buildable(c: Cell) -> bool:
+    """A cell with no fix (a NO_FIX reason) whose target builds the release from source."""
+    return c.kind == NONE and c.reason in NO_FIX and c.row.results[c.target] == Status.SOURCE
+
+
+def buildable_rows(cells: list[Cell]) -> list[Row]:
+    """The rows with a cell with_build can answer for: --fix --build-info reads only these rows' sdists, not those of
+    packages an upgrade or a gap wheel already fixes."""
+    return list({id(c.row): c.row for c in cells if _buildable(c)}.values())
+
+
 def with_build(cells: list[Cell], build_info: dict[int, BuildInfo]) -> list[Cell]:
     """The cells, with `build` set on each one with no fix (a NO_FIX reason) whose target builds the release from
     source, where `build_info` (--build-info's answers, by id() of the package) proves what the build needs."""
     out = []
     for c in cells:
         info = build_info.get(id(c.row.package))
-        if c.kind == NONE and c.reason in NO_FIX and info is not None and c.row.results[c.target] == Status.SOURCE:
+        if info is not None and _buildable(c):
             c = replace(c, build=system_packages(info, c.target))
         out.append(c)
     return out
@@ -666,9 +677,16 @@ def _none_line(name: str, pinned: str, cs: list[Cell], multi_py: bool, ask: str 
     return line + (f"; ask for a wheel: {ask}" if ask and any(c.reason == NO_NEWER for c in cs) else "")
 
 
+# What build_packages leaves out, in the text, Markdown and MCP output alike: [build-system] requires name the build
+# tools, never the libraries a build links against.
+BUILD_TOOLS_ONLY = (
+    "these are build tools only: libraries the package links against (e.g. libxml2 and libxslt for lxml) aren't named"
+)
+
+
 def build_text(packages: SystemPackages, labels: str, code: Callable[[str], str] = _plain) -> str:
-    """'to build it from source on musl-armv7l, it needs at least a C/C++ compiler: `apk add build-base` on Alpine
-    (and python3-dev with Alpine's own Python)'."""
+    """'to build it from source on musl-armv7l, it needs at least a C/C++ compiler: `apk add --no-cache build-base`
+    on Alpine (and python3-dev with the distro's own Python); these are build tools only: ...'."""
     text = (
         f"to build it from source on {labels}, it needs at least {' and '.join(packages.needs)}: "
         f"{code(packages.command)} on {packages.distro}"
@@ -678,7 +696,7 @@ def build_text(packages: SystemPackages, labels: str, code: Callable[[str], str]
         extra.append(f"and {' '.join(map(code, packages.distro_python))} with the distro's own Python")
     if RUST in packages.needs:
         extra.append("or rustup from https://rustup.rs where the distro's Rust is older than the package needs")
-    return text + (f" ({'; '.join(extra)})" if extra else "")
+    return text + (f" ({'; '.join(extra)})" if extra else "") + f"; {BUILD_TOOLS_ONLY}"
 
 
 def _build_lines(cs: list[Cell], multi_py: bool, code: Callable[[str], str]) -> list[str]:

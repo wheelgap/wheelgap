@@ -752,8 +752,9 @@ build that works there can still need setup on your machine. Nothing the lab bui
 
 With `--explain`, also say what each `source` build needs (`build needs: at least a Rust toolchain
 (maturin<2.0,>=1.9)`), from the `[build-system]` table of the sdist's `pyproject.toml`. With `--fix`, also say which
-distro packages to install to build a gap with no fix on a Linux target (`apk add build-base` on Alpine, `apt-get
-install build-essential` on Debian or Ubuntu). It downloads sdists, so it's
+distro packages to install to build a gap with no fix on a Linux target (`apk add --no-cache build-base` on Alpine,
+`apt-get update && apt-get install -y build-essential` on Debian or Ubuntu); only those gaps' sdists are read then.
+It downloads sdists, so it's
 opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#pypi-origin); it's off with `--offline`,
 `--index-url`, `WHEELGAP_INDEX_URL` or a pip or uv index setting in the environment. `build-info = true` in
 `[tool.wheelgap]` turns it on by default; `--no-build-info` turns it off. See [Build requirements](output.md#build-info).

@@ -233,15 +233,18 @@ rpds-py 0.27.0 on musl-armv7l: ● source
   ```text
   No fix yet:
     numpy 1.26.4: no newer release has a wheel for musl-armv7l; ask for a wheel: https://github.com/numpy/numpy/issues
-      to build it from source on musl-armv7l, it needs at least a C/C++ compiler: apk add build-base on Alpine (and python3-dev with the distro's own Python)
+      to build it from source on musl-armv7l, it needs at least a C/C++ compiler: apk add --no-cache build-base on Alpine (and python3-dev with the distro's own Python); these are build tools only: libraries the package links against (e.g. libxml2 and libxslt for lxml) aren't named
   ```
 
-  `musl-*` targets get Alpine's `apk add` (`build-base`, `cmake`, `cargo`) and `linux-*` targets Debian's and
-  Ubuntu's `apt-get install` (`build-essential`, `cmake`, `cargo`). The `python:*` images already have the Python
-  headers; the distro's own Python needs `python3-dev` for a C/C++ build. A distro's Rust can be older than a crate
-  needs, so a Rust build also names [rustup](https://rustup.rs). It's "at least": a library the build links to (BLAS,
-  OpenSSL, libffi) isn't in `[build-system]` and isn't named, and the distro's own build of the package (`apk add
-  py3-numpy`) isn't suggested, since it installs for the distro's Python only. `--json --fix` gives the same as
+  `musl-*` targets get Alpine's `apk add --no-cache` (`build-base`, `cmake`, `cargo`) and `linux-*` targets Debian's
+  and Ubuntu's `apt-get update && apt-get install -y` (`build-essential`, `cmake`, `cargo`), so the command runs as
+  it stands in a fresh image such as `python:3.13-slim`, which has no apt package lists. The `python:*` images
+  already have the Python headers; the distro's own Python needs `python3-dev`, which is named for a Rust build too,
+  since one can compile C through cffi as well (cryptography does). A distro's Rust can be older than a crate needs,
+  so a Rust build also names [rustup](https://rustup.rs). It's "at least": these are build tools only, and a library
+  the build links to (libxml2 and libxslt for lxml, BLAS, OpenSSL, libffi) isn't in `[build-system]` and isn't
+  named. Nor is the distro's own build of the package (`apk add py3-numpy`) suggested, since it installs for the
+  distro's Python only. Fedora and RHEL (`dnf`) aren't covered yet. `--json --fix` gives the same as
   `build_packages` in the cell's [`fix`](#fix).
 - With `--json --explain --build-info`, each package gets `build_requires`: the same requirements, normalized
   (`["maturin<2.0,>=1.9"]`), or `null` when there's no source build or no answer. When build info is off for the

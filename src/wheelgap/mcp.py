@@ -62,7 +62,7 @@ from . import suggest as release_suggest
 from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
-from .fix import build_json
+from .fix import BUILD_TOOLS_ONLY, build_json
 from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds, ran_on_pypy
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import Package, Source, SourceError
@@ -528,9 +528,10 @@ TOOLS: list[dict[str, Any]] = [
             "(e.g. a failed package that has a wheel for a checked target: the log likely comes from another "
             "platform or Python). With build_info: true, each package also gets build_packages: by Linux target "
             "where it builds from source, what to install there to build it (distro, command such as 'apk add "
-            "build-base', packages, needs, and distro_python: what the distro's own Python needs as well), from the "
-            "[build-system] requires of its sdist, downloaded from PyPI; only what those prove (a compiler, CMake, "
-            "Rust), never a library such as BLAS, and absent targets have no answer. A log that can't be read with "
+            "--no-cache build-base', packages, needs, and distro_python: what the distro's own Python needs as well), "
+            "from the [build-system] requires of its sdist, downloaded from PyPI; only what those prove (a compiler, "
+            "CMake, Rust): these are build tools only, and libraries the package links against (e.g. libxml2 and "
+            "libxslt for lxml) aren't named, and absent targets have no answer. A log that can't be read with "
             "certainty is an error, never a guess: one that "
             "names no failed build, one where which version failed isn't clear, or one that installed from "
             "another index than PyPI or with --find-links, unless the server's WHEELGAP_INDEX_URL points to that "
@@ -1391,6 +1392,11 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
     builds = _build_infos(results) if _flag(args, "build_info") else None
     packages: list[dict[str, Any]] = []
     notes: list[str] = []
+    if builds is not None and (off_by := origin.other_index()) is not None:  # why every build_packages is empty
+        notes.append(
+            f"build_packages is empty: the server's {off_by} points to another index than PyPI, where a name may be "
+            "private and its PyPI namesake another package, so no sdist was read from PyPI"
+        )
     # The CLI requires -p and -t with --from-log; here they're optional, so say what was assumed.
     defaults = (("the server's Python", pythons), ("the default platforms", platforms))
     if assumed := [what for what, given in defaults if not given]:
@@ -1419,6 +1425,8 @@ def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
             found = {t: build.system_packages(info, t) for t, s in r.statuses.items() if info and s is Status.SOURCE}
             out["build_packages"] = {t.label(True): build_json(p) for t, p in found.items() if p is not None}
         packages.append(out)
+        if out.get("build_packages") and BUILD_TOOLS_ONLY not in "".join(notes):
+            notes.append(f"build_packages: {BUILD_TOOLS_ONLY}")
         if not on_pypy and (fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]):
             # As --from-log's note: a wheel for a checked target means the install didn't run there.
             notes.append(

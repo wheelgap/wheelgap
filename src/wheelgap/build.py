@@ -168,7 +168,7 @@ class SystemPackages:
     a library the build links to (BLAS, OpenSSL) isn't in [build-system] requires, and isn't named."""
 
     distro: str  # "Alpine" for musl targets, "Debian or Ubuntu" for glibc ones
-    command: str  # "apk add build-base"
+    command: str  # "apk add --no-cache build-base": it runs as it stands in a fresh image
     packages: tuple[str, ...]
     needs: tuple[str, ...]  # RUST, CMAKE, COMPILER, in that order
     # Also needed with the distro's own Python (not with the python:* images, which have the headers): Python.h
@@ -176,12 +176,17 @@ class SystemPackages:
 
 
 # By libc: (distro, install command, the packages for each need). build-base and build-essential are the
-# compiler, make and libc headers; the distros' cargo package depends on rustc.
+# compiler, make and libc headers; the distros' cargo package depends on rustc. The commands work in a fresh image:
+# python:3.X-slim has no apt lists (so update first) and apt-get install asks before it installs (so -y).
 _SYSTEM = {
-    "musl": ("Alpine", "apk add", {COMPILER: ("build-base",), CMAKE: ("cmake", "build-base"), RUST: ("cargo",)}),
+    "musl": (
+        "Alpine",
+        "apk add --no-cache",
+        {COMPILER: ("build-base",), CMAKE: ("cmake", "build-base"), RUST: ("cargo",)},
+    ),
     "glibc": (
         "Debian or Ubuntu",
-        "apt-get install",
+        "apt-get update && apt-get install -y",
         {COMPILER: ("build-essential",), CMAKE: ("cmake", "build-essential"), RUST: ("cargo",)},
     ),
 }
@@ -200,8 +205,9 @@ def system_packages(info: BuildInfo, target: Target) -> SystemPackages | None:
     if not needs:
         return None
     packages = tuple(dict.fromkeys(p for need in needs for p in by_need[need]))
-    headers = PYTHON_HEADERS if any(need != RUST for need in needs) else ()  # a Rust build (PyO3) needs no Python.h
-    return SystemPackages(distro, f"{command} {' '.join(packages)}", packages, needs, headers)
+    # Always the headers: a Rust build can compile C through cffi as well (cryptography requires maturin and cffi,
+    # and its install docs list python3-dev), and which ones don't isn't proven. Extra, but harmless, for PyO3 alone.
+    return SystemPackages(distro, f"{command} {' '.join(packages)}", packages, needs, PYTHON_HEADERS)
 
 
 def _sdist(pkg: Package) -> str | None:
