@@ -5150,8 +5150,17 @@ def test_dockerfile_requirements_warns_about_a_local_npm_install_with_a_package_
         ("RUN tar xf /tmp/web.tar -C /srv && cd /srv/web && npm install left-pad\n", True),
         # A glob that matches the install folder.
         ("RUN cp -r /tmp/web/. /srv/w* && cd /srv/web && npm install left-pad\n", True),
+        # A clone with no folder named: git makes one from the repository's name.
+        ("RUN git clone --depth 1 https://example.com/web.git && cd web && npm install left-pad\n", True),
+        # A package.json written by a heredoc, whose script wheelgap doesn't read.
+        ("RUN cat <<'EOF' > /app/package.json\n{}\nEOF\nRUN npm install left-pad\n", True),
+        # A folder with a variable wheelgap can't resolve in the middle of it.
+        ("ARG NAME\nRUN tar xf /tmp/web.tar -C /srv/$NAME && cd /srv/web && npm install left-pad\n", True),
         # An earlier RUN in an unrelated folder leaves the npm install a plain program.
         ("RUN mkdir -p /srv/other\nRUN npm install left-pad\n", False),
+        ("RUN cp /tmp/a /srv/other/\nRUN npm install left-pad\n", False),
+        # Options and URLs of a command run in a folder wheelgap doesn't know aren't paths in the image.
+        ("RUN cd /opt/tool-* && curl -fsSLO https://example.com/tool.tar.gz\nRUN npm install left-pad\n", False),
         # So does a mkdir of the working folder itself: it adds no package.json.
         ("RUN mkdir -p /app/cache /app\nRUN npm install left-pad\n", False),
     ],

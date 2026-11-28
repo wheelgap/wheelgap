@@ -1605,7 +1605,10 @@ def _names_in_folder(copies: list[_Copy], dirs: set[str], folder: str) -> list[t
     return names
 
 
-_UNRESOLVED = ("$", "`", "~")  # a path that starts with a variable, a command substitution or a tilde
+def _unresolved(text: str) -> bool:
+    """Whether a word is a path wheelgap can't resolve: a variable or a command substitution anywhere in it (as
+    written, since the word isn't exact), or a leading tilde."""
+    return "$" in text or "`" in text or text.startswith("~")
 
 
 def _may_carry_package_json(
@@ -1626,8 +1629,10 @@ def _may_carry_package_json(
         return True
     target = posixpath.join(folder, "package.json")
     for _, text, cwd in mentions:
-        if posixpath.basename(text.rstrip("/")) == "package.json" or text.startswith(_UNRESOLVED):
+        if posixpath.basename(text.rstrip("/")) == "package.json" or _unresolved(text):
             return True  # a package.json by name (a download's URL too), or a path wheelgap can't resolve
+        if text.startswith("-") or "://" in text:
+            continue  # an option or a URL: not a path in the image
         if cwd is None and not text.startswith("/"):
             return True  # a relative name in a folder wheelgap doesn't know
         path = posixpath.normpath(posixpath.join(cwd or "/", text))
@@ -1636,7 +1641,7 @@ def _may_carry_package_json(
         if folder.startswith(path.rstrip("/") + "/"):
             return True
     for _, text, cwd in created:
-        if text.startswith(_UNRESOLVED) or (cwd is None and not text.startswith("/")):
+        if _unresolved(text) or (cwd is None and not text.startswith("/")):
             return True
         if fnmatch.fnmatchcase(target, posixpath.normpath(posixpath.join(cwd or "/", text))):
             return True
@@ -2782,6 +2787,8 @@ class _RunReader:
                         "can't tell what is installed"
                     )
             self.report.warn(number, "a heredoc script")
+            # What the script writes isn't known: a later local npm install may find a package.json it made.
+            self.mentions.append((number, "$(heredoc)", None))
             return []
         else:
             parser = _Shell(rest, env, bash)
@@ -2978,6 +2985,8 @@ class _RunReader:
                 if words and (folder := self._writes_folder(words)):
                     written.append(folder if folder.startswith("/") or cwd is not None else "/")
                     anywhere = folder == "/"  # git: any file of the work tree, which the config check leaves out
+                elif words and (folder := self._clone_folder(words)):
+                    written.append(folder)  # the clone's folder, which its URL alone doesn't name
             self.mentions += [(number, text, cwd) for text in written]
             if first in ("mkdir", "touch", "ln", "install"):
                 self.created += [(number, word.text, cwd) for word in words[1:] if not word.text.startswith("-")]
@@ -3078,6 +3087,45 @@ class _RunReader:
             if rest and rest[0] in _GIT_WRITES:
                 return "/"
         return None
+
+    @staticmethod
+    def _clone_folder(words: list[_Word]) -> str | None:
+        """The folder `git clone REPO [DIR]` makes: DIR, or the repository's name from REPO (`.git` dropped), under
+        the `-C` folder if one is given."""
+        if posixpath.basename(words[0].text) != "git":
+            return None
+        texts = [word.text for word in words[1:]]
+        base = None
+        while texts and texts[0].startswith("-"):
+            if texts[0] in ("-C", "-c") and len(texts) > 1:
+                base = texts[1] if texts[0] == "-C" else base
+                texts = texts[2:]
+            else:
+                texts = texts[1:]
+        if not texts or texts[0] != "clone":
+            return None
+        valued = {"-b", "--branch", "-o", "--origin", "--depth", "-c", "--config", "--reference", "-j", "--jobs"}
+        valued |= {"--filter", "--template", "--separate-git-dir", "-u", "--upload-pack", "--shallow-since"}
+        valued |= {"--shallow-exclude", "--server-option", "--bundle-uri", "--reference-if-able"}
+        positional: list[str] = []
+        rest = texts[1:]
+        while rest:
+            text, rest = rest[0], rest[1:]
+            if text == "--":
+                positional += rest
+                break
+            if text in valued:
+                rest = rest[1:]
+            elif not text.startswith("-"):
+                positional.append(text)
+        if not positional:
+            return None
+        if len(positional) > 1:
+            folder = positional[1]
+        else:
+            name = posixpath.basename(positional[0].rstrip("/").rpartition(":")[2] or positional[0])
+            folder = name.removesuffix(".git") or "."
+        return posixpath.join(base, folder) if base and not folder.startswith("/") else folder
 
     def _path_entry(self, value: str, where: str, cwd: str | None = "/") -> tuple[str, str] | None:
         """What a bare pip, python or uv is once PATH is `value` (see self.path)."""
