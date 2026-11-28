@@ -26,7 +26,8 @@ How statuses rank, per target:
   beating `missing`, and ignoring `n/a` unless every entry is `n/a`.
 - A target whose Python either lockfile's requires-python leaves out isn't compared, and a note says so: the lock
   isn't made for that Python (uv keeps only the wheels its range can use, and packages from another index can't be
-  looked up again), so its gaps there aren't the change's, and nothing there counts as worse.
+  looked up again), so its gaps there aren't the change's, and nothing there counts as worse. The same goes for a
+  Python a pdm.lock's [[metadata.targets]] leave out (pdm_not_covered).
 """
 
 from __future__ import annotations
@@ -48,7 +49,16 @@ from packaging.utils import InvalidName, canonicalize_name
 
 from . import __version__, fix, gapwheels, origin, suggest
 from .api import Result, _check_lockfile, check_packages, explain_issues_urls, make_targets, running_python
-from .check import CELL, Row, Status, applies, lock_environments_note, narrow_to_lock_environments, reachable
+from .check import (
+    CELL,
+    Row,
+    Status,
+    applies,
+    lock_environments_note,
+    narrow_to_lock_environments,
+    pdm_python_value,
+    reachable,
+)
 from .cli import (
     find_pyproject,
     gap_wheel_fills,
@@ -61,7 +71,16 @@ from .cli import (
 )
 from .logsafe import guarded_output
 from .pypi import check_index_url
-from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock, pythons_outside_lock, tool_table
+from .sources import (
+    Source,
+    SourceError,
+    file_kind,
+    find_lockfile,
+    parse_pdm_lock,
+    parse_uv_lock,
+    pythons_outside_lock,
+    tool_table,
+)
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -219,7 +238,9 @@ def not_covered(sources: list[Source], targets: list[Target]) -> dict[Target, di
     for t, sides in left_out.items():
         specs = {sources[i].requires_python for i in sides}
         if sides == [1]:  # the change dropped this Python: say it as the change's doing
-            old = sources[0].requires_python or "any"
+            old = sources[0].requires_python or (
+                _pdm_pythons(sources[0].pdm_targets) if sources[0].pdm_targets else "any"
+            )
             reason = (
                 f"the new lockfile no longer supports Python {t.python} (old: {old}, new: {sources[1].requires_python})"
             )
@@ -236,6 +257,66 @@ def not_covered(sources: list[Source], targets: list[Target]) -> dict[Target, di
     return out
 
 
+def _pdm_pythons(entries: list[dict]) -> str:
+    return " or ".join(dict.fromkeys(entry.get("requires_python") or "any" for entry in entries))
+
+
+def pdm_not_covered(
+    locked: list[list[dict]], targets: list[Target], ranges: list[str | None] | None = None
+) -> dict[Target, dict]:
+    """not_covered for pdm.lock sides: the targets whose Python none of a side's `[[metadata.targets]]` takes, on any
+    platform (`locked` is each side's targets, empty for a side that isn't a pdm.lock or records none). As for a
+    uv.lock's requires-python, `pdm install` refuses the lock there, so its gaps there aren't the change's; diff leaves
+    the target out, with a note, rather than refusing the run as the main command does. A Python only some patch
+    releases of which a target takes (pdm_python_value None) isn't left out here: the check says it can't tell.
+    `ranges`: each side's requires-python when it isn't a pdm.lock (a uv.lock's), for the reason's "old: ..."."""
+    out: dict[Target, dict] = {}
+    for t in targets:
+        sides = [
+            i
+            for i, entries in enumerate(locked)
+            if entries
+            and not any(pdm_python_value(entry.get("requires_python", ""), t) is not False for entry in entries)
+        ]
+        if not sides:
+            continue
+        if sides == [1]:
+            old = _pdm_pythons(locked[0]) if locked[0] else (ranges or [None])[0] or "any"
+            reason = (
+                f"the new lockfile's `pdm lock` targets no longer take Python {t.python} "
+                f"(old: {old}, new: {_pdm_pythons(locked[1])})"
+            )
+            out[t] = {"sides": ["new"], "python": t.python, "reason": reason}
+            continue
+        locked_for = " and ".join(
+            f"the {SIDES[i]} lockfile's `pdm lock` targets are for Python {_pdm_pythons(locked[i])}" for i in sides
+        )
+        out[t] = {
+            "sides": [SIDES[i] for i in sides],
+            "python": t.python,
+            "reason": f"{locked_for}, which leaves out Python {t.python}",
+        }
+    return out
+
+
+def _lock_python_range(path: Path) -> str | None:
+    """A uv.lock side's requires-python, for pdm_not_covered's reason; None for any other input."""
+    try:
+        lock = find_lockfile(path) if path.is_dir() else path
+        return parse_uv_lock(lock).requires_python if file_kind(lock) == "uv" and lock.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _pdm_lock_targets(path: Path) -> list[dict]:
+    """A side's pdm.lock `[[metadata.targets]]`, or [] (not a pdm.lock, or one the check will report as unreadable)."""
+    try:
+        lock = find_lockfile(path) if path.is_dir() else path
+        return parse_pdm_lock(lock).pdm_targets if file_kind(lock) == "pdm" and lock.is_file() else []
+    except (OSError, ValueError):
+        return []
+
+
 def not_compared_notes(report: Report) -> list[str]:
     """The stderr notes for the targets compare() left out, grouped by reason: first each Python the change dropped
     (only the new lock leaves it out), said as the change's doing, then the others."""
@@ -247,9 +328,13 @@ def not_compared_notes(report: Report) -> list[str]:
         else:
             other.setdefault(entry["reason"], []).append(entry["target"])
     notes = [
-        f"this change drops Python {python} support: {reason}, so installing the new lock there now fails (uv sync "
-        f"refuses a lock on a Python outside its requires-python). Not compared: {', '.join(labels)}; the drop "
-        "doesn't count as worse"
+        f"this change drops Python {python} support: {reason}, so installing the new lock there now fails ("
+        + (
+            "pdm install refuses a lock none of whose targets take the Python"
+            if "`pdm lock` targets" in reason  # pdm_not_covered's
+            else "uv sync refuses a lock on a Python outside its requires-python"
+        )
+        + f"). Not compared: {', '.join(labels)}; the drop doesn't count as worse"
         for (python, reason), labels in dropped.items()
     ]
     if other:
@@ -571,16 +656,17 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
 
 
 def lock_default_targets(paths: list[Path], targets: list[Target]) -> tuple[list[Target], str | None]:
-    """The default targets without the platforms both sides' uv.lock `[tool.uv] environments` leave out (a platform
-    only one side leaves out stays, and is refused), with the note to print. A side that isn't a uv.lock leaves out
-    nothing, so then nothing goes; a file that can't be read here is left for the check to report."""
+    """The default targets without the platforms both sides' uv.lock `[tool.uv] environments` or pdm.lock targets
+    leave out (a platform only one side leaves out stays, and is refused), with the note to print. A side that is
+    neither leaves out nothing, so then nothing goes; a file that can't be read here is left for the check to report."""
     sources = []
     for path in paths:
         try:
             lock = find_lockfile(path) if path.is_dir() else path
-            if file_kind(lock) != "uv" or not lock.is_file():
+            kind = file_kind(lock)
+            if kind not in ("uv", "pdm") or not lock.is_file():
                 return targets, None
-            sources.append(parse_uv_lock(lock))
+            sources.append(parse_uv_lock(lock) if kind == "uv" else parse_pdm_lock(lock))
         except (OSError, ValueError):
             return targets, None
     narrowed, left_out = narrow_to_lock_environments(sources, targets, every=True)
@@ -725,6 +811,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
         sides = []
         sources = []
         rows: list[Row] = []
+        pdm_skip: dict[Target, dict] = {}
         if args.deps:
             if (index_variable := origin.index_env()) is not None:
                 raise SourceError(
@@ -765,8 +852,20 @@ def _main(argv: list[str] | None, prog: str) -> int:
                     targets, narrowed = lock_default_targets([Path(path) for path, _ in read], targets)
                     if narrowed is not None:
                         print(f"wheelgap: note: {narrowed}", file=sys.stderr)
+                # A Python a pdm.lock side's targets leave out isn't compared (as a uv.lock's requires-python), so it
+                # isn't checked either: the main command's check would refuse it.
+                pdm_skip = pdm_not_covered(
+                    [_pdm_lock_targets(Path(path)) for path, _ in read],
+                    targets,
+                    [_lock_python_range(Path(path)) for path, _ in read],
+                )
+                checked = [t for t in targets if t not in pdm_skip]
                 for path, ref in read:
-                    results, source, rows = _check_lockfile(path, targets, online=False, offline=False)
+                    if not checked:  # every target left out: nothing to check or compare
+                        sides.append({})
+                        sources.append(Source(str(path)))
+                        continue
+                    results, source, rows = _check_lockfile(path, checked, online=False, offline=False)
                     if ref is not None:
                         # An omitted parent or pdm.toml may name an index, so don't assume PyPI provenance.
                         source.pypi_only = False
@@ -782,7 +881,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
             print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
         return 2
 
-    report = compare(sides[0], sides[1], targets, not_covered(sources, targets))
+    report = compare(sides[0], sides[1], targets, {**pdm_skip, **not_covered(sources, targets)})
     fixes = None
     if args.fix:
         try:
