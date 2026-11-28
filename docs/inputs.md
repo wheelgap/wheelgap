@@ -150,10 +150,13 @@ script beside it, as `uv run` applies them (see below).
 **Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
 `no-binary-package` from the uv settings `uv sync` applies: the nearest `uv.toml`, or `pyproject.toml` with a
 `[tool.uv]` table, from the lock's folder up. A `uv.toml` takes precedence over a `pyproject.toml` in the same folder,
-a `pyproject.toml` without `[tool.uv]` (or one uv can't parse) is skipped, and the search goes on past a repository
-root to the top of the filesystem, as uv 0.13.1 does. For a script's lock, the script's own `[tool.uv]` comes first and
+a `pyproject.toml` without `[tool.uv]` is skipped, and the search goes on past a repository root to the top of the
+filesystem, as uv 0.13.1 does. The first `pyproject.toml` above the project's folder must parse: `uv sync` and
+`uv lock` stop with an error on one that doesn't while looking for the project's workspace, so wheelgap refuses the
+input too (exit 2). For a script's lock, the script's own `[tool.uv]` comes first and
 is combined with the nearest settings from the script's folder up, as `uv run` combines them: the script's
-`no-build` and `no-binary` win, and the package lists are joined. These settings affect
+`no-build` and `no-binary` win, and the package lists are joined. When nothing is found from the script's folder
+up, `uv run` uses the settings of the folder it runs in, which wheelgap can't know. These settings affect
 index packages (not local, Git or editable packages that wheelgap skips). `no-build` forbids
 source builds; `no-binary` excludes wheels. As in uv, a package list overrides the other kind's blanket setting: with
 `no-binary = true`, a package in `no-build-package` still takes a wheel, and with `no-build = true`, one in
@@ -599,7 +602,9 @@ the uv settings name no other index: with an `[[tool.uv.index]]` marked `default
 `default-index`, it's skipped as a private index (unless that index is PyPI or `WHEELGAP_INDEX_URL`), and with
 an index that isn't `explicit`, `extra-index-url`, `find-links` or `no-index`, it's `unknown`, since uv may take it
 from there first. Either way its name isn't sent to PyPI. When wheelgap can't tell whether the file is a workspace
-member and the answer would depend on it, it's an input error.
+member and the answer would depend on it, it's an input error, and so is a first `pyproject.toml` above it that
+doesn't parse, as for a [`uv.lock`](#uvlock). Settings in your user-level uv config or in `UV_NO_BUILD`-style
+environment variables aren't read.
 
 uv's `exclude-newer` upload cutoff is applied: see [Resolution upload cutoffs](#resolution-upload-cutoffs).
 
@@ -641,7 +646,9 @@ lines to add to the block for `uv run`. To check what the script installs, pass 
 
 The block's `[tool.uv.sources]` and build restrictions are followed as in a [`pyproject.toml`](#pyprojecttoml), with
 the block's settings combined with the nearest `uv.toml` or `pyproject.toml` `[tool.uv]` from the script's folder up,
-as `uv run` combines them (see [uv.lock](#uvlock)).
+as `uv run` combines them (see [uv.lock](#uvlock)). When nothing is found from the script's folder up, `uv run` uses
+the settings of the folder it runs in, which wheelgap can't know. Settings in your user-level uv config or in
+`UV_NO_BUILD`-style environment variables aren't read.
 
 A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 

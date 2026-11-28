@@ -644,6 +644,23 @@ def _find_uv_settings(folder: Path, own: Path | None = None) -> tuple[Path, dict
     return None
 
 
+def _refuse_unparseable_workspace_parent(folder: Path, what: Path) -> None:
+    """uv sync and uv lock look for a project's workspace through the first pyproject.toml in a folder above it, and
+    stop with an error when that one can't be parsed (uv 0.13.1: "Failed to parse"), past a repository root too.
+    Settings discovery only warns about it, but the project can't be synced, so refuse rather than answer."""
+    for directory in folder.parents:
+        candidate = directory / "pyproject.toml"
+        if candidate.is_file():
+            try:
+                tomllib.loads(candidate.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                raise SourceError(
+                    f"{what}: {candidate} can't be parsed ({e}), and uv stops with an error when it looks for the "
+                    "project's workspace there"
+                ) from None
+            return  # uv's workspace discovery stops at the first one it can parse
+
+
 def _input_folder(path: Path) -> Path:
     return Path(os.path.normpath(path.absolute())).parent
 
@@ -682,6 +699,7 @@ def _lock_uv_layers(path: Path) -> list[_UvLayer]:
         return _script_uv_layers(script, block)
     folder = _input_folder(path)
     own = folder / "pyproject.toml"
+    _refuse_unparseable_workspace_parent(folder, path)
     found = _find_uv_settings(folder, own)
     return [] if found is None else [_uv_layer(found, folder, own)]
 
@@ -968,6 +986,7 @@ def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
     else:
         folder = _input_folder(path)
         own = folder / path.name
+        _refuse_unparseable_workspace_parent(folder, path)
         workspace = _workspace_root(path, data)
         found = _find_uv_settings(folder, own) if workspace is None else None
         if workspace is not None:

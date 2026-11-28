@@ -74,7 +74,6 @@ def test_uv_lock_settings_above_a_repository_root_apply_too(tmp_path, capsys, fa
     [
         ('[tool.uv]\nexclude-newer = "2026-01-01T00:00:00Z"\n', "wheel"),  # the nearest settings: uv stops there
         ("[tool.ruff]\nline-length = 100\n", "source"),  # no [tool.uv]: uv skips it
-        ("[project\n", "source"),  # uv warns that it can't parse it and keeps looking
     ],
 )
 def test_uv_lock_nearest_settings_win(tmp_path, capsys, fake_pypi, between, expected):
@@ -496,3 +495,37 @@ def test_script_block_and_settings_above_combine_as_uv_run_does(tmp_path, capsys
         f'# /// script\n# dependencies = ["fastlib==2.0.0"]\n# [tool.uv]\n# {block}\n# ///\n', encoding="utf-8"
     )
     assert _results(capsys, tmp_path / "s" / "demo.py")[1] == {"fastlib": expected}
+
+
+@pytest.mark.parametrize("input_name", ["uv.lock", "pyproject.toml"])
+@pytest.mark.parametrize("git_between", [False, True])
+def test_unparseable_pyproject_above_a_project_is_refused(tmp_path, input_name, git_between):
+    # uv sync and uv lock (0.13.1) in proj/ stop with "Failed to parse: mid/pyproject.toml" while looking for the
+    # workspace, past a .git too; settings discovery alone only warns.
+    (tmp_path / "pyproject.toml").write_text("[project\n", encoding="utf-8")
+    lock = _lock(tmp_path, tmp_path / "proj")
+    if git_between:
+        (tmp_path / "proj" / ".git").mkdir()
+    with pytest.raises(SourceError, match=r"pyproject\.toml can't be parsed .*looks for the project's workspace there"):
+        load_inputs([str(lock if input_name == "uv.lock" else lock.with_name("pyproject.toml"))])
+
+
+@pytest.mark.parametrize("input_name", ["uv.lock", "pyproject.toml"])
+def test_unparseable_pyproject_above_the_first_one_uv_parses_is_ignored(tmp_path, capsys, fake_pypi, input_name):
+    # uv's workspace discovery stops at the first pyproject.toml above that parses, whatever it holds.
+    (tmp_path / "pyproject.toml").write_text("[project\n", encoding="utf-8")
+    (tmp_path / "mid").mkdir()
+    (tmp_path / "mid" / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n", encoding="utf-8")
+    lock = _lock(tmp_path, tmp_path / "mid" / "proj")
+    path = lock if input_name == "uv.lock" else lock.with_name("pyproject.toml")
+    assert _results(capsys, path)[1] == {"fastlib": "wheel"}
+
+
+def test_unparseable_pyproject_above_a_script_only_warns_in_uv(tmp_path, capsys, fake_pypi):
+    # uv run warns about it during settings discovery and runs the script.
+    (tmp_path / "pyproject.toml").write_text("[project\n", encoding="utf-8")
+    (tmp_path / "s").mkdir()
+    (tmp_path / "s" / "demo.py").write_text(
+        '# /// script\n# dependencies = ["fastlib==2.0.0"]\n# ///\n', encoding="utf-8"
+    )
+    assert _results(capsys, tmp_path / "s" / "demo.py")[1] == {"fastlib": "wheel"}
