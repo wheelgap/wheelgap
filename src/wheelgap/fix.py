@@ -179,7 +179,9 @@ def constraint(cell: Cell) -> Constraint | None:
             same = written is not None and SpecifierSet(written) == SpecifierSet(pkg.spec)
         except InvalidSpecifier:
             same = False
-        specs, file = [written if same and written else pkg.spec], source.label
+        # A requirements file names the file whose line it is: a -r include's, not the top file's (#826).
+        file = (pkg.origin if source.kind == "requirements" else None) or source.label
+        specs = [written if same and written else pkg.spec]
     else:
         return None
     if not specs:

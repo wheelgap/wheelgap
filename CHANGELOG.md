@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--fix` names a package in a `-r` included requirements file by that file's path relative to the top file (`common/requirements.txt`), in both its change line and its "needs ... relaxed" note, instead of by its bare file name, which pointed at the top file. (#831, thanks [@mamoun123121314](https://github.com/mamoun123121314))
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-break-system-packages`, the explicit negative form of `--break-system-packages`: it doesn't change which exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#791, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-editable`: editable installs are already refused there, so the flag has no editable package to affect and doesn't change which exactly pinned distributions or artifacts uv installs. (#790, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a `uv sync --locked` or `--frozen` line and a read `uv pip install` line may also repeat `-q` / `--quiet` (`-qq` and further repetitions), including the global `uv pip -qq install` form: quieter output doesn't change which locked or exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#789, thanks [@Seyamalam](https://github.com/Seyamalam))

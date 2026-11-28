@@ -1411,8 +1411,18 @@ def test_fix_names_an_included_requirements_file_by_its_relative_path(capsys, fa
     (folder / "requirements.txt").write_text("-r common/requirements.txt\n", encoding="utf-8")
     (folder / "common" / "requirements.txt").write_text("fixme==1.0\n", encoding="utf-8")
     _, out, _ = run(capsys, str(folder / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
-    assert "common/requirements.txt" in out
+    assert "In common/requirements.txt, change the pins to fixme==1.3.\n" in out
     assert "In requirements.txt, change" not in out
+
+
+def test_fix_names_the_included_file_whose_range_holds_an_upgrade_back(capsys, fake_pypi, gap_wheels, tmp_path):
+    # #826: the "needs ... relaxed" note names the file the range is in, as the change line below it does.
+    (tmp_path / "common").mkdir()
+    (tmp_path / "requirements.txt").write_text("-r common/requirements.txt\n", encoding="utf-8")
+    (tmp_path / "common" / "requirements.txt").write_text("fixme<1.3\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.2 -> 1.3: win-arm64 (needs common/requirements.txt's fixme<1.3 relaxed)\n" in out
+    assert "In common/requirements.txt, change the requirements to fixme==1.3.\n" in out
 
 
 def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
