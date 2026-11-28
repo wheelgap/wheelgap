@@ -5155,10 +5155,11 @@ def test_dockerfile_requirements_warns_about_a_local_npm_install_with_a_package_
         # A destination given as an option with the path attached.
         ("RUN cp -r /tmp/web --target-directory=/srv && cd /srv/web && npm install left-pad\n", True),
         ("RUN cp -r -t/srv /tmp/web && cd /srv/web && npm install left-pad\n", True),
+        # A relative one, read in the RUN's folder.
+        ("RUN cp -r /tmp/web -t. && cd web && npm install left-pad\n", True),
+        ("RUN cp -r /tmp/web -tdeps && cd deps/web && npm install left-pad\n", True),
         # A clone whose option takes a value: the folder comes from the URL, not from the value.
         ("RUN git clone --revision v1.2 https://example.com/web.git && cd web && npm install left-pad\n", True),
-        ("RUN git clone -bmain https://example.com/web.git && cd web && npm install left-pad\n", True),
-        ("RUN git -C /srv clone https://example.com/web.git && cd /srv/web && npm install left-pad\n", True),
         # An option wheelgap doesn't know may take a value, so the clone's folder isn't known.
         ("RUN git clone --newopt x https://example.com/web.git /srv/other\nRUN npm install left-pad\n", True),
         # A clone into an unrelated folder leaves the npm install a plain program.

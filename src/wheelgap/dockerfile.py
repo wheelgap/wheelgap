@@ -1631,25 +1631,27 @@ def _may_carry_package_json(
     for _, text, cwd in mentions:
         if posixpath.basename(text.rstrip("/")) == "package.json" or _unresolved(text):
             return True  # a package.json by name (a download's URL too), or a path wheelgap can't resolve
-        if text.startswith("-"):
-            # An option names a path only with its value attached: `--target-directory=/srv/web`, `-t/srv/web`.
-            if text.startswith("--") and "=" in text:
-                text = text.partition("=")[2]
-            elif not text.startswith("--") and "/" in text:
-                text = text[text.index("/") :]
-            else:
-                continue
-            if not text or text.startswith("-"):
-                continue
-        if "://" in text:
-            continue  # a URL: not a path in the image
-        if cwd is None and not text.startswith("/"):
-            return True  # a relative name in a folder wheelgap doesn't know
-        path = posixpath.normpath(posixpath.join(cwd or "/", text))
-        if fnmatch.fnmatchcase(folder, path) or fnmatch.fnmatchcase(target, path):
-            return True
-        if folder.startswith(path.rstrip("/") + "/"):
-            return True
+        if text.startswith("--"):
+            # An option names a path only with its value attached: `--target-directory=/srv/web`.
+            texts = [text.partition("=")[2]] if "=" in text else []
+        elif text.startswith("-"):
+            # `-t/srv/web`, `-t.`, `-tdeps/web`: the value after the letter, or (in a cluster such as `-rt/srv`)
+            # from its first slash. A relative one counts only in a known folder, so `-rf` there costs a needless
+            # check, never a warning in every RUN whose folder isn't known.
+            texts = [text[2:]] if cwd is not None else []
+            texts += [text[text.index("/") :]] if "/" in text[2:] else []
+        else:
+            texts = [text]
+        for each in texts:
+            if not each or each.startswith("-") or "://" in each:
+                continue  # an option, or a URL: not a path in the image
+            if cwd is None and not each.startswith("/"):
+                return True  # a relative name in a folder wheelgap doesn't know
+            path = posixpath.normpath(posixpath.join(cwd or "/", each))
+            if fnmatch.fnmatchcase(folder, path) or fnmatch.fnmatchcase(target, path):
+                return True
+            if folder.startswith(path.rstrip("/") + "/"):
+                return True
     for _, text, cwd in created:
         if _unresolved(text) or (cwd is None and not text.startswith("/")):
             return True
