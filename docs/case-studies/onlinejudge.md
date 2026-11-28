@@ -35,7 +35,8 @@ uvx wheelgap==0.14.0 deploy/requirements.txt -p 3.12 \
   -t musl-x86_64,musl-aarch64 --explain --suggest --no-cache
 ```
 
-The scan exits 1. Eighteen pins have wheels for both targets and four build from source on both.
+The scan exits 1. Eighteen pins have wheels for both targets and four build from source on both. The requirements
+file isn't a full lock, so the dependencies of these pins weren't checked.
 
 ## Gaps and possible fixes
 
@@ -48,15 +49,16 @@ The scan exits 1. Eighteen pins have wheels for both targets and four build from
 
 ## Cross-check with pip
 
-Run pip in wheel-only mode on both architectures. The three platform tags cover musl 1.2 and earlier compatible
-musllinux versions. With `--no-deps`, each command checks only the named coverage pin.
+Run pip in wheel-only mode on both architectures. The three musllinux tags cover musl 1.2 and earlier compatible
+musllinux versions, and pip also accepts plain `linux_<arch>` wheels on musl. With `--no-deps`, each command checks
+only the named coverage pin.
 
 ```bash
 for arch in x86_64 aarch64; do
   for version in 6.5.0 7.2.7; do
     uvx --from pip==26.3 pip download --only-binary=:all: --no-deps \
       --platform "musllinux_1_2_$arch" --platform "musllinux_1_1_$arch" \
-      --platform "musllinux_1_0_$arch" --implementation cp --python-version 3.12 --abi cp312 \
+      --platform "musllinux_1_0_$arch" --platform "linux_$arch" --implementation cp --python-version 3.12 --abi cp312 \
       --dest "wheels-$arch" "coverage==$version"
   done
 done
