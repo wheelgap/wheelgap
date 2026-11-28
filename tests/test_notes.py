@@ -782,8 +782,9 @@ def test_pipfile_lock_sources(capsys, tmp_path, tracker, fake_pypi, sources, sen
     "tool,sent",
     [
         ("", True),
-        ('[[tool.uv.index]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
-        ('[tool.uv.sources]\nnowheels = { index = "corp" }\n', False),
+        ('[[tool.uv.index]]\nname = "corp"\nurl = "https://private.example/simple"\nexplicit = true\n', False),
+        # Another package's source: nowheels itself is still looked up on PyPI, but the input isn't PyPI-only.
+        ('[tool.uv.sources]\nother = { index = "corp" }\n', False),
         ('[[tool.poetry.source]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
         ('[[tool.pdm.source]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
     ],

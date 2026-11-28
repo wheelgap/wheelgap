@@ -1265,7 +1265,7 @@ def test_dockerfile_requirements_refuses_nested_includes(tmp_path):
     for text in (
         "-r base.txt\npurewheel==3.1\n",
         "\ufeff-r base.txt\n",
-        "purewheel==3.1\n--req base.txt\n",
+        "purewheel==3.1\n--requirem base.txt\n",  # pip refuses `--req`: --require-hashes or --requirement?
         "--pre -r base.txt\npurewheel==3.1\n",
         "--only-binary :all: --constraint=base.txt\n",
         "purewheel==3.1\n--pre \\\n-cbase.txt\n",

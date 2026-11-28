@@ -55,6 +55,22 @@ class SourceError(ValueError):
 PoetryExtras = tuple[frozenset[str], frozenset[str]]
 
 
+class MarkerGroup:
+    """A name required on several lines under different markers (sources._merge_requirements). pip takes one release
+    that every line whose marker holds allows, so which package a target installs depends on which lines hold there,
+    all together. `lines` are the requirements, one per marker (the lines under one marker merged), in pip's order;
+    `members` the packages checked for them: each answers for the sets of lines in its `marker_sets`, and the one with
+    the empty set for a target the others can't answer (check.group_answer decides per target). Compared by identity."""
+
+    def __init__(self, lines: list[Package]):
+        self.lines = lines
+        self.members: list[Package] = []
+
+    @property
+    def markers(self) -> list[list[str] | None]:
+        return [line.markers for line in self.lines]
+
+
 @dataclass
 class Package:
     name: str
@@ -121,6 +137,15 @@ class Package:
     project_urls: dict[str, str] | None = None
     home_page: str | None = None
     exclude_newer: datetime | None = field(default=None, repr=False, compare=False)
+    # Requirements files: the line's sha384 and sha512 `--hash` values (`sha512:<hex>`), which no index digest can be
+    # matched against. Beside sha256 ones, they make a target with no fitting listed file `unknown` (check.check).
+    other_hashes: frozenset[str] = frozenset()
+    # Two or more lines' ranges intersected into `spec` (numpy>=2 and numpy<2), so no matching release is a refusal.
+    merged_ranges: bool = False
+    # A name required under several markers: the group, and the sets of its lines this package is the answer for.
+    # The empty set marks the package for targets where a line's marker can't be decided (or a set no package has).
+    marker_group: MarkerGroup | None = None
+    marker_sets: frozenset[frozenset[int]] = frozenset()
 
     @property
     def key(self) -> str:
@@ -195,6 +220,11 @@ class Source:
     # for those environments only: `uv sync` fails anywhere else, and the lock leaves out the packages and wheels
     # that only other environments need (see check.check_lock_environments).
     supported_markers: list[str] = field(default_factory=list)
+    # pdm.lock only: its [[metadata.targets]] (`pdm lock --platform/--python/--implementation`), each a table of
+    # requires_python, platform, implementation and gil_disabled. `pdm install` refuses an environment none of them
+    # takes ("No compatible lock target found"), and a lock made for a platform keeps only that platform's packages
+    # and wheels (see check.pdm_target_value).
+    pdm_targets: list[dict] = field(default_factory=list)
     # Scripts and pyproject.toml: uv's exclude-newer (#521). A file uploaded at or after the cutoff isn't installed;
     # exclude-newer-package gives the packages it names their own cutoff, or none (uv's `false`: None here).
     exclude_newer: datetime | None = None
@@ -209,6 +239,8 @@ class Source:
     # graph remains untouched, preserving conservative behavior when no selectors are supplied.
     uv_packages: list[dict] | None = None
     uv_manifest: dict = field(default_factory=dict)
+    # uv.lock only: its [options] table (exclude-newer and the rest, as uv locked with them), for --fix (#822).
+    uv_options: object = None
     uv_pyproject: Path | None = None
     # A script's lock (example.py.lock, from uv lock --script): the script's path, as the lock's was given. uv takes
     # no dependency groups for it from a pyproject.toml beside it, so uv_pyproject is None; --fix's config goes in the
@@ -233,10 +265,17 @@ class Source:
     pyproject_groups_only: bool = False
     # pyproject.toml only: the canonical [project] name, to spot `myproject[extra]` self-references.
     pyproject_name: str | None = None
+    # pyproject.toml and scripts: the uv settings and [tool.uv.sources] uv applies to each requirement, including
+    # those of extras and groups selected later (_project_package).
+    uv_rules: UvRules | None = None
     # poetry.lock only: each package's [[package]] table, kept so --group/--only-group/--no-dev can pick packages
     # by the groups Poetry records on them.
     poetry_tables: list[dict] | None = None
     poetry_pyproject: Path | None = None
+    # poetry.lock before lock-version 2.1 with no readable pyproject.toml beside it, or one that declares nothing: why
+    # its direct dependencies are unknown. check() then makes a package the walk leaves out on a target `unknown`
+    # there when it would have a gap.
+    poetry_roots_unknown: str | None = None
     # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
     poetry_lock_extras: list[str] = field(default_factory=list)
     # poetry.lock after a selection: the note that says where extras couldn't leave packages out, because Poetry
@@ -301,6 +340,9 @@ class Source:
     deps_paths: dict[Target, dict[int, list[str]]] | None = None
     # --deps: all distinct direct requirements that reach each transitive package, per target.
     deps_direct: dict[Target, dict[int, tuple[str, ...]]] | None = None
+    # --deps: per target, the specifier each other package in the tree puts on each package, with that package's name,
+    # for --fix to name the one that rules an upgrade out (#821).
+    deps_imposed: dict[Target, dict[int, list[tuple[str, str]]]] | None = None
 
     def cutoff_for(self, key: str) -> datetime | None:
         """The upload cutoff uv applies to this package: its exclude-newer-package entry, else exclude-newer."""
@@ -549,6 +591,8 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
 
 
 _UV_BUILD_RESTRICTIONS = ("no-build", "no-binary", "no-build-package", "no-binary-package")
+# The uv settings wheelgap applies: the build restrictions, and no-sources, which turns [tool.uv.sources] off.
+_UV_APPLIED_SETTINGS = (*_UV_BUILD_RESTRICTIONS, "no-sources")
 
 
 def _sets_build_restriction(uv: object) -> list[str]:
@@ -575,42 +619,6 @@ def _uv_config(directory: Path) -> tuple[Path, object] | None:
     return None
 
 
-def _refuse_script_build_restrictions(path: Path) -> None:
-    """A script's lock (example.py.lock) doesn't record the build restrictions in the script's own [tool.uv], which
-    `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them.
-    The same goes for a uv.toml or pyproject.toml [tool.uv] in a folder above the lock (up to the repository root),
-    which uv also applies when there's none beside it (a pyproject.toml without [tool.uv] doesn't count):
-    _uv_build_restrictions reads only the lock's own folder."""
-    if not path.name.endswith(".py.lock"):
-        return
-    folder = path.resolve().parent
-    if _uv_config(folder) is None and not (folder / ".git").exists():
-        for directory in folder.parents:
-            if (found := _uv_config(directory)) is not None:
-                config, uv = found
-                if keys := _sets_build_restriction(uv):
-                    raise SourceError(
-                        f"{path.name}: {config} sets {', '.join(keys)}, which wheelgap doesn't read from a folder "
-                        "above a script's lock yet, so it can't say what `uv run` would install"
-                    )
-                break
-            if (directory / ".git").exists():
-                break
-    script = path.with_name(path.name.removesuffix(".lock"))
-    if not script.is_file():
-        return
-    try:
-        data = _script_metadata(script)
-    except (SourceError, OSError):
-        return  # no readable block beside it: nothing to apply, and the lock itself is still read
-    uv = data.get("tool", {}).get("uv", {}) if isinstance(data.get("tool"), dict) else {}
-    if keys := _sets_build_restriction(uv):
-        raise SourceError(
-            f"{path.name}: the script {script.name} sets {', '.join(keys)} in its [tool.uv], which wheelgap "
-            "doesn't read for a script's lock yet, so it can't say what `uv run` would install"
-        )
-
-
 def tool_table(data: dict, path: Path | str) -> dict:
     """Return the [tool] table from parsed TOML, or raise SourceError when tool is not a table."""
     tool = data.get("tool", {})
@@ -619,63 +627,438 @@ def tool_table(data: dict, path: Path | str) -> dict:
     return tool
 
 
-def _uv_build_restrictions(path: Path, source: Source) -> None:
-    """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
+# The shared reader of the uv settings uv applies to an input (#810, #811, #812): a project's uv.lock, a script's
+# lock, a pyproject.toml and a script all go through _find_uv_settings and _uv_build_policy, and a pyproject.toml
+# or script's requirements through UvRules.apply as well.
 
-    uv.toml takes precedence over [tool.uv] in pyproject.toml when both are present.
-    uv's pip-only [tool.uv.pip] options do not apply to uv sync.
-    """
-    _refuse_script_build_restrictions(path)
-    config_path = path.with_name("uv.toml")
-    standalone = config_path.is_file()
-    if not standalone:
-        config_path = path.with_name("pyproject.toml")
-        if not config_path.is_file():
-            return
+
+@dataclass
+class _UvLayer:
+    """One table of uv settings that applies to an input: a uv.toml, a pyproject.toml's [tool.uv], or a script's
+    [tool.uv]. `table` names it in errors ("uv.toml" or "[tool.uv]"), after `config`; `shown` names it in an install
+    policy, relative to the input's folder (`[tool.uv]`, `uv.toml`, `../uv.toml`, `../pyproject.toml [tool.uv]`)."""
+
+    settings: dict
+    config: Path
+    table: str
+    shown: str
+
+
+def _uv_settings_file(config: Path, strict: bool) -> dict | None:
+    """The settings in a uv.toml, or in a pyproject.toml's [tool.uv] table (None without one). uv 0.13.1 stops with
+    an error on a uv.toml it can't read, but only warns about a pyproject.toml it can't read and looks further up;
+    `strict` makes that an error too, for the input's own pyproject.toml."""
+    standalone = config.name == "uv.toml"
     try:
-        text = config_path.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
-    except UnicodeDecodeError:
-        raise SourceError(f"{config_path}: isn't UTF-8, so its uv build restrictions can't be read") from None
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
-    setting_table = "uv.toml" if standalone else "[tool.uv]"
-    tool = tool_table(data, config_path)
-    uv = data if standalone else tool.get("uv", {})
-    if not isinstance(uv, dict):
-        raise SourceError(f"{config_path}: {setting_table} must be a table")
+        data = tomllib.loads(config.read_text(encoding="utf-8-sig"))  # -sig: Windows editors add a BOM
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        if not (standalone or strict):
+            return None
+        if isinstance(e, UnicodeDecodeError):
+            raise SourceError(f"{config}: isn't UTF-8, so its uv settings can't be read") from None
+        if isinstance(e, tomllib.TOMLDecodeError):
+            raise SourceError(f"{config}: invalid TOML: {e}") from None
+        raise SourceError(f"{config}: can't be read ({e}), so its uv settings can't be read") from None
+    if standalone:
+        return data
+    if not strict:  # uv warns about a [tool] or [tool.uv] that isn't a table and keeps looking
+        uv = _table(data, "tool").get("uv")
+        return uv if isinstance(uv, dict) else None
+    uv = tool_table(data, config).get("uv")
+    if uv is not None and not isinstance(uv, dict):
+        raise SourceError(f"{config}: [tool.uv] must be a table")
+    return uv
 
-    for key in ("no-build", "no-binary"):
-        if not isinstance(uv.get(key, False), bool):
-            raise SourceError(f"{config_path}: {setting_table} {key} must be a boolean")
 
-    selected: dict[str, set[str]] = {}
-    for key in ("no-build-package", "no-binary-package"):
-        values = uv.get(key, [])
-        if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
-            raise SourceError(f"{config_path}: {setting_table} {key} must be a list of strings")
-        if any(not _NAME_RE.fullmatch(name) for name in values):
-            raise SourceError(f"{config_path}: {setting_table} {key} must contain valid package names")
-        selected[key] = {canonicalize_name(name) for name in values}
+def _find_uv_settings(folder: Path, own: Path | None = None) -> tuple[Path, dict] | None:
+    """The uv settings uv finds from `folder` (FilesystemOptions::find in uv 0.13.1), with the file they're in: in
+    each folder from it up to the filesystem root, its uv.toml, else a pyproject.toml with a [tool.uv] table. uv
+    skips a pyproject.toml without one, and one it can't read (`own`, the input's own pyproject.toml, is an error
+    instead), and it doesn't stop at a repository root."""
+    for directory in (folder, *folder.parents):
+        for name in ("uv.toml", "pyproject.toml"):
+            config = directory / name
+            if config.is_file() and (settings := _uv_settings_file(config, strict=config == own)) is not None:
+                return config, settings
+    return None
 
-    for pkg in source.packages:
-        if pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
-            continue
+
+def _refuse_unparseable_workspace_parent(folder: Path, what: Path) -> None:
+    """uv sync and uv lock look for a project's workspace through the first pyproject.toml in a folder above it, and
+    stop with an error when that one can't be parsed (uv 0.13.1: "Failed to parse"), past a repository root too.
+    Settings discovery only warns about it, but the project can't be synced, so refuse rather than answer."""
+    for directory in folder.parents:
+        candidate = directory / "pyproject.toml"
+        if candidate.is_file():
+            try:
+                tomllib.loads(candidate.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                raise SourceError(
+                    f"{what}: {candidate} can't be parsed ({e}), and uv stops with an error when it looks for the "
+                    "project's workspace there"
+                ) from None
+            return  # uv's workspace discovery stops at the first one it can parse
+
+
+def _input_folder(path: Path) -> Path:
+    return Path(os.path.normpath(path.absolute())).parent
+
+
+def _uv_layer(found: tuple[Path, dict], folder: Path, own: Path | None) -> _UvLayer:
+    config, settings = found
+    table = "uv.toml" if config.name == "uv.toml" else "[tool.uv]"
+    if config == own or (table == "uv.toml" and config.parent == folder):
+        return _UvLayer(settings, config, table, table)
+    shown = Path(os.path.relpath(config, folder)).as_posix()  # one spelling on every OS, as in a pyproject.toml
+    return _UvLayer(settings, config, table, shown if table == "uv.toml" else f"{shown} [tool.uv]")
+
+
+def _script_uv_layers(script: Path, block: dict) -> list[_UvLayer]:
+    """A script's settings, as `uv run` applies them: its own [tool.uv], combined with the settings found from the
+    script's folder up (uv 0.13.1 looks there whatever folder it runs in, and only in the folder it runs in when
+    there are none; wheelgap can't know that folder)."""
+    folder = _input_folder(script)
+    layers = [_UvLayer(block, script, "[tool.uv]", "[tool.uv]")]
+    if (found := _find_uv_settings(folder)) is not None:
+        layers.append(_uv_layer(found, folder, None))
+    return layers
+
+
+def _lock_uv_layers(path: Path) -> list[_UvLayer]:
+    """The settings `uv sync` applies to a project's uv.lock: those found from the lock's folder, the workspace
+    root, up; or for a script's lock (example.py.lock), what `uv run` applies to the script beside it."""
+    if path.name.endswith(".py.lock"):
+        script = path.with_name(path.name.removesuffix(".lock"))
+        block: dict = {}
+        if script.is_file():
+            try:
+                block = _table(_table(_script_metadata(script), "tool"), "uv")
+            except (SourceError, OSError):
+                pass  # no readable block beside it: nothing of its own to apply, and the lock itself is still read
+        return _script_uv_layers(script, block)
+    folder = _input_folder(path)
+    own = folder / "pyproject.toml"
+    _refuse_unparseable_workspace_parent(folder, path)
+    found = _find_uv_settings(folder, own)
+    return [] if found is None else [_uv_layer(found, folder, own)]
+
+
+def uv_lock_settings_above(path: Path) -> tuple[Path, list[str]] | None:
+    """The uv.toml or pyproject.toml in a folder above a project's uv.lock whose build restrictions the lock check
+    applies, with them (for --dockerfile-inputs, where the image may not have it)."""
+    folder = _input_folder(path)
+    found = _find_uv_settings(folder, folder / "pyproject.toml")
+    if found is None or found[0].parent == folder or not (keys := _sets_build_restriction(found[1])):
+        return None
+    return found[0], keys
+
+
+@dataclass
+class _BuildPolicy:
+    """The build and wheel restrictions uv applies to index packages, and whether no-sources turns
+    [tool.uv.sources] off. `no_build` and `no_binary` are the setting that turns one on for every package, as an
+    install policy names it (`[tool.uv] no-build`), False when a setting turns it off, or None when none sets it;
+    the package lists map each name to the setting that names it (`[tool.uv] no-binary-package`)."""
+
+    no_build: str | bool | None = None
+    no_binary: str | bool | None = None
+    no_build_package: dict[str, str] = field(default_factory=dict)
+    no_binary_package: dict[str, str] = field(default_factory=dict)
+    no_sources: bool = False
+
+    def _lists(self) -> tuple[dict[str, str], dict[str, str]]:
+        """The package lists uv reads: a list counts only while its blanket setting is unset (uv's NoBuild and
+        NoBinary from_args: `no-binary = false` makes no-binary-package do nothing, checked with uv 0.13.1)."""
+        return (
+            self.no_build_package if self.no_build is None else {},
+            self.no_binary_package if self.no_binary is None else {},
+        )
+
+    def settings_on(self) -> list[str]:
+        firsts = [next(iter(names.values())) for names in self._lists() if names]
+        return [setting for setting in (self.no_build, self.no_binary, *firsts) if isinstance(setting, str)]
+
+    def apply(self, pkg: Package) -> None:
+        """As uv's BuildOptions.no_build_package and no_binary_package: a blanket setting gives way to the other
+        kind's list, so with no-binary a package in no-build-package still takes a wheel, and with no-build a
+        package in no-binary-package still builds (uv 0.13.1 does both)."""
+        build_list, binary_list = self._lists()
         restrictions = []
-        if uv.get("no-build"):
+        if isinstance(self.no_build, str) and pkg.key not in binary_list:
             pkg.only_binary = True
-            restrictions.append(f"{setting_table} no-build")
-        elif pkg.key in selected["no-build-package"]:
+            restrictions.append(self.no_build)
+        elif pkg.key in build_list:
             pkg.only_binary = True
-            restrictions.append(f"{setting_table} no-build-package")
-        if uv.get("no-binary"):
+            restrictions.append(build_list[pkg.key])
+        if isinstance(self.no_binary, str) and pkg.key not in build_list:
             pkg.no_binary = True
-            restrictions.append(f"{setting_table} no-binary")
-        elif pkg.key in selected["no-binary-package"]:
+            restrictions.append(self.no_binary)
+        elif pkg.key in binary_list:
             pkg.no_binary = True
-            restrictions.append(f"{setting_table} no-binary-package")
+            restrictions.append(binary_list[pkg.key])
         pkg.install_policy = ", ".join(restrictions) or None
+
+
+def _uv_build_policy(layers: list[_UvLayer]) -> _BuildPolicy:
+    """The restrictions in `layers`, highest precedence first, combined as uv combines a script's [tool.uv] with
+    the settings found for it: the first layer that sets no-build, no-binary or no-sources decides it, and the
+    package lists are joined (uv 0.13.1 builds a package either names; _BuildPolicy.apply has how the settings
+    combine). uv's pip-only [tool.uv.pip] options don't apply to uv sync or uv run."""
+    policy = _BuildPolicy()
+    decided: set[str] = set()
+    for layer in layers:
+        for key in ("no-build", "no-binary", "no-sources"):
+            if key not in layer.settings:
+                continue
+            value = layer.settings[key]
+            if not isinstance(value, bool):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must be a boolean")
+            if key in decided:
+                continue
+            decided.add(key)
+            if key == "no-sources":
+                policy.no_sources = value
+            else:
+                setattr(policy, key.replace("-", "_"), f"{layer.shown} {key}" if value else False)
+        for key in ("no-build-package", "no-binary-package"):
+            values = layer.settings.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must be a list of strings")
+            if any(not _NAME_RE.fullmatch(name) for name in values):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must contain valid package names")
+            names = policy.no_build_package if key == "no-build-package" else policy.no_binary_package
+            for name in values:
+                names.setdefault(canonicalize_name(name), f"{layer.shown} {key}")
+    return policy
+
+
+def _uv_build_restrictions(path: Path, source: Source) -> None:
+    """Apply the build and wheel restrictions of the uv settings `uv sync` (or `uv run`, for a script's lock)
+    applies to the index packages in a uv.lock (_lock_uv_layers)."""
+    policy = _uv_build_policy(_lock_uv_layers(path))
+    for pkg in source.packages:
+        if not pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
+            policy.apply(pkg)
+
+
+# The kinds of [tool.uv.sources] entry uv takes, one per entry.
+_UV_SOURCE_KINDS = ("git", "url", "path", "workspace", "index")
+
+
+@dataclass
+class UvRules:
+    """What uv does to a pyproject.toml or script's requirements beyond what they say (#810, #811): the build
+    restrictions in the settings it applies, and [tool.uv.sources], by canonical name (each entry with the file
+    it's in), which take a requirement from git, a path, a URL, a workspace member or a named index instead of the
+    default one. `indexes` maps the names of the [[tool.uv.index]] entries a source may name to their URLs, and
+    `package_index` says where uv takes a requirement without a source of its own from (_UvPackageIndex)."""
+
+    policy: _BuildPolicy
+    sources: dict[str, tuple[object, Path]]
+    indexes: dict[str, str]
+    package_index: _UvPackageIndex
+
+    def apply(self, pkg: Package) -> None:
+        if pkg.skip:  # a direct URL: not from an index whatever the settings
+            return
+        if not self.policy.no_sources and (found := self.sources.get(pkg.key)) is not None:
+            _apply_uv_source(pkg, *found, self.indexes)
+        else:
+            self.package_index.apply(pkg)
+        if pkg.skip or pkg.error:
+            return
+        self.policy.apply(pkg)
+
+
+def _is_pypi_index(url: str) -> bool:
+    return url.rstrip("/") == "https://pypi.org/simple"
+
+
+def _shown_index(url: str) -> str:
+    """An index URL for a note, without the user and password it may hold."""
+    try:
+        return urlparse(url)._replace(netloc=urlparse(url).netloc.rpartition("@")[2]).geturl()
+    except ValueError:
+        return "an index URL wheelgap can't parse"
+
+
+@dataclass
+class _UvPackageIndex:
+    """Where uv takes a requirement that has no [tool.uv.sources] entry from, when it isn't PyPI alone: `default`, an
+    index in place of PyPI (an [[tool.uv.index]] with `default = true`, index-url or default-index), which no PyPI
+    answer may stand for; `no_index`, the setting that turns every index off; or `extra`, an index (an
+    [[tool.uv.index]] that isn't `explicit`, extra-index-url) or find-links that uv may take the package from before
+    PyPI (its first-index strategy), each as a note names it. Verified with uv 0.13.1: `uv lock` takes markupsafe from
+    such an index in all four shapes."""
+
+    default: str | None = None
+    no_index: str | None = None
+    extra: str | None = None
+
+    def apply(self, pkg: Package) -> None:
+        if self.no_index is not None:
+            pkg.error = f"{self.no_index} sets no-index, so uv installs {pkg.name} from find-links only"
+        elif self.default is not None:
+            pkg.registry = self.default  # pypi.fill_all skips it as a private index, unless WHEELGAP_INDEX_URL is it
+        elif self.extra is not None:
+            pkg.error = (
+                f"{self.extra}, which uv may take {pkg.name} from before PyPI, and wheelgap doesn't read that index"
+            )
+
+
+def _uv_package_index(tables: list[tuple[dict, str]]) -> _UvPackageIndex:
+    """The _UvPackageIndex of uv settings tables, each with how a note names it (`pyproject.toml: [tool.uv]`). Every
+    table that may apply counts, so a PyPI answer is given only when none of them names another index."""
+    found = _UvPackageIndex()
+    for settings, where in tables:
+        defaults: list[str] = []
+        extras: list[str] = []
+        indexes = settings.get("index", [])
+        if not isinstance(indexes, list) or not all(isinstance(i, dict) for i in indexes):
+            raise SourceError(f"{where} index must be a list of tables")
+        for index in indexes:
+            url = index.get("url")
+            if not isinstance(url, str):
+                raise SourceError(f"{where} has an [[index]] whose url isn't a string")
+            if index.get("explicit") is True:
+                continue  # only a [tool.uv.sources] entry that names it uses it
+            (defaults if index.get("default") is True else extras).append(url)
+        for key, into in (("index-url", defaults), ("default-index", defaults)):
+            if key in settings:
+                if not isinstance(settings[key], str):
+                    raise SourceError(f"{where} {key} must be a string")
+                into.append(settings[key])
+        for key in ("extra-index-url", "find-links"):
+            values = settings.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise SourceError(f"{where} {key} must be a list of strings")
+            # find-links is a folder or page of files, never PyPI's index.
+            extras.extend(v if key == "extra-index-url" else f"find-links {v}" for v in values)
+        if settings.get("no-index") is True and found.no_index is None:
+            found.no_index = where
+        if found.default is None and (url := next((u for u in defaults if not _is_pypi_index(u)), None)):
+            found.default = url
+        if found.extra is None and (url := next((u for u in extras if not _is_pypi_index(u)), None)):
+            found.extra = f"{where} names the index {_shown_index(url)}"
+    return found
+
+
+def _apply_uv_source(pkg: Package, entry: object, config: Path, indexes: dict[str, str]) -> None:
+    """Take `pkg` from where its [tool.uv.sources] entry says: skip a git, URL, path or workspace source as the
+    uv.lock reader does, and give an index source's package that index as its registry, so it's never answered with
+    PyPI's files (pypi.fill_all skips it as a private index unless WHEELGAP_INDEX_URL is that index). An entry
+    that picks a source by marker, extra or group leaves the package unknown: uv takes it from PyPI wherever none
+    of them applies, and wheelgap doesn't follow that per target. So does an index none of the settings read
+    defines."""
+    where = f"{config}: [tool.uv.sources] {pkg.name}"
+    entries: list[object] = entry if isinstance(entry, list) else [entry]
+    tables = [e for e in entries if isinstance(e, dict)]
+    if not tables or len(tables) != len(entries):
+        raise SourceError(f"{where} must be a table or a list of tables")
+    if len(tables) > 1 or any(key in e for e in tables for key in ("marker", "extra", "group")):
+        pkg.error = (
+            f"{config.name}: [tool.uv.sources] gives {pkg.name} a source by marker, extra or group, which wheelgap "
+            "doesn't follow per target, so where uv installs it from isn't known"
+        )
+        return
+    (source,) = tables
+    kinds = [kind for kind in _UV_SOURCE_KINDS if kind in source]
+    if len(kinds) != 1:
+        raise SourceError(f"{where} must have exactly one of {', '.join(_UV_SOURCE_KINDS)}")
+    kind = kinds[0]
+    value = source[kind]
+    if kind == "index":
+        if not isinstance(value, str):
+            raise SourceError(f"{where} has an index that isn't a string")
+        if (url := indexes.get(value)) is None:
+            # uv 0.13.1 refuses it ("references an undeclared index"), even when a uv.toml or UV_CONFIG_FILE defines
+            # it: a source's index must be in the project's own pyproject.toml (or the workspace root's), or a
+            # script's block.
+            pkg.error = (
+                f"{config.name}: [tool.uv.sources] takes {pkg.name} from the index {value!r}, which no "
+                "[[tool.uv.index]] of the project defines, so uv refuses to install it"
+            )
+            return
+        pkg.registry = url
+    elif kind == "workspace" and value is not True:
+        raise SourceError(f"{where} has a workspace that isn't true")
+    else:
+        pkg.skip = "editable" if kind == "path" and source.get("editable") is True else kind
+
+
+def _uv_sources(uv: dict, config: Path) -> dict[str, tuple[object, Path]]:
+    sources = uv.get("sources", {})
+    if not isinstance(sources, dict):
+        raise SourceError(f"{config}: [tool.uv.sources] must be a table")
+    out: dict[str, tuple[object, Path]] = {}
+    for name, entry in sources.items():
+        key = canonicalize_name(name)
+        if key in out:
+            raise SourceError(f"{config}: [tool.uv.sources] names {key!r} twice once normalized")
+        out[key] = (entry, config)
+    return out
+
+
+def _uv_indexes(*tables: object) -> dict[str, str]:
+    """The named [[tool.uv.index]] (or uv.toml [[index]]) entries of each `index` list, the first of a name first."""
+    indexes: dict[str, str] = {}
+    for table in tables:
+        for index in table if isinstance(table, list) else []:
+            if isinstance(index, dict) and isinstance(index.get("name"), str) and isinstance(index.get("url"), str):
+                indexes.setdefault(index["name"], index["url"])
+    return indexes
+
+
+def _uv_rules(data: dict, path: Path, script: bool) -> UvRules:
+    """The UvRules for a pyproject.toml or script (`data`, a script's block as _project_source gets it). A script's
+    settings are its block's [tool.uv] with those `uv run` finds (_script_uv_layers), its sources its block's. For
+    a pyproject.toml uv applies the settings found from its folder up (a uv.toml beside it in place of its
+    [tool.uv]); for a workspace member, those of the workspace root instead (uv ignores the member's own), and the
+    root's [tool.uv.sources] too, under the member's own."""
+    own_uv = _table(_table(data, "tool"), "uv")
+    sources = _uv_sources(own_uv, path)
+    root_index = None
+    # Every settings table that may apply to the default index, so a PyPI answer is given only if none names another.
+    index_tables = [(own_uv, f"{path}: [tool.uv]")]
+    if script:
+        layers = _script_uv_layers(path, own_uv)
+    else:
+        folder = _input_folder(path)
+        own = folder / path.name
+        _refuse_unparseable_workspace_parent(folder, path)
+        workspace = _workspace_root(path, data)
+        found = _find_uv_settings(folder, own) if workspace is None else None
+        if workspace is not None:
+            root, root_data, certain = workspace
+            root_uv = _table(_table(root_data, "tool"), "uv")
+            root_index = root_uv.get("index")
+            index_tables.append((root_uv, f"{root}: [tool.uv]"))
+            found = _find_uv_settings(root.parent)
+            if certain:
+                sources = {**_uv_sources(root_uv, root), **sources}
+            else:
+                # A member gets the root's settings and sources, a project of its own the settings found for it.
+                alone = _find_uv_settings(folder, own)
+                differ = [
+                    f"{config} sets {', '.join(keys)}"
+                    for config, settings in ([] if alone == found else [f for f in (found, alone) if f is not None])
+                    if (keys := [key for key in _UV_APPLIED_SETTINGS if key in settings])
+                ]
+                if root_uv.get("sources"):
+                    differ.append(f"{root} has [tool.uv.sources]")
+                if differ:
+                    raise SourceError(
+                        f"{path}: wheelgap can't tell whether this is a member of the workspace at {root} (its "
+                        "[tool.uv.workspace] members or exclude use patterns wheelgap doesn't match as uv does), and "
+                        f"uv gives a member the workspace root's settings and sources: {differ[0]}"
+                    )
+                found = alone
+        layers = [] if found is None else [_uv_layer(found, folder, own)]
+    index_tables += [(layer.settings, f"{layer.config}: {layer.table}") for layer in layers]
+    # A source's index must be in the project's own [tool.uv] (or the workspace root's), or a script's block: uv
+    # 0.13.1 refuses one only a uv.toml defines.
+    indexes = _uv_indexes(own_uv.get("index"), root_index)
+    return UvRules(_uv_build_policy(layers), sources, indexes, _uv_package_index(index_tables))
 
 
 def parse_uv_lock(path: Path) -> Source:
@@ -694,6 +1077,7 @@ def parse_uv_lock(path: Path) -> Source:
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
+    source.uv_options = data.get("options")
     if path.name.endswith(".py.lock"):
         source.uv_script = str(path).removesuffix(".lock")  # as given, so --fix's `uv lock --script` runs from here
     else:
@@ -1174,13 +1558,13 @@ def parse_poetry_lock(path: Path) -> Source:
             url = p.get("source", {}).get("url")
             pkg.registry = url if isinstance(url, str) else None
             entries = p.get("files")
-            if entries is None:
+            if not entries:
                 entries = legacy_files.get(p["name"])
-            # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
-            # packages from another index are skipped (fill_all).
-            pkg.files = (
-                None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
-            )
+            # No files recorded (old [metadata.hashes] locks, or `files = []`, which Poetry writes when the source
+            # gave it no hashes): Poetry installs the best file the index has, unchecked (`if not package.files:
+            # return ordered_links[0]` in poetry/installation/chooser.py). So PyPI packages are looked up on the
+            # index and packages from another index are skipped (fill_all), rather than read as having no files.
+            pkg.files = None if not entries else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
         edges[len(pkgs)] = _poetry_edges(p)
         requires = p.get("python-versions")
         # Not before 2.1: a direct dependency's Python marker is only in pyproject.toml there, so the range could
@@ -1193,9 +1577,20 @@ def parse_poetry_lock(path: Path) -> Source:
         roots = set(_graph_roots(pkgs, edges))
         # The project's own dependencies are roots too, even if another package also depends on them
         # under a marker (colorama directly, and via click only on Windows).
-        declared = _project_dependencies(path.parent / "pyproject.toml")
-        roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
-        return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+        pyproject = path.parent / "pyproject.toml"
+        declared = _project_dependencies(pyproject)
+        roots |= {i for i, p in enumerate(pkgs) if p.key in (declared or ())}
+        source = Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+        if not declared:
+            # Without them, a direct dependency that another package needs only under a marker would be hidden
+            # wherever the marker is false: check() makes such a package `unknown` where it would have a gap (#815).
+            source.poetry_roots_unknown = (
+                f"there is no pyproject.toml beside {path.name}"
+                if not pyproject.is_file()
+                else f"the pyproject.toml beside {path.name} "
+                + ("can't be read" if declared is None else "declares no dependencies")
+            )
+        return source
     extras = data.get("extras")
     return Source(
         path.name,
@@ -1264,13 +1659,13 @@ def _components(n: int, succ: dict[int, list[int]]) -> list[int]:
     return comp
 
 
-def _project_dependencies(pyproject: Path) -> set[str]:
-    """Names a project declares itself (PEP 621 and Poetry tables), to use as roots for poetry.lock.
-    A missing or odd pyproject.toml just means no extra roots: it must never break the run."""
+def _project_dependencies(pyproject: Path) -> set[str] | None:
+    """Names a project declares itself (PEP 621 and Poetry tables), to use as roots for poetry.lock, or None when
+    the pyproject.toml is missing or isn't UTF-8 TOML. Odd values in a readable one are left out, never an error."""
     try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8-sig"))
     except Exception:
-        return set()
+        return None
 
     def table(value: object) -> dict:
         return value if isinstance(value, dict) else {}
@@ -1376,9 +1771,21 @@ def parse_pdm_lock(path: Path) -> Source:
         if inherit_metadata and pkg.files is not None and isinstance(requires, str):
             pkg.locked_requires_python = requires
         _add_once(pkgs, seen, pkg)
+    targets = metadata.get("targets", [])
+    if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets):
+        raise SourceError(f"{path.name}: `metadata.targets` isn't a list of tables")
+    for t in targets:
+        if not all(isinstance(t.get(k, ""), str) for k in ("requires_python", "platform", "implementation")) or (
+            not isinstance(t.get("gil_disabled", False), bool)
+        ):
+            raise SourceError(
+                f"{path.name}: a `metadata.targets` entry needs strings for requires_python, platform and "
+                "implementation, and a boolean gil_disabled"
+            )
     return Source(
         path.name,
         pkgs,
+        pdm_targets=targets,
         pdm_groups=[groups[(pkg.key, pkg.version)] for pkg in pkgs],
         pdm_locked_groups=(
             [canonicalize_name(g) for g in locked_groups if isinstance(g, str)]
@@ -1803,13 +2210,16 @@ def _project_source(data: dict, path: Path, script: bool = False) -> Source:
         pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
     )
     _read_exclude_newer(source, data, path, script)
+    source.uv_rules = _uv_rules(data, path, script)
+    if settings := source.uv_rules.policy.settings_on():
+        source.deps_blockers.append(f"{settings[0]}, which uv applies to the dependencies it resolves too")
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
         source.pyproject_name = canonicalize_name(name)
     self_extras: list[str] = []
     for line in dependencies:
-        pkg = requirement_to_package(line, path.name)
+        pkg = _project_package(source, line)
         if pkg.key != source.pyproject_name:
             source.packages.append(pkg)
             source.specs.append(line)
@@ -1892,7 +2302,7 @@ def select_pyproject_groups(source: Source, groups: Iterable[str], only_groups: 
             # Installing the project installs its dependencies, and `myproject[extra]` that extra too.
             self_extras.extend(_self_reference_extras(source, line, req))
             continue
-        pkg = requirement_to_package(line, source.label)
+        pkg = _project_package(source, line)
         if line not in source.specs:
             source.specs.append(line)
         if pkg not in source.packages:
@@ -1936,14 +2346,23 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
             if source.pyproject_name is not None and canonicalize_name(req.name) == source.pyproject_name:
                 wanted.extend(_self_reference_extras(source, line, req))
                 continue
-            pkg = requirement_to_package(line, source.label)
+            pkg = _project_package(source, line)
             if line not in source.specs:
                 source.specs.append(line)
             if pkg not in source.packages:  # also in another extra or in dependencies: one row
                 source.packages.append(pkg)
+    source.packages[:] = _merge_requirements(source.packages)  # numpy>=1.20 and numpy==1.26.4: one row, as installed
 
     for pkg in source.packages:  # pinned or not: uv leaves out a pinned release's later files too
         pkg.exclude_newer = source.cutoff_for(pkg.key)
+
+
+def _project_package(source: Source, line: str) -> Package:
+    """A pyproject.toml or script requirement, taken from where uv takes it (Source.uv_rules)."""
+    pkg = requirement_to_package(line, source.label)
+    if source.uv_rules is not None:
+        source.uv_rules.apply(pkg)
+    return pkg
 
 
 def requirement_to_package(text: str, origin: str, hashes: frozenset[str] = frozenset()) -> Package:
@@ -2050,8 +2469,8 @@ def _index_option_names(lines: Iterable[str]) -> list[str]:
 
 
 def _abbreviated_include(line: str) -> bool:
-    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
-    doesn't follow: the file it names may set an index."""
+    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which --dockerfile-inputs
+    refuses and the compiled-file hint passes over (_read_requirements follows them, through _line_include)."""
     for token in line.split():
         option = token.split("=", 1)[0]
         if (
@@ -2094,13 +2513,55 @@ def _takes_value(token: str) -> bool:
     return len(matches) == 1 and matches[0] in _VALUE_OPTIONS
 
 
+# The long options of pip's requirements-file parser (build_parser in pip/_internal/req/req_file.py at 26.3), which
+# optparse also reads by any unambiguous prefix: `--cons f` is `--constraint f`, while `--req` is refused as
+# ambiguous (--require-hashes, --requirement).
+_PIP_FILE_OPTIONS = (
+    "--all-releases",
+    "--config-settings",
+    "--constraint",
+    "--editable",
+    "--extra-index-url",
+    "--find-links",
+    "--hash",
+    "--index-url",
+    "--no-binary",
+    "--no-index",
+    "--no-require-hashes",
+    "--only-binary",
+    "--only-final",
+    "--pre",
+    "--prefer-binary",
+    "--pypi-url",
+    "--require-hashes",
+    "--requirement",
+    "--trusted-host",
+    "--use-feature",
+)
+
+
+def _include_option(option: str, label: str) -> str | None:
+    """`--requirement` or `--constraint` for that option or an abbreviation optparse expands to it, else None.
+    SourceError for an abbreviation that could be either one or another option, which pip refuses."""
+    if option in ("--requirement", "--constraint"):
+        return option
+    if len(option) <= 2 or not option.startswith("--") or option in _PIP_FILE_OPTIONS:
+        return None
+    matches = [name for name in _PIP_FILE_OPTIONS if name.startswith(option)]
+    if not {"--requirement", "--constraint"} & set(matches):
+        return None
+    if len(matches) > 1:
+        raise SourceError(f"{label}: pip refuses this line: ambiguous option: {option} ({', '.join(matches)}?)")
+    return matches[0]
+
+
 def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
     """The file pip reads for a line of options, as (whether it's a constraints file, its path). optparse collects
     every -r and -c on the line, and pip follows only the first -r, or the first -c if there's no -r
     (`_parse_and_recurse` in pip/_internal/req/req_file.py). The spellings are `-r f`, `-rf`, `-r=f`,
-    `--requirement f` and `--requirement=f` (and the same for -c). `-r=f` is read as `f`, as wheelgap always has, though
-    pip's optparse would read a file named `=f`. None for a line pip reads as an editable
-    requirement, or one with an abbreviated include, which _abbreviated_include reports instead."""
+    `--requirement f` and `--requirement=f` (and the same for -c), and the abbreviations optparse expands to them
+    (`--cons f`, `--requirem=f`). `-r=f` is read as `f`, as wheelgap always has, though pip's optparse would read a
+    file named `=f`. None for a line pip reads as an editable requirement."""
 
     def editable(token: str) -> bool:
         option = token.partition("=")[0]
@@ -2109,7 +2570,7 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         )
 
     found: dict[bool, list[str]] = {False: [], True: []}
-    unread = ""  # an editable or an abbreviated include, which this function doesn't follow
+    unread = ""  # an editable, which this function doesn't follow
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -2117,22 +2578,15 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         if token == "--":  # optparse reads no options after it
             break
         option, eq, value = token.partition("=")
-        if option in ("--requirement", "--constraint"):
-            name, constraint = option, option == "--constraint"
+        if full := _include_option(option, label):
+            name, constraint = option, full == "--constraint"
         elif token.startswith(("-r", "-c")) and not token.startswith("--"):
             name, constraint = token[:2], token.startswith("-c")
             eq, value = ("=", token[2:].removeprefix("=")) if len(token) > 2 else ("", "")
         else:
             if editable(token):
                 unread = unread or "an editable"
-            elif _abbreviated_include(token):
-                unread = unread or "an abbreviated -r or -c"
-            if (
-                _takes_value(token)
-                or (editable(token) and not eq and token in ("-e", "--editable"))
-                # `--cons -C -r f`: -C is --cons's value, so pip reads the -r
-                or (token.startswith("--") and _abbreviated_include(token) and not eq)
-            ):
+            if _takes_value(token) or (editable(token) and not eq and token in ("-e", "--editable")):
                 i += 1  # optparse takes the next token as this option's value: `--no-binary -r f` names no include
             continue
         if not eq:
@@ -2143,7 +2597,7 @@ def _line_include(tokens: list[str], label: str) -> tuple[bool, str] | None:
         found[constraint].append(value)
     if unread:
         if editable(tokens[0]) or not (found[False] or found[True]):
-            return None  # read as an editable, or reported by _abbreviated_include, as before
+            return None  # read as an editable, as before
         # pip's answer depends on options wheelgap doesn't read here, so a guess could leave packages out.
         raise SourceError(f"{label}: wheelgap can't read a -r or -c on a line with {unread}: {' '.join(tokens)}")
     if found[False]:
@@ -2429,6 +2883,199 @@ def _constraint_conflict(pkg: Package, entries: list[Package]) -> str | None:
     return f"{first} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
 
 
+def _merge_requirements(pkgs: list[Package]) -> list[Package]:
+    """One package per name and marker, as pip and uv read a name required twice (`-r base.txt` pins numpy==1.26.4,
+    the file asks numpy>=1.20): the resolver takes one release that every requirement for the name allows (pip's
+    Factory._iter_found_candidates intersects their specifiers), so pip 26.3 installs only numpy 1.26.4, and refuses
+    numpy==2.3.0 with numpy<2. Lines under different markers apply together only where both markers hold, which
+    each target decides, so they become a MarkerGroup: a package per line, and one per set of lines that some
+    environment holds together (numpy>=1.20 with `numpy<2; sys_platform == "win32"` is the two merged on Windows).
+    check.group_answer picks one per target. conda packages (skip="conda") are another installer's, never merged.
+    Merging again (an extra added later) starts from the lines of the groups made before."""
+    unfolded: list[Package] = []
+    seen: set[int] = set()
+    for pkg in pkgs:
+        if pkg.marker_group is None:
+            unfolded.append(pkg)
+        elif id(pkg.marker_group) not in seen:
+            seen.add(id(pkg.marker_group))
+            unfolded.extend(pkg.marker_group.lines)
+    pkgs = unfolded
+    groups: dict[str, list[int]] = {}
+    for i, pkg in enumerate(pkgs):
+        if pkg.skip != "conda":
+            groups.setdefault(pkg.key, []).append(i)
+    out: dict[int, list[Package]] = {}
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        by_marker: dict[tuple[str, ...] | None, list[int]] = {}
+        for i in indices:
+            markers = pkgs[i].markers
+            by_marker.setdefault(None if markers is None else tuple(sorted(set(markers))), []).append(i)
+        firsts = []
+        for members in by_marker.values():
+            out.update({i: [] for i in members[1:]})
+            out[members[0]] = [_merge_same_marker([pkgs[i] for i in members])]
+            firsts.append(members[0])
+        if len(firsts) > 1:
+            out[firsts[0]] = _marker_group([out[i][0] for i in firsts])
+            out.update({i: [] for i in firsts[1:]})
+    return [kept for i, pkg in enumerate(pkgs) for kept in out.get(i, [pkg])]
+
+
+def _merge_same_marker(entries: list[Package]) -> Package:
+    """The requirements for one name under one marker as pip reads them together (see _merge_requirements)."""
+    first = entries[0]
+    if len(entries) == 1:
+        return first
+    if skipped := next((entry for entry in entries if entry.skip), None):
+        return skipped  # `name @ URL` beside `name>=1`: pip installs the URL's file, never an index release
+    error = next((entry.error for entry in entries if entry.error), None)
+    # pip filters the files by the hashes every line lists (Hashes.__and__, where a line with none allows all) and
+    # checks the download against the first line's: pip 26.3 installs markupsafe for `--hash=<mac wheel>` then
+    # `--hash=<linux wheel>` on macOS, and refuses it in the other order. Only one set of hashes, on the first line,
+    # reads as that line alone does.
+    hashes = (first.hashes, first.other_hashes)
+    if any((entry.hashes or entry.other_hashes) and (entry.hashes, entry.other_hashes) != hashes for entry in entries):
+        error = error or (
+            f"the requirements for {first.name} list different --hash options; pip filters the files by the hashes "
+            "they all list and checks the download against the first one's, which wheelgap doesn't follow"
+        )
+    specifiers = [specifier for entry in entries if (specifier := _specifier(entry))]
+    if pins := [entry for entry in entries if entry.version]:
+        chosen = next((entry for entry in pins if entry.version and _allows(entry.version, specifiers)), None)
+        if chosen is None:
+            pin = pins[0]
+            other = next(e for e in entries if (s := _specifier(e)) and pin.version and not _allows(pin.version, [s]))
+            both = f"{pin.name}{_specifier(pin)} and {other.name}{_specifier(other)}"
+            if pin.origin != other.origin:
+                both = (
+                    f"{pin.name}{_specifier(pin)} ({pin.origin}) and {other.name}{_specifier(other)} ({other.origin})"
+                )
+            error = error or f"the requirements {both} conflict: no release satisfies both (pip and uv refuse this)"
+            chosen = pin
+        return replace(chosen, error=error, hashes=first.hashes, other_hashes=first.other_hashes)
+    spec = SpecifierSet()
+    for specifier in specifiers:
+        spec &= SpecifierSet(specifier)
+    ranged = [entry for entry in entries if entry.spec]
+    base = ranged[0] if len(ranged) == 1 else first
+    written = base.written_spec if len(ranged) == 1 else None
+    return replace(
+        base,
+        spec=str(spec) or None,
+        written_spec=written,
+        error=error,
+        hashes=first.hashes,
+        other_hashes=first.other_hashes,
+        merged_ranges=len(ranged) > 1,
+    )
+
+
+# More lines than this under different markers are one `unknown` package: the sets of lines are counted per target.
+_MAX_MARKER_LINES = 12
+
+
+def _marker_group(lines: list[Package]) -> list[Package]:
+    """The packages checked for a name required under these different markers (one line each, in pip's order): one
+    per line, one per set of two or more lines that some environment wheelgap can check holds together (merged as pip
+    merges them, and folded into a line's package that checks the same thing), and a last one, `unknown`, for a target
+    none of them answers (check.group_answer)."""
+    group = MarkerGroup(lines)
+    first = lines[0]
+    shown = " and ".join(
+        f"{p.name}{_specifier(p) or ''}" + (f"; {' or '.join(p.markers)}" if p.markers else "") for p in lines
+    )
+    fallback = replace(
+        first,
+        version=None,
+        spec=None,
+        written_spec=None,
+        skip=None,
+        hashes=frozenset(),
+        other_hashes=frozenset(),
+        markers=None
+        if any(line.markers is None for line in lines)
+        else [m for line in lines for m in line.markers or []],
+        error=(
+            f"{first.origin} requires {first.name} under different markers ({shown}), and on this target wheelgap "
+            "can't tell which of them hold (a marker it can't decide here) or which release pip takes for them "
+            "together"
+        ),
+        marker_group=group,
+        marker_sets=frozenset({frozenset()}),
+    )
+    if len(lines) > _MAX_MARKER_LINES:
+        sets: list[frozenset[int]] = []
+    else:
+        sets = [frozenset({i}) for i in range(len(lines))]
+        sets += [s for s in _held_together(group) if len(s) > 1]
+    members: list[Package] = []
+    for held in sets:
+        if len(held) == 1:
+            (i,) = held
+            pkg = replace(lines[i], marker_group=group, marker_sets=frozenset({held}))
+        else:
+            chosen = [lines[i] for i in sorted(held)]
+            merged = _merge_same_marker(chosen)
+            conjunction = [
+                " and ".join(f"({' or '.join(line.markers)})" for line in chosen if line.markers is not None)
+            ]
+            pkg = replace(
+                merged,
+                markers=conjunction if conjunction[0] else None,
+                marker_group=group,
+                marker_sets=frozenset({held}),
+            )
+        # A merged set that checks what a line alone does is that line's package (pywin32==306 under win32 and
+        # Windows markers: one row). Two lines' own packages stay apart, each with its marker, as before.
+        same = next((m for m in members if _same_check(m, pkg)), None) if len(held) > 1 else None
+        if same is None:
+            members.append(pkg)
+        else:
+            same.marker_sets |= pkg.marker_sets
+            same.markers = None if same.markers is None or pkg.markers is None else same.markers + pkg.markers
+    group.members = [*members, fallback]
+    return group.members
+
+
+def _same_check(a: Package, b: Package) -> bool:
+    """Whether two packages of a MarkerGroup check the same release in the same way."""
+    fields = ("version", "spec", "hashes", "other_hashes", "skip", "error", "merged_ranges")
+    return all(getattr(a, f) == getattr(b, f) for f in fields)
+
+
+_MARKER_TARGETS: list[Target] = []
+
+
+def _held_together(group: MarkerGroup) -> list[frozenset[int]]:
+    """The sets of the group's lines that hold, for sure, on some target wheelgap can check (any platform, Python 2.7
+    or 3.0 to the next 3.x), in order. On a target where some markers can't be decided, the set of those that hold
+    for sure counts too: check.group_answer starts from it there."""
+    from .check import marker_value  # check imports this module
+    from .targets import NEWEST_PYTHON, Target
+
+    if not _MARKER_TARGETS:
+        pythons = [(2, 7)] + [(3, minor) for minor in range(NEWEST_PYTHON[1] + 2)]
+        _MARKER_TARGETS.extend(Target(major, minor, False, name) for name in PLATFORMS for major, minor in pythons)
+    found: dict[frozenset[int], None] = {}
+    for target in _MARKER_TARGETS:
+        values = [
+            True if markers is None else _any_value([marker_value(m, target) for m in markers])
+            for markers in group.markers
+        ]
+        held = frozenset(i for i, value in enumerate(values) if value is True)
+        if held:
+            found[held] = None
+    return sorted(found, key=lambda s: (len(s), sorted(s)))
+
+
+def _any_value(values: list[bool | None]) -> bool | None:
+    """Whether any of these marker values holds: True, False, or None when that can't be decided."""
+    return True if True in values else None if None in values else False
+
+
 def parse_requirements(
     path: Path, constraint_paths: tuple[Path, ...] = (), line_files: tuple[Path, ...] = ()
 ) -> Source:
@@ -2544,6 +3191,7 @@ def _finalize_requirements(
     req_lines: list[str],
     compiler_signs: list[str],
 ) -> Source:
+    pkgs = _merge_requirements(pkgs)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
@@ -2692,14 +3340,14 @@ _SHORT_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for na
 
 def _requirement_options(
     text: str, where: str
-) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str]]:
+) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str], list[str]]:
     """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
     by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash; each --no-binary,
     --only-binary, --all-releases or --only-final as (long name, value) in order, for the install's format and release
     control; what pip ignores there, for a note: each option as (the name it was written with, its long name), and
-    words that aren't options, which optparse sets aside, as one entry; and the frozenset of sha256 digests from
-    --hash options. SourceError where pip refuses the line, or where it applies an option that wheelgap doesn't read
-    (-e)."""
+    words that aren't options, which optparse sets aside, as one entry; the frozenset of sha256 digests from
+    --hash options; and the sha384 and sha512 ones, as `algorithm:digest`, in order. SourceError where
+    pip refuses the line, or where it applies an option that wheelgap doesn't read (-e)."""
     try:
         tokens = shlex.split(text)
     except ValueError:
@@ -2709,6 +3357,7 @@ def _requirement_options(
     formats: list[tuple[str, str]] = []
     ignored: list[tuple[str, str]] = []
     sha256_hashes: set[str] = set()
+    other_hashes: list[str] = []
     k = 0
     while k < len(tokens):
         token = tokens[k]
@@ -2763,6 +3412,8 @@ def _requirement_options(
                 raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
             if algo == "sha256":
                 sha256_hashes.add(digest.lower())
+            elif f"{algo}:{digest.lower()}" not in other_hashes:
+                other_hashes.append(f"{algo}:{digest.lower()}")
         if kind == "requirement" and "=" not in given_value:
             raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
         if kind == "feature" and value not in _USE_FEATURE_CHOICES:
@@ -2779,7 +3430,7 @@ def _requirement_options(
             # The value pip's callback reads, never a word after another option; the callback applies it to the whole
             # install, exactly as on a line of its own.
             formats.append((name, given_value))
-    return hashed, formats, ignored, frozenset(sha256_hashes)
+    return hashed, formats, ignored, frozenset(sha256_hashes), other_hashes
 
 
 def _read_requirements(
@@ -2796,7 +3447,7 @@ def _read_requirements(
     ignored_options: dict[tuple[Path, str], str] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
-    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options.
+    --extra-index-url, --find-links, --no-index).
     `req_lines` collects requirement lines that aren't constraints, for --deps; `compiler_signs` notes the
     `--hash` options and `# via` comments that mark pip-compile output, in requirement files only.
     `stack` is the chain of files being read, `-r` and `-c` together, as pip keeps it: by the path each
@@ -2842,11 +3493,7 @@ def _read_requirements(
             if (
                 not already_seen
                 and index_options is not None
-                and any(
-                    _names_index_option(text) or _abbreviated_include(text)
-                    for text in (line, " ".join(tokens or []))
-                    if text
-                )
+                and any(_names_index_option(text) for text in (line, " ".join(tokens or [])) if text)
             ):
                 index_options.append(line)
             include = None
@@ -2858,38 +3505,47 @@ def _read_requirements(
                 _apply_release_options(line, format_control, where, handled=False)
             if include and include[0]:
                 target = include[1]
-                # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
-                # Unread, it may name an index, so the input isn't PyPI-only.
-                if "://" not in target and "${" not in target:
-                    # The include is read from the including file's folder as named, and that named
-                    # path is what the cycle check compares, as pip does.
-                    target_path = Path(os.path.abspath(path.parent / target))
-                    if target_path in stack:
-                        # An include naming a file already being read is an error, as pip refuses it:
-                        # the chain is one chain for -r and -c together, so a loop through a
-                        # constraints file is refused too.
-                        raise _cycle_error(path, line, target_path, stack)
-                    # A -r inside the constraints file is requirements, not more constraints (pip's rule),
-                    # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
-                    # are passed through for that -r file only: the constraints file's own lines add to neither.
-                    try:
-                        included = _read_requirements(
-                            path.parent / target,
-                            seen,
-                            constraints,
-                            True,
-                            index_options,
-                            format_control,
-                            req_lines,
-                            compiler_signs,
-                            stack=stack,
-                            ignored_options=ignored_options,
-                        )
-                    except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
-                        raise _include_error(path, number, line, e, stack) from e
-                    pkgs.extend(included)
-                elif not already_seen and index_options is not None:
-                    index_options.append(line)
+                if "://" in target or "${" in target:
+                    # pip reads a constraints file by URL (-c https://releases.openstack.org/...) and fills in
+                    # ${VAR} from its environment; wheelgap does neither. Unread, the file may pin any requirement
+                    # to another release (or make pip refuse it), so no answer for this input can be trusted.
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    how = (
+                        "a constraints file by URL, which wheelgap doesn't download"
+                        if "://" in target
+                        else "a constraints file through an environment variable, which wheelgap doesn't fill in"
+                    )
+                    raise SourceError(
+                        f"{where}: {line}: pip reads {how}, and its pins would change which releases pip installs; "
+                        "save the file and name it by its path instead"
+                    )
+                # The include is read from the including file's folder as named, and that named
+                # path is what the cycle check compares, as pip does.
+                target_path = Path(os.path.abspath(path.parent / target))
+                if target_path in stack:
+                    # An include naming a file already being read is an error, as pip refuses it:
+                    # the chain is one chain for -r and -c together, so a loop through a
+                    # constraints file is refused too.
+                    raise _cycle_error(path, line, target_path, stack)
+                # A -r inside the constraints file is requirements, not more constraints (pip's rule),
+                # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
+                # are passed through for that -r file only: the constraints file's own lines add to neither.
+                try:
+                    included = _read_requirements(
+                        path.parent / target,
+                        seen,
+                        constraints,
+                        True,
+                        index_options,
+                        format_control,
+                        req_lines,
+                        compiler_signs,
+                        stack=stack,
+                        ignored_options=ignored_options,
+                    )
+                except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
+                    raise _include_error(path, number, line, e, stack) from e
+                pkgs.extend(included)
                 continue
             if include:  # -r file, -rfile, --requirement file, --requirement=file, after other options too
                 target_path = Path(os.path.abspath(path.parent / include[1]))
@@ -2937,9 +3593,10 @@ def _read_requirements(
             options = " ".join(word for word in words[first_option:] if word)
             hashed = False
             req_hashes: frozenset[str] = frozenset()
+            other_hashes: list[str] = []
             if options:
                 where = _shown(path, stack) + (f":{number}" if number is not None else "")
-                hashed, formats, ignored, req_hashes = _requirement_options(options, where)
+                hashed, formats, ignored, req_hashes, other_hashes = _requirement_options(options, where)
                 if ignored_options is not None:
                     for shown, option in ignored:
                         note = f"{where}: pip ignores {shown} after a requirement"
@@ -2967,7 +3624,22 @@ def _read_requirements(
                 name = egg.group(1) if egg else line.split(";", 1)[0].strip()
                 append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
                 continue
-            append(requirement_to_package(line, path.name, hashes=req_hashes))
+            pkg = requirement_to_package(line, path.name, hashes=req_hashes)
+            if other_hashes and not pkg.skip and not constraint:
+                # The index gives each file's sha256 only (PyPI's JSON API), so these can't be matched. Dropped, they
+                # would leave no hash filter at all, while pip checks them: it picks the best file, then refuses it if
+                # no listed hash matches (pip 26.3, markupsafe==3.0.2 --hash=sha512:<the sdist's>, on macOS arm64).
+                # Beside sha256 ones, pip's filter_unallowed_hashes keeps only the files with a listed sha256 where one
+                # fits the target, so they decide there; elsewhere pip checks its pick against these too.
+                pkg.other_hashes = frozenset(other_hashes)
+                if not req_hashes:
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    algorithms = " and ".join(dict.fromkeys(h.partition(":")[0] for h in other_hashes))
+                    pkg.error = (
+                        f"{where} lists {algorithms} hashes for {pkg.name}, which wheelgap can't match (the index "
+                        "gives sha256 digests only), so it can't tell which file pip accepts"
+                    )
+            append(pkg)
             if req_lines is not None and not constraint:
                 req_lines.append(line)
     finally:

@@ -24,6 +24,10 @@ How statuses rank, per target:
   a package name: `ranged==1.5` → `./ranged` shows `./ranged` as a new gap (still exit 1), not as `ranged`.
 - A package listed more than once (a uv.lock fork) takes its worst status on each target, with `unknown`
   beating `missing`, and ignoring `n/a` unless every entry is `n/a`.
+- A target whose Python either lockfile's requires-python leaves out isn't compared, and a note says so: the lock
+  isn't made for that Python (uv keeps only the wheels its range can use, and packages from another index can't be
+  looked up again), so its gaps there aren't the change's, and nothing there counts as worse. The same goes for a
+  Python a pdm.lock's [[metadata.targets]] leave out (pdm_not_covered).
 """
 
 from __future__ import annotations
@@ -45,7 +49,16 @@ from packaging.utils import InvalidName, canonicalize_name
 
 from . import __version__, fix, gapwheels, origin, suggest
 from .api import Result, _check_lockfile, check_packages, explain_issues_urls, make_targets, running_python
-from .check import CELL, Row, Status, applies, lock_environments_note, narrow_to_lock_environments, reachable
+from .check import (
+    CELL,
+    Row,
+    Status,
+    applies,
+    lock_environments_note,
+    narrow_to_lock_environments,
+    pdm_python_value,
+    reachable,
+)
 from .cli import (
     find_pyproject,
     gap_wheel_fills,
@@ -58,7 +71,16 @@ from .cli import (
 )
 from .logsafe import guarded_output
 from .pypi import check_index_url
-from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock, tool_table
+from .sources import (
+    Source,
+    SourceError,
+    file_kind,
+    find_lockfile,
+    parse_pdm_lock,
+    parse_uv_lock,
+    pythons_outside_lock,
+    tool_table,
+)
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -184,6 +206,150 @@ class Report:
     worse: list[dict] = field(default_factory=list)
     new: list[dict] = field(default_factory=list)
     unchecked: list[str] = field(default_factory=list)
+    # The targets left out of the comparison (see not_covered): each one's `target` label, `sides` and `reason`.
+    not_compared: list[dict] = field(default_factory=list)
+
+
+SIDES = ("old", "new")
+
+
+def not_covered(sources: list[Source], targets: list[Target]) -> dict[Target, dict]:
+    """The targets whose Python either side's requires-python leaves out, as the main command finds them
+    (pythons_outside_lock), each with the sides that leave it out and why, for compare()'s `skip`.
+
+    A lock isn't made for those Pythons: uv keeps only the wheels its range can use, so the locked files may lack the
+    wheels a Python outside it needs. The main command looks the PyPI packages up again and notes that the others (from
+    another index, or whose lookup failed) may show false gaps; diff would compare those as if they were real, and a
+    lock that moves its packages to a mirror would then lose every wheel at once (#807). uv sync refuses a lock on a
+    Python outside its requires-python, so what such a target means depends on the sides:
+
+    - both leave it out: neither lock installs there, so no gap there is the change's;
+    - only the new one: the change itself dropped that Python (`uv sync` there now fails). That's said as the change's
+      doing (not_compared_note, and the Action's warning), but it stays a note: exit 1 means `worse` or `new` lists
+      something, and a lock's own range isn't a wheel gap;
+    - only the old one: the range widened, and the new lock's gaps on that Python aren't shown."""
+    left_out: dict[Target, list[int]] = {}
+    for i, source in enumerate(sources):
+        outside = set(pythons_outside_lock(source, targets))
+        for t in targets:
+            if t.python in outside:
+                left_out.setdefault(t, []).append(i)
+    out = {}
+    for t, sides in left_out.items():
+        specs = {sources[i].requires_python for i in sides}
+        if sides == [1]:  # the change dropped this Python: say it as the change's doing
+            old = sources[0].requires_python or (
+                _pdm_pythons(sources[0].pdm_targets) if sources[0].pdm_targets else "any"
+            )
+            reason = (
+                f"the new lockfile no longer supports Python {t.python} (old: {old}, new: {sources[1].requires_python})"
+            )
+            out[t] = {"sides": ["new"], "python": t.python, "reason": reason}
+            continue
+        if len(sides) == 2 and len(specs) == 1:
+            locked = f"both lockfiles are locked for Python {specs.pop()}"
+        else:
+            locked = " and ".join(
+                f"the {SIDES[i]} lockfile is locked for Python {sources[i].requires_python}" for i in sides
+            )
+        reason = f"{locked}, which leaves out Python {t.python}"
+        out[t] = {"sides": [SIDES[i] for i in sides], "python": t.python, "reason": reason}
+    return out
+
+
+def _pdm_pythons(entries: list[dict]) -> str:
+    return " or ".join(dict.fromkeys(entry.get("requires_python") or "any" for entry in entries))
+
+
+def pdm_not_covered(
+    locked: list[list[dict]], targets: list[Target], ranges: list[str | None] | None = None
+) -> dict[Target, dict]:
+    """not_covered for pdm.lock sides: the targets whose Python none of a side's `[[metadata.targets]]` takes, on any
+    platform (`locked` is each side's targets, empty for a side that isn't a pdm.lock or records none). As for a
+    uv.lock's requires-python, `pdm install` refuses the lock there, so its gaps there aren't the change's; diff leaves
+    the target out, with a note, rather than refusing the run as the main command does. A Python only some patch
+    releases of which a target takes (pdm_python_value None) isn't left out here: the check says it can't tell.
+    `ranges`: each side's requires-python when it isn't a pdm.lock (a uv.lock's), for the reason's "old: ..."."""
+    out: dict[Target, dict] = {}
+    for t in targets:
+        sides = [
+            i
+            for i, entries in enumerate(locked)
+            if entries
+            and not any(pdm_python_value(entry.get("requires_python", ""), t) is not False for entry in entries)
+        ]
+        if not sides:
+            continue
+        if sides == [1]:
+            old = _pdm_pythons(locked[0]) if locked[0] else (ranges or [None])[0] or "any"
+            reason = (
+                f"the new lockfile's `pdm lock` targets no longer take Python {t.python} "
+                f"(old: {old}, new: {_pdm_pythons(locked[1])})"
+            )
+            out[t] = {"sides": ["new"], "python": t.python, "reason": reason}
+            continue
+        locked_for = " and ".join(
+            f"the {SIDES[i]} lockfile's `pdm lock` targets are for Python {_pdm_pythons(locked[i])}" for i in sides
+        )
+        out[t] = {
+            "sides": [SIDES[i] for i in sides],
+            "python": t.python,
+            "reason": f"{locked_for}, which leaves out Python {t.python}",
+        }
+    return out
+
+
+def _lock_python_range(path: Path) -> str | None:
+    """A uv.lock side's requires-python, for pdm_not_covered's reason; None for any other input."""
+    try:
+        lock = find_lockfile(path) if path.is_dir() else path
+        return parse_uv_lock(lock).requires_python if file_kind(lock) == "uv" and lock.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _pdm_lock_targets(path: Path) -> list[dict]:
+    """A side's pdm.lock `[[metadata.targets]]`, or [] (not a pdm.lock, or one the check will report as unreadable)."""
+    try:
+        lock = find_lockfile(path) if path.is_dir() else path
+        return parse_pdm_lock(lock).pdm_targets if file_kind(lock) == "pdm" and lock.is_file() else []
+    except (OSError, ValueError):
+        return []
+
+
+def not_compared_notes(report: Report) -> list[str]:
+    """The stderr notes for the targets compare() left out, grouped by reason: first each Python the change dropped
+    (only the new lock leaves it out), said as the change's doing, then the others."""
+    dropped: dict[tuple[str, str], list[str]] = {}
+    other: dict[str, list[str]] = {}
+    for entry in report.not_compared:
+        if entry["sides"] == ["new"]:
+            dropped.setdefault((entry["python"], entry["reason"]), []).append(entry["target"])
+        else:
+            other.setdefault(entry["reason"], []).append(entry["target"])
+    notes = [
+        f"this change drops Python {python} support: {reason}, so installing the new lock there now fails ("
+        + (
+            "pdm install refuses a lock none of whose targets take the Python"
+            if "`pdm lock` targets" in reason  # pdm_not_covered's
+            else "uv sync refuses a lock on a Python outside its requires-python"
+        )
+        + f"). Not compared: {', '.join(labels)}; the drop doesn't count as worse"
+        for (python, reason), labels in dropped.items()
+    ]
+    if other:
+        reasons = "; ".join(f"{', '.join(labels)}: {reason}" for reason, labels in other.items())
+        notes.append(
+            f"didn't compare {reasons}. A lock isn't made for a Python outside its requires-python (it may lack the "
+            "wheels that Python needs, and packages from other indexes can't be looked up again), so nothing there "
+            "counts as worse"
+            + (
+                "; where only the old lockfile leaves a Python out, the new one's gaps there aren't shown"
+                if any(entry["sides"] == ["old"] for entry in report.not_compared)
+                else ""
+            )
+        )
+    return notes
 
 
 def _side(pkg: Package, t: Target, prefix: str = "") -> dict[str, str]:
@@ -211,11 +377,17 @@ def _with_direct(pkg: Package, targets: list[Target]) -> str:
     return f"{pkg.name} (via {first}{extra})"
 
 
-def compare(before: dict[str, Package], after: dict[str, Package], targets: list[Target]) -> Report:
+def compare(
+    before: dict[str, Package], after: dict[str, Package], targets: list[Target], skip: dict[Target, dict] | None = None
+) -> Report:
     """Packages that got worse and new packages with gaps, with the names that couldn't be checked at the
-    same version on either side."""
+    same version on either side. The targets in `skip` (see not_covered) aren't compared; they're listed in
+    `not_compared` instead. Labels are the same as for every target, compared or not."""
     multi_py = len({t.python for t in targets}) > 1
     report = Report()
+    skip = skip or {}
+    report.not_compared = [{"target": t.label(multi_py), **skip[t]} for t in targets if t in skip]
+    targets = [t for t in targets if t not in skip]
     for key, pkg in after.items():
         if key not in before:
             gaps = [t for t in targets if new_gap(pkg, t)]
@@ -266,6 +438,7 @@ def json_report(report: Report, targets: list[Target], fixes: Fixes | None = Non
         "worse": report.worse,
         "new": report.new,
         "unchecked": report.unchecked,
+        "not_compared": report.not_compared,
         "summary": {"worse": len(report.worse), "new": len(report.new)},
     }
     if fixes is not None:
@@ -368,9 +541,12 @@ def fix_text(fixes: Fixes, targets: list[Target]) -> list[str]:
     ]
 
 
-def summary(n_worse: int, n_new: int) -> str:
+def summary(n_worse: int, n_new: int, compared: bool = True, partial: bool = False) -> str:
+    """The last line. `compared` False: every target was left out (not_covered); `partial`: some were."""
+    if not compared:  # "nothing got worse" would claim a comparison
+        return "Nothing was compared."
     if not n_worse and not n_new:
-        return "Nothing got worse."
+        return "Nothing got worse on the compared targets." if partial else "Nothing got worse."
     parts = []
     if n_worse:
         parts.append(f"{n_worse} package{'s' * (n_worse != 1)} got worse")
@@ -480,16 +656,17 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
 
 
 def lock_default_targets(paths: list[Path], targets: list[Target]) -> tuple[list[Target], str | None]:
-    """The default targets without the platforms both sides' uv.lock `[tool.uv] environments` leave out (a platform
-    only one side leaves out stays, and is refused), with the note to print. A side that isn't a uv.lock leaves out
-    nothing, so then nothing goes; a file that can't be read here is left for the check to report."""
+    """The default targets without the platforms both sides' uv.lock `[tool.uv] environments` or pdm.lock targets
+    leave out (a platform only one side leaves out stays, and is refused), with the note to print. A side that is
+    neither leaves out nothing, so then nothing goes; a file that can't be read here is left for the check to report."""
     sources = []
     for path in paths:
         try:
             lock = find_lockfile(path) if path.is_dir() else path
-            if file_kind(lock) != "uv" or not lock.is_file():
+            kind = file_kind(lock)
+            if kind not in ("uv", "pdm") or not lock.is_file():
                 return targets, None
-            sources.append(parse_uv_lock(lock))
+            sources.append(parse_uv_lock(lock) if kind == "uv" else parse_pdm_lock(lock))
         except (OSError, ValueError):
             return targets, None
     narrowed, left_out = narrow_to_lock_environments(sources, targets, every=True)
@@ -634,6 +811,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
         sides = []
         sources = []
         rows: list[Row] = []
+        pdm_skip: dict[Target, dict] = {}
         if args.deps:
             if (index_variable := origin.index_env()) is not None:
                 raise SourceError(
@@ -674,8 +852,20 @@ def _main(argv: list[str] | None, prog: str) -> int:
                     targets, narrowed = lock_default_targets([Path(path) for path, _ in read], targets)
                     if narrowed is not None:
                         print(f"wheelgap: note: {narrowed}", file=sys.stderr)
+                # A Python a pdm.lock side's targets leave out isn't compared (as a uv.lock's requires-python), so it
+                # isn't checked either: the main command's check would refuse it.
+                pdm_skip = pdm_not_covered(
+                    [_pdm_lock_targets(Path(path)) for path, _ in read],
+                    targets,
+                    [_lock_python_range(Path(path)) for path, _ in read],
+                )
+                checked = [t for t in targets if t not in pdm_skip]
                 for path, ref in read:
-                    results, source, rows = _check_lockfile(path, targets, online=False, offline=False)
+                    if not checked:  # every target left out: nothing to check or compare
+                        sides.append({})
+                        sources.append(Source(str(path)))
+                        continue
+                    results, source, rows = _check_lockfile(path, checked, online=False, offline=False)
                     if ref is not None:
                         # An omitted parent or pdm.toml may name an index, so don't assume PyPI provenance.
                         source.pypi_only = False
@@ -691,7 +881,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
             print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
         return 2
 
-    report = compare(sides[0], sides[1], targets)
+    report = compare(sides[0], sides[1], targets, {**pdm_skip, **not_covered(sources, targets)})
     fixes = None
     if args.fix:
         try:
@@ -712,9 +902,12 @@ def _main(argv: list[str] | None, prog: str) -> int:
     else:
         for line in report.lines:
             print(line)
-        print(summary(len(report.worse), len(report.new)))
+        left_out = len(report.not_compared)
+        print(summary(len(report.worse), len(report.new), left_out < len(targets), partial=left_out > 0))
         for line in fix_text(fixes, targets) if fixes is not None else []:
             print(line)
+    for note in not_compared_notes(report):
+        print(f"wheelgap: note: {note}", file=sys.stderr)
     if report.unchecked:
         print(f"wheelgap: note: couldn't check {', '.join(report.unchecked)} in either lockfile", file=sys.stderr)
     return 1 if report.worse or report.new else 0

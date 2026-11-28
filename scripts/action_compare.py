@@ -15,6 +15,10 @@ doesn't import wheelgap.
   code is the step's result: 0 only when `wheelgap diff` exited 0 with a valid report listing nothing, 1 when it
   exited 1 with a valid report listing something, and 2 for anything else (no report, an error, or an exit code that
   disagrees with the report), so the step never passes on a guess.
+  Targets `wheelgap diff` didn't compare (its `not_compared`: a Python a lockfile's requires-python leaves out) are
+  listed after the counts with the reason, and never count as worse. A Python only the new lockfile leaves out is one
+  the change dropped: its paragraph leads with "This change drops Python X.Y support", and the log gets a
+  `::warning::` line naming only that version (checked to be one, never other text from the report).
 - `pick` prints the id of this lockfile's comment from `gh api --paginate` output: the first one by `--login`
   (the token's own identity) whose body starts with the marker. Anyone else's comment is never edited.
 - `log` copies wheelgap's stderr to stdout with anything the Actions runner would run as a workflow command
@@ -55,6 +59,7 @@ FIX_REASONS = {
     "loses_wheel": "every newer release with a wheel drops one it has elsewhere",
     "uv_may_fork": "every newer release with a wheel drops one it has on another Python",
     "no_binary": "--no-binary, so pip uses no wheel for it",
+    "held_back": "another package's requirement on it rules out the newer release with a wheel",
 }
 RESOLVE_NOTE = "wheelgap doesn't resolve dependencies: the rest of them must allow these releases."
 GAP_WHEEL_NOTE = (
@@ -62,6 +67,7 @@ GAP_WHEEL_NOTE = (
     '(<a href="https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index">how to use them</a>).'
 )
 SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+PYTHON = re.compile(r"[0-9]{1,2}\.[0-9]{1,3}t?")  # a target Python as wheelgap labels it: 3.13, 3.14t
 
 
 def esc(text: object, limit: int = MAX_ESCAPED) -> str:
@@ -119,6 +125,8 @@ def fix_cell(fix: object) -> str:
     kind = fix.get("kind")
     if kind == "upgrade":
         text = f"upgrade to {code(fix.get('version'))}"
+        if fix.get("prerelease") is True:
+            text += " (a pre-release)"
         c = fix.get("constraint")
         if isinstance(c, dict) and c.get("allows") is False and isinstance(c.get("requirements"), list):
             reqs = ", ".join(code(r) for r in c["requirements"])
@@ -202,10 +210,13 @@ def rows(data: dict, *, suggestions: bool = False, fixes: bool = False) -> list[
     return out
 
 
-def counts(n_worse: int, n_new: int) -> str:
-    """As `wheelgap diff` words its last line."""
+def counts(n_worse: int, n_new: int, compared: bool = True, partial: bool = False) -> str:
+    """As `wheelgap diff` words its last line: `compared` False when every target was left out, `partial` when some
+    were."""
+    if not compared:
+        return "Nothing was compared."
     if not n_worse and not n_new:
-        return "Nothing got worse."
+        return "Nothing got worse on the compared targets." if partial else "Nothing got worse."
     parts = []
     if n_worse:
         parts.append(f"{n_worse} package{'s' * (n_worse != 1)} got worse")
@@ -225,7 +236,64 @@ def _valid(data: object) -> bool:
             return False
         if not all(isinstance(pkg.get(k, []), list) for k in ("versions", "old_versions", "new_versions")):
             return False
-    return isinstance(data.get("unchecked", []), list)
+    if not isinstance(data.get("unchecked", []), list) or not isinstance(data.get("not_compared", []), list):
+        return False
+    return all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("target"), str)
+        and isinstance(entry.get("reason"), str)
+        and isinstance(entry.get("python", ""), str)
+        and isinstance(entry.get("sides", []), list)
+        for entry in data.get("not_compared", [])
+    )
+
+
+def dropped(entry: dict) -> bool:
+    """A target only the new lockfile leaves out: the change dropped its Python."""
+    return entry.get("sides") == ["new"]
+
+
+def dropped_pythons(data: dict) -> list[str]:
+    """The Pythons the change dropped, once each, from the `python` of each dropped target."""
+    return list(
+        dict.fromkeys(str(entry.get("python", "?")) for entry in data.get("not_compared", []) if dropped(entry))
+    )
+
+
+def compared(data: dict) -> bool:
+    """False only when the report says it left out every target it was given (`not_compared`)."""
+    targets = data.get("targets")
+    labels = [t.get("label") for t in targets if isinstance(t, dict)] if isinstance(targets, list) else []
+    left_out = [entry.get("target") for entry in data.get("not_compared", [])]
+    return not labels or any(label not in left_out for label in labels)
+
+
+def not_compared_lines(data: dict) -> list[str]:
+    """The targets `wheelgap diff` left out, grouped by its reason: a note, not a failure. The Pythons the change
+    dropped come first, each said as the change's doing."""
+
+    def names(targets: list[str]) -> str:
+        shown = ", ".join(code(t) for t in targets[:MAX_UNCHECKED])
+        return shown + (f" and {len(targets) - MAX_UNCHECKED} more" if len(targets) > MAX_UNCHECKED else "")
+
+    drops: dict[tuple[str, str], list[str]] = {}
+    other: dict[str, list[str]] = {}
+    for entry in data.get("not_compared", []):
+        if dropped(entry):
+            drops.setdefault((str(entry.get("python", "?")), entry["reason"]), []).append(entry["target"])
+        else:
+            other.setdefault(entry["reason"], []).append(entry["target"])
+    out = [
+        f"<p><b>This change drops Python {esc(python)} support.</b> {code(reason, MAX_MESSAGE)}, so installing the "
+        f"new lock there now fails. Not compared: {names(targets)}; the drop doesn't count as worse.</p>"
+        for (python, reason), targets in drops.items()
+    ]
+    for reason, targets in other.items():
+        out.append(
+            f"<p>Not compared: {names(targets)}. {code(reason, MAX_MESSAGE)}: a lock isn't made for a Python outside "
+            "its requires-python, so nothing there counts as worse.</p>"
+        )
+    return out
 
 
 def load(path: str, exit_code: int) -> tuple[dict | None, str]:
@@ -265,13 +333,16 @@ def report(
         with_ = f"the base branch ({code(base)})" if base else "the base branch"
     else:
         with_ = code(base)
-    compared = f"Compared {code(lockfile)}{at} with {with_}."
+    compared_with = f"Compared {code(lockfile)}{at} with {with_}."
     header = ["### wheelgap diff", ""]
     if data is None:
-        return "\n".join([*header, f"<p>{compared} The check couldn't run: {problem}</p>", ""])
+        return "\n".join([*header, f"<p>{compared_with} The check couldn't run: {problem}</p>", ""])
     listed = bool(data["worse"] or data["new"])
     resolved = "<b>Resolved.</b> " if comment and not listed else ""
-    header.append(f"<p>{resolved}{compared} {counts(len(data['worse']), len(data['new']))}</p>")
+    said = counts(len(data["worse"]), len(data["new"]), compared(data), bool(data.get("not_compared")))
+    header.append(f"<p>{resolved}{compared_with} {said}</p>")
+    if skipped := not_compared_lines(data):
+        header += ["", *skipped]
     footer = [""]
     unchecked = data.get("unchecked", [])
     if unchecked:
@@ -434,7 +505,18 @@ def run(args: argparse.Namespace) -> int:
     if data is None:
         print("wheelgap: couldn't compare the lockfiles; the job summary and the log above say why.")
         return 2
-    print(f"wheelgap: {counts(len(data['worse']), len(data['new']))} The job summary has the details.")
+    left_out = len(data.get("not_compared", []))
+    skipped = f" {left_out} target{'s' * (left_out != 1)} not compared." if left_out else ""
+    said = counts(len(data["worse"]), len(data["new"]), compared(data), left_out > 0)
+    print(f"wheelgap: {said}{skipped} The job summary has the details.")
+    for python in dropped_pythons(data):
+        # A workflow command on purpose, so it can't be missed: fixed text and a version checked to be one, never
+        # the reason (it quotes the pull request's lockfile).
+        what = f"Python {python}" if PYTHON.fullmatch(python) else "a target Python"
+        print(
+            f"::warning::wheelgap: This change drops {what} support: the new lockfile's requires-python leaves it "
+            "out. The job summary has the details."
+        )
     return 1 if data["worse"] or data["new"] else 0
 
 

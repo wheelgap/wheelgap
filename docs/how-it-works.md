@@ -76,7 +76,8 @@ still checked, so a possible gap is reported rather than hidden. See
 - A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with
   `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without
   `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails,
-  and prints a note (with `-q`, only when some packages couldn't be re-checked).
+  and prints a note (with `-q`, only when some packages couldn't be re-checked). `wheelgap diff` doesn't compare such
+  a target at all (**after 0.14.0**; see [what counts as worse](diff.md#what-counts-as-worse)).
 - `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup make it
   exit 2 with an error naming the packages. The `requires-python` re-check above is skipped, with a note that those
   Pythons may show false gaps. `offline = true` in `[tool.wheelgap]` makes it the project default.
@@ -155,9 +156,7 @@ only when wheelgap knows the package is PyPI's. That's one rule, shared by them 
       (or `--pypi-url`), `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in
       it or in the files it pulls in with `-r` and `-c`), a `pyproject.toml` with no index or sources in
       `[tool.uv]`, `[tool.uv.pip]`, `[tool.poetry]`, `[tool.pdm]` or `[tool.pixi.pypi-options]`, a script whose
-      `# /// script` block has none in its `[tool.uv]`, or a `Pipfile.lock` whose sources are all PyPI. A
-      `-c` file that isn't read (a URL or `${VAR}`) or an abbreviated `--requirement`/`--constraint` option counts as
-      naming one.
+      `# /// script` block has none in its `[tool.uv]`, or a `Pipfile.lock` whose sources are all PyPI.
     - **No `uv.toml`, `pyproject.toml` or `pdm.toml` sets an index** in the input's folder or a folder above it, up to
       the repository root (the first with a `.git`). One that can't be read counts as setting one.
     - **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_PYPI_URL`, `PIP_EXTRA_INDEX_URL`,

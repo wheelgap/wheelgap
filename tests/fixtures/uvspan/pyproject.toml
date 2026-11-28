@@ -1,0 +1,9 @@
+[project]
+name = "uvspan"
+version = "0"
+requires-python = ">=3.13"
+dependencies = ["numpy>=1.26"]
+
+[tool.uv]
+package = false
+exclude-newer = "850 days"
