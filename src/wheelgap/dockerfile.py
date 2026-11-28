@@ -2651,6 +2651,7 @@ class _Install:
     scripts: int = 0  # how many commands that run the project's own scripts come before it (InputsReport.scripts)
     sync: bool = False  # `uv sync`, which installs the lock beside pyproject.toml in its working folder
     sync_no_dev: bool = False  # `uv sync --no-dev`
+    no_python_downloads: bool = False  # `uv sync --no-python-downloads`, which stops uv fetching a Python a pin names
     pytorch: bool = False  # the explicit requirements on the exact approved index form, with no lookup
 
 
@@ -3565,7 +3566,18 @@ class _RunReader:
                 f"`{shown}`: `uv sync` needs exactly one of --locked or --frozen to be read, or the lock in the "
                 "build context may not be what it installs"
             )
-        return "install", _Install(True, [], [], False, [], None, None, sync=True, sync_no_dev="--no-dev" in seen)
+        return "install", _Install(
+            True,
+            [],
+            [],
+            False,
+            [],
+            None,
+            None,
+            sync=True,
+            sync_no_dev="--no-dev" in seen,
+            no_python_downloads="--no-python-downloads" in texts,
+        )
 
     def _pip(self, number, args, uv, uv_system, shown, stop):  # type: ignore[no-untyped-def]
         """`pip ARGS` or `uv pip ARGS`."""
@@ -4113,11 +4125,14 @@ def _dockerfile_requirements(
     official = False  # the official python image: no WORKDIR of its own
     windows = False  # a Windows image, whose RUN lines run in cmd /S /C, not sh
     bash_env: int | None = None  # the line of an ENV or ARG that sets BASH_ENV, which bash -c runs first
+    image_python: str | None = None  # the final image's own Python, when its image is read
     try:
         # The errors plain --dockerfile gives for the FROM lines come first.
         base_image, base_platform, _, _, _ = _final_from(text, build_args)
         try:
-            windows = parse_image(base_image, base_platform).platform.startswith("win")
+            final_image = parse_image(base_image, base_platform)
+            image_python = final_image.python
+            windows = final_image.platform.startswith("win")
             official = _image_name(base_image) in IMAGE_NAMES
         except UnknownImageError:
             image_read = False
@@ -4471,6 +4486,26 @@ def _dockerfile_requirements(
                     "CPython version (X.Y, X.Y.Z or X.Yt) --dockerfile-inputs can check"
                 )
             pin = written
+        # uv fetches a Python the pin names only when downloads are on: UV_PYTHON_DOWNLOADS is auto, automatic or
+        # true by default. With them off (the flag, or an ENV that says otherwise) uv can only use the image's own
+        # Python, so a pin for another one makes the sync fail where wheelgap answered for it.
+        downloads_off = (
+            install.no_python_downloads
+            or "UV_PYTHON_DOWNLOADS" in reader.ambiguous
+            or (
+                "UV_PYTHON_DOWNLOADS" in env and env["UV_PYTHON_DOWNLOADS"].lower() not in ("auto", "automatic", "true")
+            )
+        )
+        if pin is not None and downloads_off:
+            pin_xy = re.fullmatch(r"(\d+\.\d+)(\.\d+)?(t?)", pin)
+            assert pin_xy is not None  # checked above
+            # The image's patch release isn't known, so a patch pin can't be shown to be the one uv finds in it.
+            if image_python is None or pin_xy[2] or pin_xy[1] + pin_xy[3] != image_python:
+                raise DockerfileError(
+                    f"line {number}: `uv sync` gets Python {pin} from its .python-version, but downloads are off "
+                    "here (--no-python-downloads, or UV_PYTHON_DOWNLOADS other than auto, automatic or true), and "
+                    f"the image's own Python is {image_python or 'not known'}, so uv may not get Python {pin}"
+                )
         try:
             project_table = tomllib.loads(pyproject.read_bytes().decode("utf-8-sig")).get("project")
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:

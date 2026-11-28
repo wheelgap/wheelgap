@@ -3128,6 +3128,58 @@ def test_cli_dockerfile_inputs_uv_sync_pin_must_be_checked(
         )
 
 
+@pytest.mark.parametrize(
+    ("pin", "setting", "refused"),
+    [
+        ("3.12", "--no-python-downloads", True),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=never", True),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=manual", True),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=auto", False),
+        ("3.13", "--no-python-downloads", False),
+        ("3.13.2", "--no-python-downloads", True),
+    ],
+)
+def test_cli_dockerfile_inputs_uv_sync_pin_needs_downloads_unless_image(
+    tmp_path, capsys, fake_pypi, fixtures, pin, setting, refused
+):
+    """With downloads off, uv can't fetch the Python a pin names, so only a pin for the image's own Python is read."""
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj/uv.lock").read_bytes())
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (tmp_path / ".python-version").write_text(f"{pin}\n", encoding="utf-8")
+    if setting.startswith("ENV"):
+        setup, sync = f"{setting}\n", "RUN uv sync --locked\n"
+    else:
+        setup, sync = "", f"RUN uv sync --locked {setting}\n"
+    path = _context(
+        tmp_path,
+        f"FROM python:3.13\nWORKDIR /app\nCOPY uv.lock pyproject.toml .python-version ./\n{setup}{sync}",
+        files=(),
+    )
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs", "-t", "linux-x86_64"]
+    if refused:
+        assert main(argv) == 2
+        assert "downloads are off here" in capsys.readouterr().err
+    else:
+        assert main(argv) != 2  # read (its gaps are the fixture's own), not refused
+        assert "downloads are off here" not in capsys.readouterr().err
+
+
+def test_cli_dockerfile_inputs_uv_sync_pin_unknown_image_needs_downloads(tmp_path, capsys, fake_pypi, fixtures):
+    """A base image wheelgap can't read has no known Python, so with downloads off a pin for it is refused."""
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj/uv.lock").read_bytes())
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (tmp_path / ".python-version").write_text("3.13\n", encoding="utf-8")
+    path = _context(
+        tmp_path,
+        "FROM registry.example/app:1\nWORKDIR /app\nCOPY uv.lock pyproject.toml .python-version ./\n"
+        "RUN uv sync --locked --no-python-downloads\n",
+        files=(),
+    )
+    argv = ["--dockerfile", str(path), "--dockerfile-inputs", "-p", "3.13", "-t", "linux-x86_64"]
+    assert main(argv) == 2
+    assert "downloads are off here" in capsys.readouterr().err
+
+
 def test_cli_dockerfile_inputs_uv_sync_pin_cant_share_the_run(tmp_path, capsys, fake_pypi, fixtures):
     """A pin that isn't the image's Python can't be checked beside an install that installs the image's."""
     (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj/uv.lock").read_bytes())
