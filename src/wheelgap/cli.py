@@ -2554,8 +2554,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             args.python
             or config.get("python")
             or read_python_version(project_dir(config_inputs or ([str(project)] if project else [])))
-            or [running_python()]
+            or []
         )
+        default_python = not pythons  # the running one: a lock that doesn't cover it says so (#816)
+        pythons = pythons or [running_python()]
         platforms = args.target or config.get("targets", [])
         if not platforms and pyproject:
             platforms = load_uv_targets(pyproject, pythons)
@@ -2756,7 +2758,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if source.found is not None:
                 for line in directory_notes(source.found):  # always: the file read isn't the one the name promises
                     print(f"wheelgap: note: {line}", file=sys.stderr)
-            check_lock_environments(source, targets)
+            check_lock_environments(source, targets, default_python=default_python)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "

@@ -337,7 +337,7 @@ the ones it covers, with a note. A target is inside when one lock target takes i
 Windows) and architecture. The glibc, musl or macOS version doesn't count, since PDM installs a `manylinux_2_40` lock
 on glibc 2.36 too, with a warning. A `requires_python` that holds for some patch releases only (`>=3.13.2` for
 `-p 3.13`), and a platform or key PDM doesn't know, can't be decided: wheelgap says so and stops, also with exit code 2.
-To check a target the lock doesn't cover, add it with `pdm lock --append --platform ... --python ...`.
+To check a target the lock doesn't cover, add it with `pdm lock --append --platform ... --python ...`. The error names each target with its Python, since the Python can be the cause, and when no `-p`, `python` setting or `.python-version` picked it (so it's the one wheelgap runs on), it says so and names a Python the lock covers.
 
 **Dependency groups:** the same selectors work with PDM's meanings, and configured `groups` apply too. Every group the
 lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups locked with

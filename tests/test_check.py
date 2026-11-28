@@ -1,6 +1,15 @@
 import pytest
 
-from wheelgap.check import ConflictWorld, Status, check, marker_holds, pdm_target_value, status_for
+from wheelgap.check import (
+    ConflictWorld,
+    Status,
+    check,
+    lock_environments_label,
+    lock_environments_note,
+    marker_holds,
+    pdm_target_value,
+    status_for,
+)
 from wheelgap.pypi import fill_all
 from wheelgap.sources import Package, Source, load_inputs
 from wheelgap.targets import build_targets
@@ -542,3 +551,16 @@ def test_status_for_and_explain_with_format_control():
 def test_pdm_target_value(entry, python, platform, expected):
     (target,) = build_targets([python], [platform])
     assert pdm_target_value(entry, target) is expected
+
+
+def test_lock_environments_label_names_several_locks():
+    uv = Source("uv.lock", supported_markers=["sys_platform == 'linux'"])
+    pdm = Source("pdm.lock", pdm_targets=[{"requires_python": ">=3.10", "platform": "linux"}])
+    assert lock_environments_label([uv]) == "uv.lock is locked for `[tool.uv] environments` only"
+    assert lock_environments_label([uv, pdm, Source("pylock.toml")]) == (
+        "uv.lock and pdm.lock are each locked for `[tool.uv] environments` or `pdm lock` targets only"
+    )
+    (lin,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert lock_environments_note([uv, pdm], ["win-amd64"], [lin], "default targets").endswith(
+        "which leave out win-amd64: checking the default targets they all cover (linux-x86_64)"
+    )

@@ -1927,9 +1927,9 @@ def test_pdm_lock_targets_refuse_a_target_outside_them(capsys, fake_pypi, fixtur
     assert code == 2
     message = json.loads(out)["error"]["message"]
     assert message == (
-        "pdm.lock: this lock doesn't cover macos-arm64, linux-aarch64: it was locked for `pdm lock` targets only "
-        "(requires_python ==3.13.*, platform manylinux_2_40_x86_64), so `pdm install` fails there and the lock "
-        "leaves out the packages and wheels other environments need; of the targets asked for it covers "
+        "pdm.lock: this lock doesn't cover 3.13 macos-arm64, 3.13 linux-aarch64: it was locked for `pdm lock` targets "
+        "only (requires_python ==3.13.*, platform manylinux_2_40_x86_64), so `pdm install` fails there and the lock "
+        "leaves out the packages and wheels other environments need; of the targets asked for it covers 3.13 "
         "linux-x86_64 (to check the others, lock for them too with `pdm lock --append --platform ... --python ...`)"
     )
     assert err == f"wheelgap: error: {message}\n"
@@ -1947,12 +1947,43 @@ def test_pdm_lock_targets_refuse_a_target_outside_them(capsys, fake_pypi, fixtur
     assert fake_pypi == []
 
 
+def test_pdm_lock_targets_name_the_default_python_when_it_is_the_cause(
+    capsys, fake_pypi, fixtures, tmp_path, monkeypatch
+):
+    # No -p, `python` setting or .python-version: the running Python, which the lock's ==3.13.* leaves out.
+    monkeypatch.setattr(cli, "running_python", lambda: "3.15")
+    (tmp_path / "pdm.lock").write_bytes((fixtures / "pdmtargets" / "pdm.lock").read_bytes())
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"))
+    assert code == 2
+    assert "this lock doesn't cover 3.15 linux-x86_64, 3.15 linux-aarch64, 3.15 macos-arm64, 3.15 win-amd64: " in err
+    assert err.rstrip().endswith(
+        "; Python 3.15 is the default, the one wheelgap runs on (no -p, `python` setting or .python-version): "
+        "pass -p 3.13 for a Python the lock covers, or run `pdm lock --append --python 3.15` to lock for it"
+    )
+    # With -p the Python was asked for, so there's no hint, but the message still names it.
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.15", "-t", "linux-x86_64")
+    assert code == 2 and "doesn't cover 3.15 linux-x86_64: " in err and "is the default" not in err
+
+
+def test_pdm_lock_targets_say_when_free_threading_is_the_cause(capsys, fake_pypi, fixtures, tmp_path):
+    text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    text = text.replace(
+        'platform = "manylinux_2_40_x86_64"\n',
+        'platform = "manylinux_2_40_x86_64"\nimplementation = "cpython"\ngil_disabled = false\n',
+    )
+    (tmp_path / "pdm.lock").write_text(text.replace("==3.13.*", ">=3.13"), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.14t", "-t", "linux-x86_64")
+    assert code == 2 and "doesn't cover 3.14t linux-x86_64: " in err
+    assert "(requires_python >=3.13, platform manylinux_2_40_x86_64, implementation cpython, gil_disabled false)" in err
+    assert run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.14", "-t", "linux-x86_64")[0] == 0
+
+
 def test_pdm_lock_targets_that_a_target_cannot_decide_are_not_guessed(capsys, fake_pypi, fixtures, tmp_path):
     text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
     (tmp_path / "pdm.lock").write_text(text.replace('"==3.13.*"', '">=3.13.2"'), encoding="utf-8")
     code, out, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64")
     assert code == 2 and out == ""
-    assert "can't tell whether this lock covers linux-x86_64: it was locked for `pdm lock` targets only" in err
+    assert "can't tell whether this lock covers 3.13 linux-x86_64: it was locked for `pdm lock` targets only" in err
     assert "`pdm install` fails outside them; check targets the lock targets decide" in err
 
 

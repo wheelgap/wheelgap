@@ -6,7 +6,7 @@ import itertools
 import re
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 
@@ -34,7 +34,15 @@ from .sources import (
     uv_group_names,
     uv_selected_roots,
 )
-from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
+from .targets import (
+    ANDROID_FLOOR,
+    IOS_FLOOR,
+    MANYLINUX_FLOOR,
+    MANYLINUX_X86_ARCHES,
+    NEWEST_PYTHON,
+    PLATFORMS,
+    Target,
+)
 
 
 class Status(StrEnum):
@@ -729,8 +737,8 @@ def pdm_target_value(entry: dict, target: Target) -> bool | None:
 def _pdm_target_text(entry: dict) -> str:
     parts = [f"requires_python {entry.get('requires_python') or 'any'}"]
     parts += [f"{key} {entry[key]}" for key in ("platform", "implementation") if entry.get(key)]
-    if entry.get("implementation") and entry.get("gil_disabled"):
-        parts.append("gil_disabled")
+    if entry.get("implementation"):  # only with an implementation does PDM compare it (EnvSpec.from_spec)
+        parts.append(f"gil_disabled {'true' if entry.get('gil_disabled') else 'false'}")
     return ", ".join(parts)
 
 
@@ -780,7 +788,17 @@ def lock_environment_targets(source: Source, targets: Iterable[Target]) -> tuple
     return outside, undecided
 
 
-def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
+def _pdm_covered_python(source: Source, targets: list[Target]) -> str | None:
+    """The newest Python, X.Y, that a pdm.lock's targets take on one of `targets`' platforms, for a hint."""
+    for minor in range(NEWEST_PYTHON[1], 7, -1):
+        for target in targets:
+            candidate = replace(target, major=3, minor=minor, freethreaded=False)
+            if any(pdm_target_value(entry, candidate) for entry in source.pdm_targets):
+                return f"3.{minor}"
+    return None
+
+
+def check_lock_environments(source: Source, targets: Iterable[Target], *, default_python: bool = False) -> None:
     """SourceError unless every target is in the environments a uv.lock or pdm.lock was locked for.
 
     uv resolves such a lock for its environments only: it drops the packages only other environments need (a
@@ -792,7 +810,8 @@ def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
     outside, undecided = lock_environment_targets(source, targets)
     if not outside and not undecided:
         return
-    with_python = len({t.python for t in targets}) > 1
+    # A pdm.lock's targets name Pythons too, so its message always does (the running one may be the cause).
+    with_python = len({t.python for t in targets}) > 1 or bool(source.pdm_targets)
 
     def names(some: list[Target]) -> str:
         return ", ".join(t.label(with_python) for t in some)
@@ -815,6 +834,21 @@ def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
             else "it covers none of the targets asked for"
         )
         + f" (to check the others, {more})"
+        + _default_python_hint(source, outside, default_python)
+    )
+
+
+def _default_python_hint(source: Source, outside: list[Target], default_python: bool) -> str:
+    """For a pdm.lock checked on the running Python (no -p, `python` setting or .python-version): say so, and which
+    Python the lock covers."""
+    if not default_python or not source.pdm_targets:
+        return ""
+    pythons = ", ".join(dict.fromkeys(t.python for t in outside))
+    covered = _pdm_covered_python(source, outside)
+    return (
+        f"; Python {pythons} is the default, the one wheelgap runs on (no -p, `python` setting or .python-version): "
+        + (f"pass -p {covered} for a Python the lock covers, or " if covered else "")
+        + f"run `pdm lock --append --python {outside[0].major}.{outside[0].minor}` to lock for it"
     )
 
 
@@ -844,16 +878,20 @@ def lock_environments_label(sources: Iterable[Source]) -> str:
     """For notes: the locks made for some environments only, and what they were locked for ("uv.lock is locked for
     `[tool.uv] environments` only")."""
     limited = [source for source in sources if _locks_environments(source)]
-    labels = ", ".join(dict.fromkeys(source.label for source in limited))
+    labels = list(dict.fromkeys(source.label for source in limited))
     whats = list(dict.fromkeys(_locked_for(source)[0] for source in limited))
-    return f"{labels} is locked for {whats[0] if len(whats) == 1 else ' or '.join(whats)} only"
+    if len(labels) == 1:
+        return f"{labels[0]} is locked for {whats[0]} only"
+    return f"{', '.join(labels[:-1])} and {labels[-1]} are each locked for {' or '.join(whats)} only"
 
 
 def lock_environments_note(sources: Iterable[Source], left_out: list[str], kept: list[Target], what: str) -> str:
+    sources = list(sources)
     checked = ", ".join(dict.fromkeys(t.platform for t in kept))
+    several = len({source.label for source in sources if _locks_environments(source)}) > 1
     return (
         f"{lock_environments_label(sources)}, which leave out {', '.join(left_out)}: "
-        f"checking the {what} it covers ({checked})"
+        f"checking the {what} {'they all cover' if several else 'it covers'} ({checked})"
     )
 
 
