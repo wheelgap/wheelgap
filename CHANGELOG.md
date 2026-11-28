@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `uv.lock` whose `[package.metadata]` has the wrong type (for example `provides-extras = [1]` or `metadata = []`) now stops with a clear error naming the package and field (exit 2, and an error object with `--json`) instead of a raw `AttributeError` traceback. (#805, thanks [@Mugunth007](https://github.com/Mugunth007))
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-break-system-packages`, the explicit negative form of `--break-system-packages`: it doesn't change which exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#791, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-editable`: editable installs are already refused there, so the flag has no editable package to affect and doesn't change which exactly pinned distributions or artifacts uv installs. (#790, thanks [@Seyamalam](https://github.com/Seyamalam))
 - `--dockerfile-inputs`: a `uv sync --locked` or `--frozen` line and a read `uv pip install` line may also repeat `-q` / `--quiet` (`-qq` and further repetitions), including the global `uv pip -qq install` form: quieter output doesn't change which locked or exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#789, thanks [@Seyamalam](https://github.com/Seyamalam))

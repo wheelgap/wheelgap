@@ -798,8 +798,6 @@ def uv_extra_names(package: dict) -> frozenset[str]:
     provides_extras = metadata.get("provides-extras", [])
     if not isinstance(provides_extras, list) or not all(isinstance(name, str) for name in provides_extras):
         raise SourceError(f"uv.lock: {owner}: provides-extras must be a list of strings")
-    if not all(isinstance(name, str) for name in optional):
-        raise SourceError(f"uv.lock: {owner}: optional-dependencies keys must be strings")
     return frozenset(canonicalize_name(name) for name in optional) | frozenset(
         canonicalize_name(name) for name in provides_extras
     )
@@ -810,10 +808,6 @@ def uv_group_names(package: dict) -> frozenset[str]:
     dev_deps = _uv_table(package, "dev-dependencies", owner)
     metadata = _uv_table(package, "metadata", owner)
     requires_dev = _uv_table(metadata, "requires-dev", owner)
-    if not all(isinstance(name, str) for name in dev_deps):
-        raise SourceError(f"uv.lock: {owner}: dev-dependencies keys must be strings")
-    if not all(isinstance(name, str) for name in requires_dev):
-        raise SourceError(f"uv.lock: {owner}: requires-dev keys must be strings")
     return frozenset(canonicalize_name(name) for name in dev_deps) | frozenset(
         canonicalize_name(name) for name in requires_dev
     )

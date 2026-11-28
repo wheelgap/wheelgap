@@ -6363,6 +6363,8 @@ def test_pyproject_non_table_tool_exits_with_source_error(capsys, tmp_path, fake
     [
         ("[package.metadata]\nprovides-extras = [1]\n", "provides-extras must be a list of strings"),
         ("metadata = []\n", "metadata must be a table"),
+        ('[package.metadata]\nprovides-extras = "abc"\n', "provides-extras must be a list of strings"),
+        ("[package.metadata]\nrequires-dev = []\n", "requires-dev must be a table"),
     ],
 )
 def test_uv_lock_wrong_type_package_metadata_exits_2_with_json_error(
