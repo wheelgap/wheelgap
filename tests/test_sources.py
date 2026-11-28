@@ -1157,6 +1157,8 @@ def test_poetry_dict_markers_with_an_unconditional_group(tmp_path):
 
 
 def test_poetry_1x_lock_walks_dependency_markers(tmp_path):
+    # The project's own dependencies (#815: without them a Poetry 1.x lock is refused where that could hide a gap).
+    (tmp_path / "pyproject.toml").write_text('[tool.poetry.dependencies]\napp-lib = "*"\n', encoding="utf-8")
     # Before lock-version 2.1, markers only sit on dependency edges.
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "app-lib"\nversion = "1.0"\n\n[package.dependencies]\n'
@@ -1222,6 +1224,8 @@ def test_poetry_1x_dependency_cycle_is_still_walked(tmp_path):
 
 
 def test_poetry_1x_edges_pick_the_version_in_range(tmp_path):
+    # The project's own dependencies (#815: without them a Poetry 1.x lock is refused where that could hide a gap).
+    (tmp_path / "pyproject.toml").write_text('[tool.poetry.dependencies]\napp-lib = "*"\n', encoding="utf-8")
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "app-lib"\nversion = "1.0"\nfiles = []\n\n[package.dependencies]\n'
         'numpy = [{version = "1.24.4", markers = "python_version < \\"3.9\\""}, '
@@ -1287,6 +1291,8 @@ def test_poetry_lock_vcs_skipped(tmp_path):
 
 
 def test_poetry_1x_roots_are_cycles_nothing_else_reaches(tmp_path):
+    # The project's own dependencies (#815: without them a Poetry 1.x lock is refused where that could hide a gap).
+    (tmp_path / "pyproject.toml").write_text('[tool.poetry.dependencies]\nz1 = "*"\n', encoding="utf-8")
     # a1<->a2 and z1<->z2 are cycles; z1 -> a1 only on Windows. Only the z cycle is a starting point,
     # so a1/a2 must not be needed on Linux (they used to be made roots too, by index order).
     pkg = '[[package]]\nname = "{n}"\nversion = "1"\nfiles = []\n\n[package.dependencies]\n{deps}\n\n'

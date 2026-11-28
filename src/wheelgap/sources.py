@@ -237,6 +237,9 @@ class Source:
     # by the groups Poetry records on them.
     poetry_tables: list[dict] | None = None
     poetry_pyproject: Path | None = None
+    # poetry.lock before lock-version 2.1 with no readable pyproject.toml beside it: why its direct dependencies are
+    # unknown. check() then refuses when a package the walk leaves out on a target would have a gap there.
+    poetry_roots_unknown: str | None = None
     # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
     poetry_lock_extras: list[str] = field(default_factory=list)
     # poetry.lock after a selection: the note that says where extras couldn't leave packages out, because Poetry
@@ -1193,9 +1196,19 @@ def parse_poetry_lock(path: Path) -> Source:
         roots = set(_graph_roots(pkgs, edges))
         # The project's own dependencies are roots too, even if another package also depends on them
         # under a marker (colorama directly, and via click only on Windows).
-        declared = _project_dependencies(path.parent / "pyproject.toml")
-        roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
-        return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+        pyproject = path.parent / "pyproject.toml"
+        declared = _project_dependencies(pyproject)
+        roots |= {i for i, p in enumerate(pkgs) if p.key in (declared or ())}
+        source = Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+        if declared is None:
+            # Without them, a direct dependency that another package needs only under a marker would be hidden
+            # wherever the marker is false: check() refuses where that could hide a gap.
+            source.poetry_roots_unknown = (
+                f"{path.name} is a Poetry 1.x lock (lock-version {metadata.get('lock-version')}), which doesn't "
+                "record the project's own dependencies; those are in the pyproject.toml beside it, and "
+                + ("there is none" if not pyproject.is_file() else "that file can't be read")
+            )
+        return source
     extras = data.get("extras")
     return Source(
         path.name,
@@ -1264,13 +1277,13 @@ def _components(n: int, succ: dict[int, list[int]]) -> list[int]:
     return comp
 
 
-def _project_dependencies(pyproject: Path) -> set[str]:
-    """Names a project declares itself (PEP 621 and Poetry tables), to use as roots for poetry.lock.
-    A missing or odd pyproject.toml just means no extra roots: it must never break the run."""
+def _project_dependencies(pyproject: Path) -> set[str] | None:
+    """Names a project declares itself (PEP 621 and Poetry tables), to use as roots for poetry.lock, or None when
+    the pyproject.toml is missing or isn't UTF-8 TOML. Odd values in a readable one are left out, never an error."""
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except Exception:
-        return set()
+        return None
 
     def table(value: object) -> dict:
         return value if isinstance(value, dict) else {}

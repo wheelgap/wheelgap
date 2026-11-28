@@ -13,6 +13,7 @@ import wheelgap
 from wheelgap import cli
 from wheelgap.check import Status
 from wheelgap.cli import main
+from wheelgap.sources import SourceError
 from wheelgap.targets import ALIASES, DEFAULT_PLATFORMS, PLATFORMS
 
 NOTES_HINT = (
@@ -5159,6 +5160,55 @@ def test_poetry_1x_transitive_gap_table_uses_direct_dependency(capsys, tmp_path,
     assert code == 1 and not err
     assert "cryptography (via mcp)" in out
     assert fake_pypi == []
+
+
+# click needs colorama on Windows only, and the project depends on both (#815). colorama has only an sdist here.
+POETRY_1X_CLICK_COLORAMA = (
+    '[[package]]\nname = "click"\nversion = "8.1.7"\n'
+    'files = [{ file = "click-8.1.7-py3-none-any.whl" }]\n\n[package.dependencies]\n'
+    'colorama = {version = "*", markers = "platform_system == \\"Windows\\""}\n\n'
+    '[[package]]\nname = "colorama"\nversion = "0.4.6"\nfiles = [{ file = "colorama-0.4.6.tar.gz" }]\n\n'
+    '[metadata]\nlock-version = "2.0"\n'
+)
+
+
+def test_poetry_1x_lock_without_its_pyproject_is_refused_where_it_could_hide_a_gap(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64", "--json")
+    assert code == 2  # used to be a pass, with colorama hidden on Linux and no note
+    message = json.loads(out)["error"]["message"]
+    assert "Poetry 1.x lock (lock-version 2.0)" in message and "there is none" in message
+    assert "they have no wheel there: colorama on linux-x86_64." in message
+    assert err.startswith("wheelgap: error: ")
+
+
+def test_poetry_1x_lock_with_an_unreadable_pyproject_is_refused_too(tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[tool.poetry\n", encoding="utf-8")
+    # The command line already refuses it for its [tool.wheelgap] table; the Python API reads no config.
+    with pytest.raises(SourceError, match="that file can't be read"):
+        wheelgap.check_lockfile(tmp_path / "poetry.lock", wheelgap.make_targets(["3.13"], ["linux-x86_64"]))
+
+
+def test_poetry_1x_lock_with_its_pyproject_checks_direct_dependencies_everywhere(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "^8.1"\ncolorama = "^0.4"\n', encoding="utf-8"
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1, err
+    (row,) = [p for p in json.loads(out)["packages"] if p["name"] == "colorama"]
+    assert row["results"]["linux-x86_64"] == "source"
+
+
+def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_has_a_gap(
+    capsys, tmp_path, fake_pypi
+):
+    # colorama has a pure wheel: needed on Linux or not, the answer is the same.
+    lock = POETRY_1X_CLICK_COLORAMA.replace("colorama-0.4.6.tar.gz", "colorama-0.4.6-py2.py3-none-any.whl")
+    (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64")
+    assert code == 0, err
 
 
 def test_a_failing_via_hint_never_costs_the_check(capsys, tmp_path, fake_pypi, monkeypatch):

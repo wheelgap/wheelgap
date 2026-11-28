@@ -1305,6 +1305,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
         # The (via ...) hint, per target, worked out only when a gap needs it, so gap-free runs never pay. Text and
         # Markdown tables show it, and `--json --explain` writes it as `direct`.
         hints: dict[Target, dict[int, tuple[str, ...]]] = {}
+        # Poetry 1.x without its pyproject.toml: packages the walk leaves out on a target that would have a gap there.
+        unsure: dict[str, list[Target]] = {}
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
@@ -1320,7 +1322,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 row = resolved_rows[id(resolved)]
                 files = None if resolved.error else resolved.files
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
-                row.results[t] = (
+                status = (
                     status_for(
                         files,
                         t,
@@ -1329,9 +1331,12 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                         no_binary=resolved.no_binary,
                         only_binary=resolved.only_binary,
                     )
-                    if needed
+                    if needed or source.poetry_roots_unknown
                     else Status.NOT_NEEDED
                 )
+                if not needed and status not in (Status.WHEEL, Status.NOT_NEEDED):
+                    unsure.setdefault(pkg.name, []).append(t)
+                row.results[t] = status if needed else Status.NOT_NEEDED
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i]
@@ -1350,4 +1355,20 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                         if direct := hints[t].get(i):
                             row.direct_via[t] = direct
             rows.extend(resolved_rows.values())
+        if unsure:
+            raise SourceError(_poetry_roots_unknown_message(source, unsure, targets))
     return rows
+
+
+def _poetry_roots_unknown_message(source: Source, unsure: dict[str, list[Target]], targets: list[Target]) -> str:
+    """Why check() refuses a Poetry 1.x lock read without its pyproject.toml (#815)."""
+    with_python = len({t.python for t in targets}) > 1
+    where = "; ".join(
+        f"{name} on {', '.join(dict.fromkeys(t.label(with_python) for t in some))}" for name, some in unsure.items()
+    )
+    return (
+        f"{source.poetry_roots_unknown}. Poetry installs a direct dependency everywhere, even one another package "
+        "needs only under a marker, so wheelgap can't tell whether these are installed where the markers leave them "
+        f"out, and they have no wheel there: {where}. Check the lock beside its pyproject.toml, or relock with "
+        "Poetry 2 (lock-version 2.1 records where each package is installed)"
+    )

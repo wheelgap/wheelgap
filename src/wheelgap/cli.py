@@ -3098,7 +3098,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if source.path in uv_files or id(source) in uv_named:
             restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
-    rows = [r for r in check(sources, targets) if r.needed]
+    try:
+        rows = [r for r in check(sources, targets) if r.needed]
+    except SourceError as e:  # a Poetry 1.x lock without its pyproject.toml, where that could hide a gap
+        print(f"wheelgap: error: {e}", file=sys.stderr)
+        return input_error_json(e) if args.json else 2
     if pyodide_lock:
         apply_bundled(rows, targets, pyodide_lock)
     rows.sort(key=lambda r: r.package.key)
