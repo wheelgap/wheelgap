@@ -432,13 +432,15 @@ def restore_uv_python_files(packages: Iterable[Package], pythons: Iterable[str])
 def _loads_toml(path: Path) -> dict:
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        raise SourceError(f"{path.name}: isn't UTF-8, so it can't be read") from None
     except tomllib.TOMLDecodeError as e:
-        raise SourceError(f"{path.name}: {e}") from e
+        raise SourceError(f"{path.name}: invalid TOML: {e}") from None
 
 
 def _filename(entry: object, origin: str, package: str) -> str | None:
     if not isinstance(entry, dict):
-        raise SourceError(f"{origin}: package {package}: `wheels` entry isn't a table")
+        raise SourceError(f"{origin}: package {package}: has a file entry that isn't a table")
     url = entry.get("url")
     parts: ParseResult | None = None
     if isinstance(url, str):
@@ -714,10 +716,10 @@ def parse_uv_lock(path: Path) -> Source:
     else:
         source.uv_pyproject = path.with_name("pyproject.toml")
     for p in uv_packages:
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         src = p.get("source", {})
         if not isinstance(src, dict):
-            raise SourceError(f"{path.name}: package {p.get('name', '?')}: `source` isn't a table")
-        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
+            raise SourceError(f"{path.name}: package {pkg.name}: `source` isn't a table")
         kind = next((k for k in ("editable", "virtual", "git", "path", "directory", "url") if k in src), None)
         if kind and "registry" not in src:
             pkg.skip = kind

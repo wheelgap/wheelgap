@@ -137,17 +137,42 @@ def test_uv_lock_manifest_that_is_not_a_table_raises(tmp_path):
         (
             "uv.lock",
             '[[package]]\nname = "a"\nversion = "1.0"\nwheels = ["x"]\n',
-            "uv.lock: package a: `wheels` entry isn't a table",
+            "uv.lock: package a: has a file entry that isn't a table",
         ),
-        ("uv.lock", "not = valid = toml\n", "uv.lock:"),
+        (
+            "uv.lock",
+            "[manifest]\nmembers = [1]\n",
+            "uv.lock: the manifest has a `members` that isn't a list of strings",
+        ),
+        (
+            "uv.lock",
+            '[[package]]\nname = "a"\nversion = "1.0"\nsource = "x"\n',
+            "uv.lock: package a: `source` isn't a table",
+        ),
+        (
+            "uv.lock",
+            '[[package]]\nname = "a"\nversion = "1.0"\nwheels = "x"\n',
+            "uv.lock: package a: `wheels` isn't a list",
+        ),
+        (
+            "uv.lock",
+            '[[package]]\nname = "a"\nversion = "1.0"\nsdist = "a-1.0.tar.gz"\n',
+            "uv.lock: package a: has a file entry that isn't a table",
+        ),
+        ("uv.lock", "not = valid = toml\n", "uv.lock: invalid TOML:"),
         ("pylock.toml", "packages = -1\n", "pylock.toml: `packages` isn't a list of tables"),
         ("pylock.toml", "packages = [1]\n", "pylock.toml: `packages` isn't a list of tables"),
         (
             "pylock.toml",
             '[[packages]]\nname = "a"\nversion = "1.0"\nwheels = [true]\n',
-            "pylock.toml: package a: `wheels` entry isn't a table",
+            "pylock.toml: package a: has a file entry that isn't a table",
         ),
-        ("pylock.toml", "not = valid = toml\n", "pylock.toml:"),
+        (
+            "pylock.toml",
+            '[[packages]]\nname = "a"\nversion = "1.0"\nwheels = "x"\n',
+            "pylock.toml: package a: `wheels` isn't a list",
+        ),
+        ("pylock.toml", "not = valid = toml\n", "pylock.toml: invalid TOML:"),
     ],
 )
 def test_uv_lock_and_pylock_reject_wrong_types_and_invalid_toml(tmp_path, filename, content, expected):
