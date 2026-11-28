@@ -59,6 +59,7 @@ FIX_REASONS = {
     "loses_wheel": "every newer release with a wheel drops one it has elsewhere",
     "uv_may_fork": "every newer release with a wheel drops one it has on another Python",
     "no_binary": "--no-binary, so pip uses no wheel for it",
+    "held_back": "it's a dependency, and --deps took the newest release the requirements on it allow",
 }
 RESOLVE_NOTE = "wheelgap doesn't resolve dependencies: the rest of them must allow these releases."
 GAP_WHEEL_NOTE = (

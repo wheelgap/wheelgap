@@ -76,6 +76,9 @@ INDEX = {
     # dropped's newest release has no Windows ARM wheel; the one before had one (#403).
     "tool": {"1.0": release(["dropped"])},
     "dropped": {"1.0": release(files=(WIN_ARM, LINUX)), "2.0": release(files=(LINUX,))},
+    # holder needs held<2, the last held with no Windows ARM wheel; 2.0 has one (#821).
+    "holder": {"1.0": release(["held<2"])},
+    "held": {"1.0": release(files=()), "1.5": release(files=()), "2.0": release(files=(WIN_ARM,))},
 }
 DIFFERING = {
     "differ-1.0-" + WIN_AMD: ["c", "pywin"],
@@ -1174,3 +1177,43 @@ def test_project_deps_cutoff_applies_to_an_exact_pin(index, tmp_path, capsys):
     assert list(packages) == ["app"]
     assert packages["app"]["version"] is None
     assert "no valid upload_time_iso_8601" in packages["app"]["error"]
+
+
+FIX = ["--deps", "--fix", "-p", "3.14", "-t", "win-arm64", "--no-cache", "--color", "never"]
+
+
+@pytest.mark.parametrize(
+    "line,said,how",
+    [
+        (
+            "held<2",
+            " (needs requirements.txt's held<2 relaxed)",
+            "In requirements.txt, change the requirements to held==2.0.",
+        ),
+        ("held==1.0", "", "In requirements.txt, change the pins to held==2.0."),
+    ],
+)
+def test_fix_names_a_direct_requirements_own_file_and_range(index, capsys, tmp_path, line, said, how):
+    # #821: every package --deps resolves was "--deps", so --fix said "In --deps, change the pins" and lost the range.
+    reqs = tmp_path / "requirements.txt"
+    reqs.write_text(line + "\n", encoding="utf-8")
+    assert main([str(reqs), *FIX]) == 1
+    out = capsys.readouterr().out
+    assert f"  held {'1.5' if '<' in line else '1.0'} -> 2.0: win-arm64{said}\n{how}\n" in out
+    assert "--deps," not in out
+
+
+def test_fix_names_the_parent_for_a_dependency_instead_of_a_pin(index, capsys):
+    # holder's held<2 rules 2.0 out, so "use held==2.0" can't install: name holder instead (#821).
+    assert main(["holder==1.0", *FIX]) == 1
+    out = capsys.readouterr().out
+    assert "Use held==2.0" not in out and "Upgrade:" not in out
+    assert (
+        "No fix yet:\n  held 1.5: it's a dependency, and --deps took the newest release the requirements on it allow "
+        "for win-arm64 (its 2.0 has the wheel; upgrade or relax holder, which brings it in)\n"
+    ) in out
+    assert main(["holder==1.0", *FIX, "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    held = next(p for p in data["packages"] if p["name"] == "held")
+    assert held["fix"] == {"win-arm64": {"kind": "none", "reason": "held_back", "abi3_only": False}}
+    assert data["fix_summary"]["none"] == 1 and data["fix_summary"]["upgrade"] == 0

@@ -39,8 +39,11 @@ NO_BINARY = "no_binary"  # --no-binary: pip uses no wheel for it, so neither an 
 # uv.lock only, instead of LOSES: what the newer releases drop is only another Python's wheel, and uv may lock a
 # release per Python (a fork), so `uv lock --upgrade-package NAME` may still fix it. wheelgap can't tell: try it.
 UV_MAY_FORK = "uv_may_fork"
+# --deps only (#821): a dependency of another package. --deps already took the newest release every requirement on it
+# allows, so a newer one with the wheel is outside one of them: the package it comes in through must change instead.
+HELD_BACK = "held_back"
 # The reasons that mean no fix is known; NOT_LOOKED_UP and UV_MAY_FORK don't, so the summary counts them apart.
-NO_FIX = (NO_NEWER, LOSES, NO_BINARY)
+NO_FIX = (NO_NEWER, LOSES, NO_BINARY, HELD_BACK)
 
 RESOLVE_NOTE = "wheelgap doesn't resolve dependencies: the rest of them must allow these releases."
 # Inputs whose ranged requirement (Package.spec) is the user's own constraint, written in that input.
@@ -53,7 +56,7 @@ class Cell:
     target: Target
     source: Source
     kind: str  # UPGRADE, GAP_WHEEL or NONE
-    version: str | None = None  # UPGRADE: the release to move to
+    version: str | None = None  # UPGRADE: the release to move to (HELD_BACK: the newer release with the wheel)
     fill: gapwheels.Fill | None = None  # an unofficial gap wheel of the pinned version (for UPGRADE, the fallback)
     reason: str | None = None  # NONE: one of the reasons above
     abi3_only: bool = False  # NONE, on a free-threaded target: the release has abi3 wheels for its platform only
@@ -106,6 +109,14 @@ def plan(
         found = suggestions.get(id(r.package))
         for t in gap_targets(r, targets):
             fill = filled.get((id(r), t))
+            if found is not None and transitive(r, t, source) and (t in found.found or t in found.beyond):
+                # --deps: an upgrade of a dependency is outside what the package that requires it allows (#821).
+                if fill is not None:
+                    cells.append(Cell(r, t, source, GAP_WHEEL, fill=fill))
+                else:
+                    version = found.found[t] if t in found.found else found.beyond[t][0]
+                    cells.append(Cell(r, t, source, NONE, version=version, reason=HELD_BACK))
+                continue
             if found is not None and t in found.found:
                 cells.append(Cell(r, t, source, UPGRADE, version=found.found[t], fill=fill))
                 continue
@@ -138,6 +149,11 @@ def plan(
                 reason = NO_NEWER
             cells.append(Cell(r, t, source, NONE, reason=reason, abi3_only=abi3_only(r, t)))
     return cells
+
+
+def transitive(row: Row, target: Target, source: Source) -> bool:
+    """--deps: whether the row's package is reached through another package on the target (not a direct requirement)."""
+    return source.deps_paths is not None and len(row.via.get(target, ())) > 1
 
 
 def upload_cutoff(source: Source, pkg: Package) -> datetime | None:
@@ -251,6 +267,11 @@ def constraint(cell: Cell) -> Constraint | None:
         specs, file = sorted(pinned), source.label
         reqs_shown = [f"{pkg.name}{s}" for s in specs]
         return _judged(cell, specs, reqs_shown, file, "constraint")
+    elif source.deps_paths is not None and (pkg.spec or pkg.written_spec) and source.kind in SPEC_KINDS:
+        # --deps: a direct requirement's range, as its input writes it (a dependency's is never the user's own).
+        if transitive(cell.row, cell.target, source):
+            return None
+        specs, file = [pkg.written_spec or pkg.spec or ""], source.label
     elif pkg.spec and source.kind in SPEC_KINDS:
         written = pkg.written_spec
         try:
@@ -403,7 +424,8 @@ def _how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain)
         # The file whose line pins it: a -r include's, not the top file's.
         by_file: dict[str, list[Cell]] = {}
         for c in cells:
-            by_file.setdefault(c.row.package.origin or source.label, []).append(c)
+            origin = c.row.package.origin
+            by_file.setdefault(origin if origin and origin != "--deps" else source.label, []).append(c)
         return [
             f"In {code(f)}, change the {_what(cs)} to {', '.join(map(code, _pins(cs)))}." for f, cs in by_file.items()
         ]
@@ -423,7 +445,10 @@ def _what(cells: list[Cell]) -> str:
     """ "pins", or "requirements" when a line is a range or a bare name (the index picked the version)."""
     # A -c constraint pins it, so the line itself may be a bare name.
     ranged = any(
-        c.row.package.spec or c.row.package.version_from_index or c.row.package.key in c.source.constraint_specs
+        c.row.package.spec
+        or c.row.package.written_spec
+        or c.row.package.version_from_index
+        or c.row.package.key in c.source.constraint_specs
         for c in cells
     )
     return "requirements" if ranged else "pins"
@@ -459,12 +484,20 @@ REASON_TEXT = {
     LOSES: "every newer release with a wheel drops one it has elsewhere",
     UV_MAY_FORK: "every newer release with a wheel drops one it has on another Python",
     NO_BINARY: "--no-binary, so pip uses no wheel for it",
+    HELD_BACK: "it's a dependency, and --deps took the newest release the requirements on it allow",
 }
 
 
 def _reason(reason: str, cs: list[Cell], multi_py: bool) -> str:
     text = f"{REASON_TEXT[reason]} for {_labels(cs, multi_py)}"
     drops = list(dict.fromkeys(c.drops for c in cs if c.drops))
+    if reason == HELD_BACK:  # the newer release with the wheel, and the direct requirements that bring it in
+        newer = ", ".join(dict.fromkeys(c.version for c in cs if c.version))
+        through = list(dict.fromkeys(n for c in cs for n in c.row.direct_via.get(c.target, ())))
+        text += f" (its {newer} has the wheel"
+        if through:
+            text += f"; upgrade or relax {', '.join(through)}, which {'brings' if len(through) == 1 else 'bring'} it in"
+        return text + ")"
     if reason in (LOSES, UV_MAY_FORK) and drops:  # name what the nearest one drops
         lost = "; ".join(
             f"{version} has none for {', '.join(dict.fromkeys(t.label(multi_py) for t in ts))}" for version, ts in drops

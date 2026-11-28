@@ -536,6 +536,12 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
     resolver.policy = source.format_control.policy if source.format_control else None
     roots = [Requirement(text) for text in source.specs]
     kept = [p for p in source.packages if p.skip]  # a name @ URL: nothing to look up, as without --deps
+    # The input's own line for each direct requirement, for --fix to say where it is and what range it writes (#821):
+    # only when the input has one line for the name, so there's no guessing which.
+    lines: dict[str, list[Package]] = {}
+    for p in source.packages:
+        if not p.skip:
+            lines.setdefault(p.key, []).append(p)
     roots = [r for r in roots if not r.url]
     packages: list[Package] = list(kept)
     index: dict[tuple[str, str | None, str | None], int] = {}
@@ -570,12 +576,16 @@ def resolve_deps(source: Source, targets: list[Target], resolver: Resolver | Non
             if ident not in index:
                 name = resolver.names.get(key, path[-1])
                 index[ident] = len(packages)
+                own = lines[key][0] if len(lines.get(key, [])) == 1 else None
                 packages.append(
                     Package(
                         name,
                         version,
                         error=error if version is None else None,
-                        origin="--deps",
+                        # A direct requirement keeps its input's file; where it's reached through another package
+                        # (its path, per target), --fix goes by that instead.
+                        origin=own.origin if own is not None and own.origin else "--deps",
+                        written_spec=own.written_spec or own.spec if own is not None else None,
                         exclude_newer=source.cutoff_for(key),
                     )
                 )

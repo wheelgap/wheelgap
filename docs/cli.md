@@ -820,7 +820,9 @@ Following the usual output, say how to fix each gap cell (a package on a target,
    wheel index, as below. When both exist, the upgrade comes first and the gap wheel is listed as the fallback
    ("if you can't upgrade NAME"); the gap wheel section opens with "As a fallback" when `--fix` names an upgrade.
 3. **No fix yet**, with the reason (no newer release has a wheel; every one that has drops a wheel elsewhere, naming
-   what the nearest one drops; or `--no-binary`), the package's issue tracker where no newer release has a wheel, and,
+   what the nearest one drops; `--no-binary`; or, with `--deps`, a dependency whose newer release with the wheel the
+   requirements on it rule out, since `--deps` takes the newest one they allow, naming the direct requirements that
+   bring it in to upgrade or relax instead), the package's issue tracker where no newer release has a wheel, and,
    on a free-threaded target whose release has only abi3 wheels, a line saying so. For a uv.lock, when what the newer
    releases drop is only an older Python's wheel because their `Requires-Python` leaves that Python out, uv may lock a
    release per Python: such a gap goes under "Maybe, with uv:", with `uv lock --upgrade-package NAME` to try (and the
