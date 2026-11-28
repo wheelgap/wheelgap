@@ -1920,6 +1920,50 @@ def test_lock_environments_cover_a_default_platform_for_some_pythons_only(capsys
     assert "this lock doesn't cover 3.14 linux-x86_64, 3.14 linux-aarch64: " in err
 
 
+def test_pdm_lock_targets_refuse_a_target_outside_them(capsys, fake_pypi, fixtures):
+    # What PDM 2.29.7 writes for `pdm lock --platform linux --python "==3.13.*"`. MarkupSafe has macOS and aarch64
+    # wheels on PyPI, but the lock kept only the x86_64 Linux ones: these used to be false `source` gaps.
+    lock = fixtures / "pdmtargets" / "pdm.lock"
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "macos-arm64,linux-aarch64,linux-x86_64", "--json")
+    assert code == 2
+    message = json.loads(out)["error"]["message"]
+    assert message == (
+        "pdm.lock: this lock doesn't cover macos-arm64, linux-aarch64: it was locked for `pdm lock` targets only "
+        "(requires_python ==3.13.*, platform manylinux_2_40_x86_64), so `pdm install` fails there and the lock "
+        "leaves out the packages and wheels other environments need; of the targets asked for it covers "
+        "linux-x86_64 (to check the others, lock for them too with `pdm lock --append --platform ... --python ...`)"
+    )
+    assert err == f"wheelgap: error: {message}\n"
+    # glibc 2.36 is older than the lock's manylinux_2_40, which PDM installs anyway (with a warning).
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+    assert run(capsys, str(lock), "-p", "3.14", "-t", "linux-x86_64")[0] == 2  # outside requires_python
+    # The default platforms are narrowed to the ones it covers, as for a uv.lock.
+    code, out, err = run(capsys, str(lock), "-p", "3.13", "--json")
+    assert code == 0 and [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64"]
+    assert (
+        "wheelgap: note: pdm.lock is locked for `pdm lock` targets only, which leave out linux-aarch64, "
+        "macos-arm64, win-amd64: checking the default targets it covers (linux-x86_64)\n"
+    ) in err
+    assert fake_pypi == []
+
+
+def test_pdm_lock_targets_that_a_target_cannot_decide_are_not_guessed(capsys, fake_pypi, fixtures, tmp_path):
+    text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    (tmp_path / "pdm.lock").write_text(text.replace('"==3.13.*"', '">=3.13.2"'), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and out == ""
+    assert "can't tell whether this lock covers linux-x86_64: it was locked for `pdm lock` targets only" in err
+    assert "`pdm install` fails outside them; check targets the lock targets decide" in err
+
+
+@pytest.mark.parametrize("targets", ['"linux"', '["linux"]', "[{requires_python = 3}]", '[{gil_disabled = "no"}]'])
+def test_pdm_lock_targets_must_be_tables(capsys, tmp_path, targets):
+    (tmp_path / "pdm.lock").write_text(f"[metadata]\ntargets = {targets}\n", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "`metadata.targets`" in err
+
+
 @pytest.mark.parametrize(
     "marker,target",
     [
@@ -5201,9 +5245,7 @@ def test_poetry_1x_lock_with_its_pyproject_checks_direct_dependencies_everywhere
     assert row["results"]["linux-x86_64"] == "source"
 
 
-def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_has_a_gap(
-    capsys, tmp_path, fake_pypi
-):
+def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_has_a_gap(capsys, tmp_path, fake_pypi):
     # colorama has a pure wheel: needed on Linux or not, the answer is the same.
     lock = POETRY_1X_CLICK_COLORAMA.replace("colorama-0.4.6.tar.gz", "colorama-0.4.6-py2.py3-none-any.whl")
     (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")

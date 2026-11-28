@@ -38,6 +38,7 @@ from .check import (
     explain,
     explain_lines,
     lock_environment_targets,
+    lock_environments_label,
     lock_environments_note,
     marker_holds,
     narrow_to_lock_environments,
@@ -2732,8 +2733,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if unlocked and len(unlocked) < len(targets):
                 if not quiet:
                     print(
-                        f"wheelgap: note: {', '.join(s.label for s in sources if s.supported_markers)} is locked for "
-                        "`[tool.uv] environments` only, which leave out the advisory targets "
+                        f"wheelgap: note: {lock_environments_label(sources)}, which leave out the advisory targets "
                         f"{', '.join(t.label(len({t.python for t in targets}) > 1) for t in targets if t in unlocked)}"
                         ": not checking them",
                         file=sys.stderr,

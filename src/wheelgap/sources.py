@@ -195,6 +195,11 @@ class Source:
     # for those environments only: `uv sync` fails anywhere else, and the lock leaves out the packages and wheels
     # that only other environments need (see check.check_lock_environments).
     supported_markers: list[str] = field(default_factory=list)
+    # pdm.lock only: its [[metadata.targets]] (`pdm lock --platform/--python/--implementation`), each a table of
+    # requires_python, platform, implementation and gil_disabled. `pdm install` refuses an environment none of them
+    # takes ("No compatible lock target found"), and a lock made for a platform keeps only that platform's packages
+    # and wheels (see check.pdm_target_value).
+    pdm_targets: list[dict] = field(default_factory=list)
     # Scripts and pyproject.toml: uv's exclude-newer (#521). A file uploaded at or after the cutoff isn't installed;
     # exclude-newer-package gives the packages it names their own cutoff, or none (uv's `false`: None here).
     exclude_newer: datetime | None = None
@@ -1389,9 +1394,21 @@ def parse_pdm_lock(path: Path) -> Source:
         if inherit_metadata and pkg.files is not None and isinstance(requires, str):
             pkg.locked_requires_python = requires
         _add_once(pkgs, seen, pkg)
+    targets = metadata.get("targets", [])
+    if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets):
+        raise SourceError(f"{path.name}: `metadata.targets` isn't a list of tables")
+    for t in targets:
+        if not all(isinstance(t.get(k, ""), str) for k in ("requires_python", "platform", "implementation")) or (
+            not isinstance(t.get("gil_disabled", False), bool)
+        ):
+            raise SourceError(
+                f"{path.name}: a `metadata.targets` entry needs strings for requires_python, platform and "
+                "implementation, and a boolean gil_disabled"
+            )
     return Source(
         path.name,
         pkgs,
+        pdm_targets=targets,
         pdm_groups=[groups[(pkg.key, pkg.version)] for pkg in pkgs],
         pdm_locked_groups=(
             [canonicalize_name(g) for g in locked_groups if isinstance(g, str)]

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `pdm.lock` made for some targets only (`pdm lock --platform`, `--python` or `--implementation`, recorded as `[[metadata.targets]]`) now covers just those, as for a `uv.lock` with `[tool.uv] environments`: a target outside them is an error naming the targets it does cover, and the default platforms are narrowed to those, instead of false `source` gaps on platforms the lock left out and `pdm install` refuses. (#816)
 - A Poetry 1.x `poetry.lock` (lock-version before 2.1) checked without a readable `pyproject.toml` beside it is now an error where a package the dependency walk leaves out on a target has no wheel there: the lock doesn't say which packages are direct dependencies, which Poetry installs everywhere, so such a gap used to be hidden with no note. (#815)
 - A `poetry.lock` package with `files = []` is now looked up on its index, as Poetry installs it, instead of showing `✗ missing`; one from another index is skipped as `private index`. (#817)
 - `--dockerfile-inputs`: a read `uv pip install` line may also use `--no-break-system-packages`, the explicit negative form of `--break-system-packages`: it doesn't change which exactly pinned distributions or artifacts uv installs, so the answer is unchanged. (#791, thanks [@Seyamalam](https://github.com/Seyamalam))

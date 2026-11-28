@@ -92,7 +92,8 @@ Check every package a lockfile (or a project directory) installs on at least one
 target's Python may be missing wheels for it, so its PyPI packages are also looked up on the index (keeping the
 lock's files if a lookup fails). A `uv.lock` made with `[tool.uv] environments` covers those environments only, so
  a target outside them raises `SourceError`, as on the [command line](inputs.md#uvlock). With no
-`targets`, the default platforms are narrowed to the ones it covers.
+`targets`, the default platforms are narrowed to the ones it covers. A `pdm.lock`'s `[[metadata.targets]]` limit it
+the same way ([pdm.lock](inputs.md#pdmlock)).
 
 - `deps=True` resolves the dependency tree for requirements files, a conda `environment.yml` (its `pip:` list),
   `pyproject.toml` and script (`# /// script`) inputs from

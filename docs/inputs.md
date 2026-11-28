@@ -324,6 +324,19 @@ on the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** `git`, `hg`, `svn`, `bzr`, `path`, `url` and `file` packages.
 
+**Lock targets:** a lock made with `pdm lock --platform`, `--python` or `--implementation` records them as
+`[[metadata.targets]]` (a plain `pdm lock` records the project's `requires-python` there), keeps only the packages and
+wheels those targets need, and `pdm install` fails anywhere else ("No compatible lock target found"). wheelgap
+follows PDM as it does [`[tool.uv] environments`](#uvlock): a target you asked for outside them is an error (exit code
+2) naming the targets the lock doesn't cover and the ones it does, and the built-in default platforms are narrowed to
+the ones it covers, with a note. A target is inside when one lock target takes it, as PDM 2.29 decides: its
+`requires_python` takes the target's Python, its `implementation` (if any) is CPython with the target's
+`gil_disabled`, and its `platform` (if any) has the target's operating system (manylinux, musllinux, macOS or
+Windows) and architecture. The glibc, musl or macOS version doesn't count, since PDM installs a `manylinux_2_40` lock
+on glibc 2.36 too, with a warning. A `requires_python` that holds for some patch releases only (`>=3.13.2` for
+`-p 3.13`), and a platform or key PDM doesn't know, can't be decided: wheelgap says so and stops, also with exit code 2.
+To check a target the lock doesn't cover, add it with `pdm lock --append --platform ... --python ...`.
+
 **Dependency groups:** the same selectors work with PDM's meanings, and configured `groups` apply too. Every group the
 lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups locked with
 `pdm lock -G`) counts, as with a plain `pdm install`; `--no-dev` leaves out `dev` (like `pdm install --without dev`),
