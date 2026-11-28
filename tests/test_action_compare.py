@@ -472,7 +472,12 @@ def test_diff_fix_is_exactly_what_fix_says_for_the_new_lockfile(fake_pypi, gap_w
     nativeext = data["new"][0]["targets"]
     assert {t: side["fix"] for t, side in nativeext.items()} == main["nativeext"]
     assert nativeext["linux-x86_64"]["fix"]["kind"] == "gap_wheel"
-    assert nativeext["musl-aarch64"]["fix"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": False}
+    assert nativeext["musl-aarch64"]["fix"] == {
+        "kind": "none",
+        "reason": "no_newer_release",
+        "abi3_only": False,
+        "build_packages": None,
+    }
     assert data["fix_summary"] == {
         "gaps": 3,
         "upgrade": 1,
@@ -583,6 +588,7 @@ def armlib_how(data):
             "upgrade to 2.0 (needs a==1 in the -c constraints of r.txt relaxed)",
         ),
         ({"kind": "upgrade", "version": "2.0", "constraint": {"allows": True}}, "upgrade to 2.0"),
+        ({"kind": "upgrade", "version": "2.0rc1", "prerelease": True}, "upgrade to 2.0rc1 (a pre-release)"),
         ({"kind": "none", "reason": "loses_wheel"}, "no fix yet: every newer release with a wheel drops one"),
         ({"kind": "none", "reason": "no_newer_release", "abi3_only": True}, "; only abi3 wheels, which free-threaded"),
         ({"kind": "none", "reason": "not_looked_up"}, "newer releases weren't looked up (the log says why)"),

@@ -324,7 +324,12 @@ def test_json_key_only_with_fix(capsys, fake_pypi, gap_wheels):
                 "sha256": "cd" * 32,
                 "unofficial": True,
             },
-            "3.14 win-arm64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+            "3.14 win-arm64": {
+                "kind": "none",
+                "reason": "no_newer_release",
+                "abi3_only": False,
+                "build_packages": None,
+            },
         }
     ]
     for p in data["packages"]:
@@ -1341,12 +1346,28 @@ def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels
     fallback = {"wheel": FIXME_WHEEL, "url": DOWNLOAD + FIXME_WHEEL, "sha256": "ab" * 32, "unofficial": True}
     how = "In requirements.txt, change the pins to fixme==1.4."
     assert fixes["fixme"] == {
-        "win-arm64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": fallback},
-        "win-amd64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": None},
+        "win-arm64": {
+            "kind": "upgrade",
+            "version": "1.4",
+            "prerelease": False,
+            "exclude_newer": None,
+            "how": how,
+            "constraint": None,
+            "gap_wheel": fallback,
+        },
+        "win-amd64": {
+            "kind": "upgrade",
+            "version": "1.4",
+            "prerelease": False,
+            "exclude_newer": None,
+            "how": how,
+            "constraint": None,
+            "gap_wheel": None,
+        },
     }
     assert fixes["nowheels"] == {
         "win-arm64": {"kind": "gap_wheel", **fallback, "wheel": FT_WHEEL, "url": DOWNLOAD + FT_WHEEL},
-        "win-amd64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False},
+        "win-amd64": {"kind": "none", "reason": "no_newer_release", "abi3_only": False, "build_packages": None},
     }
     # The existing keys are unchanged: every filled cell is in gap_wheels, the fallback one too.
     assert [(w["name"], w["target"]) for w in data["gap_wheels"]] == [("fixme", "win-arm64"), ("nowheels", "win-arm64")]
@@ -1407,6 +1428,15 @@ def test_fix_upgrade_for_hash_pinned_requirements_says_to_regenerate(capsys, fak
 def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
     _, out, _ = run(capsys, _fixme_requirements(tmp_path, "fixme<1.3\n"), "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
+
+
+def test_fix_upgrade_for_a_name_required_under_two_markers(capsys, fake_pypi, gap_wheels, tmp_path):
+    # Its `unknown` stand-in is never looked up; the name is still pypi.org's, so --fix suggests the upgrade as it
+    # does for one line (#835 review).
+    path = _fixme_requirements(tmp_path, "fixme>=1.0\nfixme<1.3 ; sys_platform == 'win32'\n")
+    _, out, err = run(capsys, path, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
+    assert "come from PyPI" not in out + err
 
 
 def fixme_uv_lock(specifier):
@@ -1553,7 +1583,12 @@ def test_fix_says_when_only_abi3_wheels_block_free_threaded_python(capsys, fake_
         "free-threaded Python can't use: ask abi3only for a cp314t wheel at https://github.com/example/abi3only/issues\n"
     ) in out
     _, data, _ = gap_wheels_json(capsys, "abi3only==1.0", "-p", "3.14t", "-t", "win-arm64", "--fix")
-    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "no_newer_release", "abi3_only": True}
+    assert data["packages"][0]["fix"]["win-arm64"] == {
+        "kind": "none",
+        "reason": "no_newer_release",
+        "abi3_only": True,
+        "build_packages": None,
+    }
     _, out, _ = run(capsys, "nowheels==0.9", "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert "abi3" not in out  # only when that's the reason
 
@@ -1598,7 +1633,12 @@ def test_fix_counts_packages_not_looked_up_apart_in_json(capsys, fake_pypi, gap_
         "not_looked_up": 2,
         "uv_may_fork": 0,
     }
-    assert data["packages"][0]["fix"]["win-arm64"] == {"kind": "none", "reason": "not_looked_up", "abi3_only": False}
+    assert data["packages"][0]["fix"]["win-arm64"] == {
+        "kind": "none",
+        "reason": "not_looked_up",
+        "abi3_only": False,
+        "build_packages": None,
+    }
 
 
 def pyfork_uv_lock():
@@ -1697,3 +1737,325 @@ def test_fix_uv_may_fork_names_the_script_for_a_script_lock(capsys, fake_pypi, g
     )
     _, out, _ = run(capsys, str(tmp_path / "tool.py.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
     assert f"try uv lock --script {tmp_path / 'tool.py'} --upgrade-package pyfork and run wheelgap again" in out
+
+
+def test_fix_moves_a_pre_release_pin_to_a_final_release(capsys, fake_pypi, gap_wheels, monkeypatch):
+    # grpcio 1.58.0rc1 got 1.59.0rc1 although 1.59.0 has the wheel (#825).
+    arm = "cp314-cp314t-win_arm64"
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "prepin",
+        {
+            "1.0rc1": ["prepin-1.0rc1.tar.gz"],
+            "1.1rc1": [f"prepin-1.1rc1-{arm}.whl"],
+            "1.1": [f"prepin-1.1-{arm}.whl"],
+            "1.2rc1": ["prepin-1.2rc1-cp314-cp314t-win_amd64.whl"],
+        },
+    )
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  prepin 1.0rc1 -> 1.1: win-arm64\nUse prepin==1.1 instead.\n" in out
+    _, data, _ = gap_wheels_json(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert data["packages"][0]["fix"]["win-arm64"]["prerelease"] is False
+    # No final release has the win-amd64 wheel: the pre-release is named, and said to be one.
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
+    assert "  prepin 1.0rc1 -> 1.2rc1 (a pre-release): win-amd64\n" in out
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix", "--markdown")
+    assert "- `prepin 1.0rc1 -> 1.2rc1` (a pre-release): win-amd64\n" in out
+    _, data, _ = gap_wheels_json(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
+    assert data["packages"][0]["fix"]["win-amd64"] | {"how": None} == {
+        "kind": "upgrade",
+        "version": "1.2rc1",
+        "prerelease": True,
+        "exclude_newer": None,
+        "how": None,
+        "constraint": None,
+        "gap_wheel": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "requires,said",
+    [
+        # #823: numpy<2 for Python < 3.13 and numpy>=1.26 for 3.13: only the second applies to a 3.13 target.
+        (
+            [("<1.3", "python_full_version < '3.14'"), (">=1.0", "python_full_version >= '3.14'")],
+            " (within your pyproject.toml constraint fixme>=1.0)",
+        ),
+        ([("<1.3", "python_full_version >= '3.14'")], " (needs pyproject.toml's fixme<1.3 relaxed)"),
+        ([("<1.3", "sys_platform == 'win32'"), (">=1.0", None)], " (needs pyproject.toml's fixme<1.3 relaxed)"),
+        ([("<1.3", "extra == 'old'")], " (needs pyproject.toml's fixme<1.3 relaxed)"),  # uv locks every extra
+        ([("<1.3", "sys_platform == 'linux'")], ""),  # no requirement applies on Windows: nothing to go by
+        ([("<1.3", "platform_release == '6.1'")], ""),  # a marker the target can't decide: no answer
+        ([("<1.3", "platform_release == '6.1'"), (">=1.0", None)], ""),
+    ],
+)
+def test_fix_uv_lock_constraint_applies_only_where_its_marker_holds(
+    capsys, fake_pypi, gap_wheels, tmp_path, requires, said
+):
+    dist = ", ".join(
+        '{ name = "fixme"' + f', specifier = "{spec}"' + (f', marker = "{marker}"' if marker else "") + " }"
+        for spec, marker in requires
+    )
+    lock = fixme_uv_lock(">=1.0").replace(
+        'requires-dist = [{ name = "fixme", specifier = ">=1.0" }]', f"requires-dist = [{dist}]"
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert f"  fixme 1.0 -> 1.3: win-arm64{said}\n" in out
+    _, data, _ = gap_wheels_json(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    constraint = data["packages"][0]["fix"]["win-arm64"]["constraint"]
+    assert (constraint is None) == (not said)
+    if constraint is not None:
+        assert constraint["allows"] == ("within" in said)
+
+
+def test_fix_uv_may_fork_when_the_blocking_requirement_doesnt_apply(capsys, fake_pypi, gap_wheels, tmp_path):
+    # pyfork<2 only below Python 3.14: it doesn't hold 2.0 back on 3.14, so uv may still fork (#823).
+    lock = pyfork_uv_lock().replace(
+        'dependencies = [{ name = "pyfork" }]\n',
+        'dependencies = [{ name = "pyfork" }]\n\n[package.metadata]\n'
+        'requires-dist = [{ name = "pyfork", specifier = "<2", marker = "python_full_version < \'3.14\'" }]\n',
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
+    assert "Maybe, with uv:\n  pyfork 1.0: " in out and "leaves out" not in out
+
+
+CUTLIB = {
+    "1.0": [{"filename": "cutlib-1.0.tar.gz", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}],
+    "1.1": [{"filename": "cutlib-1.1.tar.gz", "upload_time_iso_8601": "2024-07-01T00:00:00Z"}],
+    "2.0": [
+        {
+            "filename": "cutlib-2.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+            "upload_time_iso_8601": "2024-08-18T10:00:00Z",
+        },
+        {"filename": "cutlib-2.0.tar.gz", "upload_time_iso_8601": "2024-08-18T12:00:00Z"},
+    ],
+}
+
+
+def cutlib_uv_lock(options):
+    return (
+        f'version = 1\nrequires-python = ">=3.13"\n\n{options}\n'
+        '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+        'dependencies = [{ name = "cutlib" }]\n\n'
+        '[[package]]\nname = "cutlib"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://files.example/cutlib-1.0.tar.gz" }\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "options,setting",
+    [
+        ('[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n', "exclude-newer"),
+        (
+            '[options]\nexclude-newer = "2030-01-01T00:00:00Z"\n\n'
+            '[options.exclude-newer-package]\nCutLib = "2024-08-01T00:00:00Z"\n',
+            "exclude-newer-package CutLib",
+        ),
+    ],
+)
+def test_fix_says_a_release_past_exclude_newer_needs_the_cutoff_moved(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options, setting
+):
+    # #822: 2.0 has the wheel but was uploaded after the lock's exclude-newer, so uv lock can't pick it as it stands.
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
+    args = [str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert (
+        f"  cutlib 1.0 -> 2.0: linux-x86_64 (needs uv's {setting} moved past 2024-08-18T12:00:00Z)\n"
+        f"First move uv's {setting} (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z: cutlib==2.0 was uploaded after "
+        "its cutoff, so uv can't pick it before that.\n"
+        f"In {tmp_path}, run uv lock --upgrade-package cutlib, then uv sync"
+    ) in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    cell = data["packages"][0]["fix"]["linux-x86_64"]
+    assert cell["version"] == "2.0" and cell["how"].startswith(f"First move uv's {setting} ")
+    assert cell["exclude_newer"] == {
+        "setting": setting,
+        "cutoff": "2024-08-01T00:00:00Z",
+        "span": None,
+        "move_past": "2024-08-18T12:00:00Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "",
+        '[options]\nexclude-newer = "2024-09-01T00:00:00Z"\n',
+        '[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n\n[options.exclude-newer-package]\ncutlib = false\n',
+    ],
+)
+def test_fix_upgrade_within_exclude_newer_needs_no_move(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
+    args = [str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert "  cutlib 1.0 -> 2.0: linux-x86_64\n" in out and "First move" not in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    assert data["packages"][0]["fix"]["linux-x86_64"]["exclude_newer"] is None
+
+
+@pytest.mark.parametrize(
+    "options,setting",
+    [
+        ('[options]\nexclude-newer = "last week-ish"\n', "the exclude-newer"),
+        ("[options.exclude-newer-package]\nCutLib = { since = 3 }\n", "the exclude-newer-package for CutLib"),
+        ('[options]\nexclude-newer-span = "P3Q"\n', "the exclude-newer"),
+    ],
+)
+def test_fix_looks_nothing_up_when_the_locks_exclude_newer_cant_be_read(
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options, setting
+):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert (
+        f"Newer releases of cutlib weren't looked up: wheelgap can't read {setting} that uv recorded in uv.lock.\n"
+        in out
+    )
+    assert not [url for url in fake_pypi if url.endswith("/cutlib/json")]
+
+
+# numpy as PyPI has it, for the real locks in tests/fixtures/uvspan and uvspanpackage (uv 0.13.1, numpy pinned at
+# 1.26.4, which has no cp313 wheel): 2.1.0 is the first release with one, uploaded after an 850-day cutoff.
+SPAN_NUMPY = {
+    "1.26.4": [{"filename": "numpy-1.26.4.tar.gz", "upload_time_iso_8601": "2024-02-06T00:26:44Z"}],
+    "2.0.1": [{"filename": "numpy-2.0.1.tar.gz", "upload_time_iso_8601": "2024-07-21T13:58:00Z"}],
+    "2.1.0": [
+        {
+            "filename": "numpy-2.1.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+            "upload_time_iso_8601": "2024-08-18T21:00:00Z",
+        },
+        {"filename": "numpy-2.1.0.tar.gz", "upload_time_iso_8601": "2024-08-18T22:13:47Z"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "folder,setting",
+    [
+        # [options] exclude-newer-span = "P850D", from exclude-newer = "850 days"
+        ("uvspan", "exclude-newer"),
+        # [options.exclude-newer-package] numpy = { timestamp = "0001-01-01T00:00:00Z", span = "P850D" }
+        ("uvspanpackage", "exclude-newer-package numpy"),
+    ],
+)
+def test_fix_reads_the_durations_uv_records_in_a_lock(
+    capsys, fake_pypi, gap_wheels, fixtures, monkeypatch, folder, setting
+):
+    # A duration counts back from the time uv locks: the output names it, never the time it gives this run (#822).
+    from datetime import UTC, datetime
+
+    from wheelgap import cutoff
+
+    monkeypatch.setitem(FAKE_INDEX, "numpy", SPAN_NUMPY)
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2026, 11, 28, tzinfo=UTC))  # 850 days: 2024-07-31
+    args = [str(fixtures / folder / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert (
+        "  numpy 1.26.4 -> 2.1.0: linux-x86_64 (within your pyproject.toml constraint numpy>=1.26; "
+        f"needs uv's {setting} span (P850D) shortened, or set to a time past 2024-08-18T22:13:47Z)\n"
+        f"First shorten uv's {setting} span (P850D), or set it to a time past 2024-08-18T22:13:47Z: "
+        "numpy==2.1.0 was uploaded after its cutoff, so uv can't pick it before that.\n"
+    ) in out
+    assert "2024-07-31" not in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    cell = data["packages"][0]["fix"]["linux-x86_64"]
+    assert cell["exclude_newer"] == {
+        "setting": setting,
+        "cutoff": None,
+        "span": "P850D",
+        "move_past": "2024-08-18T22:13:47Z",
+    }
+    assert "2024-07-31" not in cell["how"]
+    # A shorter duration reaches 2.1.0: within the cutoff, nothing to move.
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2026, 12, 20, tzinfo=UTC))
+    _, out, _ = run(capsys, *args)
+    assert "  numpy 1.26.4 -> 2.1.0: linux-x86_64 (within your pyproject.toml constraint numpy>=1.26)\n" in out
+
+
+def test_fix_on_a_pyproject_applies_its_exclude_newer(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["cutlib>=1.0"]\n\n'
+        '[tool.uv]\nexclude-newer = "2024-08-01T00:00:00Z"\n',
+        encoding="utf-8",
+    )
+    _, out, _ = run(capsys, str(tmp_path / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert (
+        "  cutlib 1.1 -> 2.0: linux-x86_64 (within your pyproject.toml constraint cutlib>=1.0; needs uv's "
+        "exclude-newer moved past 2024-08-18T12:00:00Z)\n"
+        "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z:"
+    ) in out
+    assert "change the requirements" not in out  # its range already allows 2.0: only the cutoff holds it back
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_fix_constraint_note_is_per_target(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, order):
+    # permark<2 on Windows, permark>=1 elsewhere: one note for both targets was right for one of them only (#823).
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "permark",
+        {
+            "1.0": ["permark-1.0.tar.gz"],
+            "2.0": ["permark-2.0-cp314-cp314t-win_arm64.whl", "permark-2.0-cp314-cp314t-musllinux_1_2_x86_64.whl"],
+        },
+    )
+    dist = [
+        '{ name = "permark", specifier = "<2", marker = "sys_platform == \'win32\'" }',
+        '{ name = "permark", specifier = ">=1", marker = "sys_platform != \'win32\'" }',
+    ][::order]
+    lock = fixme_uv_lock(">=1.0").replace("fixme", "permark")
+    lock = lock.replace(
+        'requires-dist = [{ name = "permark", specifier = ">=1.0" }]', f"requires-dist = [{', '.join(dist)}]"
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    targets = ",".join(["musl-x86_64", "win-arm64"][::order])
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", targets, "--fix")
+    assert "  permark 1.0 -> 2.0: musl-x86_64 (within your pyproject.toml constraint permark>=1)\n" in out
+    assert "  permark 1.0 -> 2.0: win-arm64 (needs pyproject.toml's permark<2 relaxed)\n" in out
+
+
+def test_fix_says_first_move_once_for_every_cutoff_setting(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from wheelgap import cutoff
+
+    monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "cutlib2",
+        {v: [{**f, "filename": f["filename"].replace("cutlib", "cutlib2")} for f in fs] for v, fs in CUTLIB.items()},
+    )
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2024, 8, 10, tzinfo=UTC))
+    lock = cutlib_uv_lock(
+        '[options]\nexclude-newer = "2024-08-01T00:00:00Z"\n\n'
+        '[options.exclude-newer-package]\ncutlib2 = { timestamp = "0001-01-01T00:00:00Z", span = "P3D" }\n'
+    )
+    lock = lock.replace(
+        'dependencies = [{ name = "cutlib" }]', 'dependencies = [{ name = "cutlib" }, { name = "cutlib2" }]'
+    )
+    lock += lock[lock.index('[[package]]\nname = "cutlib"') :].replace("cutlib", "cutlib2")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
+    assert out.count("First ") == 1
+    assert (
+        "First move uv's exclude-newer (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z, and shorten uv's "
+        "exclude-newer-package cutlib2 span (P3D), or set it to a time past 2024-08-18T12:00:00Z: cutlib==2.0, "
+        "cutlib2==2.0 were uploaded after their cutoff, so uv can't pick them before that.\n"
+    ) in out
+    assert "2024-08-07" not in out  # the time P3D gives this run
+
+
+@pytest.mark.parametrize(
+    "line,what", [("x", "requirements"), ("x>=1", "requirements"), ("x==1", "pins"), ("x==1.*", "requirements")]
+)
+def test_fix_deps_says_pins_only_for_a_line_that_pins(line, what):
+    # --deps resolves every line to one release; a bare name or a range is still not a pin to change.
+    target = build_targets(["3.14t"], ["win-arm64"])[0]
+    source = Source("requirements.txt", kind="requirements", specs=[line], deps_paths={target: {}})
+    cell = fix.Cell(Row(Package("x", "1"), {target: Status.SOURCE}), target, source, fix.UPGRADE, "2")
+    assert fix.how(source, [cell]) == [f"In requirements.txt, change the {what} to x==2."]

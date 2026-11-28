@@ -440,9 +440,25 @@ fully pinned file (from Rye, `uv pip compile`, `pip-compile` or `uv export`): it
 doesn't resolve dependencies. Rye's default (non-universal) locks are resolved for the machine that created them and
 carry no platform markers.
 
-**Read:** requirement lines with their markers, and files included with `-r` / `--requirement`. A pinned line
+**Read:** requirement lines with their markers, and files included with `-r` / `--requirement` (or an abbreviation
+pip accepts, such as `--requirem`; `--cons` is `--constraint`, and `--req`, which pip refuses as ambiguous, is an
+input error). A pinned line
 (`numpy==2.3.4`) is checked at that version; a range or a bare name uses the newest matching release (see
 [How it works](how-it-works.md#version-ranges)).
+
+**A name required twice** (on two lines, or in the file and a `-r` file) is checked as pip and uv install it: one
+release that every line whose marker holds allows. With `numpy==1.26.4` in `base.txt` and `numpy>=1.20` in the file,
+only numpy 1.26.4 is checked. Ranges are intersected, and a pin is kept when every other line allows it. Lines that no
+release satisfies together (`numpy==2.3.0` and `numpy<2`, or `numpy>=2` and `numpy<2`) are `unknown`, since pip and uv
+refuse them. Lines under different markers are decided per target, with the lines that hold there:
+`numpy>=1.20` and `numpy<2; sys_platform == "win32"` check the newest numpy on Linux and the newest 1.x on Windows,
+and the forks `uv pip compile --universal` writes (`python_full_version < '3.10'`, `platform_machine != 'x86_64'`)
+each take their own targets. Where a target can't decide a marker (`platform_machine` on `linux-armv7l`, a patch
+release such as `python_full_version >= '3.13.2'` on Python 3.13), the answer stands only if that line can't change
+it: it asks the same as a line that holds, or it allows the release checked. Otherwise that target is `unknown`. A
+name both on an index line and as `name @ URL` is the URL's, skipped. Two lines with different `--hash` options are
+`unknown` too: pip filters the files by the hashes they all list and checks the download against the first line's, so
+the line order decides.
 
 **`--no-binary` and `--only-binary`** lines (`:all:`, `:none:` or package names) apply as pip applies them, in order
 and to every requirement, including those in `-r` and `-c` files: with `--no-binary` a package's wheels are ignored
@@ -475,9 +491,14 @@ Listing only the sdist's hash gives `source`, as pip and uv build it then; listi
 `missing`. If no file of the release has a listed hash, the package is `unknown` (`none of the hashes in
 requirements.txt matches a file of NAME VERSION`), as pip refuses the download. `--explain` names each wheel left
 out: `its hash isn't listed in requirements.txt`. As pip does, a file the index gives no `sha256` for (some mirrors
-behind `WHEELGAP_INDEX_URL`) isn't left out, since pip checks it after the download. Not read yet, so the answer is
-the one without them: `sha384` and `sha512` hashes (PyPI gives no such digest), `--hash` in a constraints file, and
-the lookups of [`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
+behind `WHEELGAP_INDEX_URL`) isn't left out, since pip checks it after the download. A requirement whose hashes are
+all `sha384` or `sha512` is `unknown` (`requirements.txt:3 lists sha512 hashes for NAME, which wheelgap can't match`):
+PyPI gives no such digest, and pip checks them against the file it picks, so wheelgap can't tell which file pip
+accepts. Beside `sha256` ones they count per target: where a file with a listed `sha256` fits, pip installs one of
+those, as with the `sha256` ones alone; where none fits, pip checks its pick against the others too, so the target is
+`unknown`.
+Not read yet, so the answer is the one without them: `--hash` in a constraints file, and the lookups of
+[`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
 files come from the index.
 
 Other options after a requirement are read as pip 26.3 reads them there. pip parses them and then
@@ -502,8 +523,9 @@ range leaves out, or an exact constraint that the requirement's range or another
 reported `unknown` and the run fails. Versions match as pip matches them: `==1.9` and `==1.9.0` agree, and `==1.0`
 with `==1.0+cpu` is `1.0+cpu`. A constraint wheelgap can't apply leaves the package `unknown` rather than guessed: one
 with an environment marker (unless the requirement is pinned to a version it allows), a URL or path, or two exact
-versions that disagree. Constraint files given as a URL or an environment variable (`-c https://…`,
-`-c ${PIP_CONSTRAINT}`) are skipped.
+versions that disagree. A constraints file given as a URL or through an environment variable (`-c https://…`,
+`-c ${PIP_CONSTRAINT}`) is an input error naming the file and line: pip reads it, and its pins could change any
+requirement's release, but wheelgap doesn't download it or fill in the variable. Save the file and name it by its path.
 
 A `-r FILE` line inside a constraints file is read as pip reads it: `FILE` is a requirements file, so its packages
 are checked, while the constraints file's own lines stay constraints. A `-c` inside any file is a constraints file.
@@ -579,7 +601,9 @@ wheelgap pyproject.toml --extra test --deps -t win-arm64 --explain
 ```
 
 Each requirement is read like a line of a requirements file, so ranges and bare names use the newest matching release
-and markers are respected. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
+and markers are respected. A name required twice, in `dependencies` or in it and a selected extra or group, is checked
+as in a requirements file: `numpy>=1.20` and `numpy==1.26.4` check numpy 1.26.4 only, and lines under different
+markers are decided per target. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
 several it can pick a different release per Python ([how it works](how-it-works.md)). A bare name always checks the
 latest release, even for a `-p` version that can't install it, so it can show false gaps. Only direct
 dependencies are checked by default and wheelgap prints a note saying so. Add [`--deps`](cli.md#deps) to resolve them
