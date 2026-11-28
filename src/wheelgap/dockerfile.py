@@ -1605,23 +1605,40 @@ def _names_in_folder(copies: list[_Copy], dirs: set[str], folder: str) -> list[t
     return names
 
 
+_UNRESOLVED = ("$", "`", "~")  # a path that starts with a variable, a command substitution or a tilde
+
+
 def _may_carry_package_json(
-    copies: list[_Copy], dirs: set[str], folder: str, named: list[tuple[int, str, str | None]]
+    copies: list[_Copy],
+    dirs: set[str],
+    folder: str,
+    mentions: list[tuple[int, str, str | None]],
+    created: list[tuple[int, str, str | None]],
 ) -> bool:
     """Whether a package.json may be in `folder` of the image: an entry the COPY instructions so far may put there
-    (_names_in_folder), an earlier command that wheelgap doesn't read and that names the folder, a parent of it or its
-    package.json (`named`: the mentions and created folders, with the folder each ran in), or one wheelgap can't list
-    — an unreadable COPY or ADD, or a COPY --from whose tree reaches it. npm runs the scripts of a project's workspaces
-    and file: dependencies for a named install too, so a local `npm install X` is only a plain program while no
-    package.json can be in its working folder yet."""
+    (_names_in_folder), an earlier command that wheelgap doesn't read and that may write the folder, a parent of it
+    or a package.json (`mentions`, with the folder each ran in), a mkdir, touch, ln or install that names its
+    package.json (`created`: a mkdir of the folder itself adds no file), or one wheelgap can't list — an unreadable
+    COPY or ADD, or a COPY --from whose tree reaches it. npm runs the scripts of a project's workspaces and file:
+    dependencies for a named install too, so a local `npm install X` is only a plain program while no package.json
+    can be in its working folder yet."""
     if any(name == "package.json" for name, _ in _names_in_folder(copies, dirs, folder)):
         return True
     target = posixpath.join(folder, "package.json")
-    for _, text, cwd in named:
+    for _, text, cwd in mentions:
+        if posixpath.basename(text.rstrip("/")) == "package.json" or text.startswith(_UNRESOLVED):
+            return True  # a package.json by name (a download's URL too), or a path wheelgap can't resolve
         if cwd is None and not text.startswith("/"):
             return True  # a relative name in a folder wheelgap doesn't know
         path = posixpath.normpath(posixpath.join(cwd or "/", text))
-        if path in (folder, target) or folder.startswith(path.rstrip("/") + "/"):
+        if fnmatch.fnmatchcase(folder, path) or fnmatch.fnmatchcase(target, path):
+            return True
+        if folder.startswith(path.rstrip("/") + "/"):
+            return True
+    for _, text, cwd in created:
+        if text.startswith(_UNRESOLVED) or (cwd is None and not text.startswith("/")):
+            return True
+        if fnmatch.fnmatchcase(target, posixpath.normpath(posixpath.join(cwd or "/", text))):
             return True
     for copy in copies:
         if copy.error:
@@ -3295,8 +3312,9 @@ class _RunReader:
             # Without an explicit prefix npm's project is the nearest folder up the tree with a package.json, so
             # one in any folder above the working folder is the project's own code too.
             folders = [folder] if explicit else list(_up_the_tree(folder))
-            named = [*self.mentions, *self.created]
-            empty = not any(_may_carry_package_json(self.copies, self.dirs, each, named) for each in folders)
+            empty = not any(
+                _may_carry_package_json(self.copies, self.dirs, each, self.mentions, self.created) for each in folders
+            )
         if spelling := _project_script(base, texts, stdin, empty):
             return "project-scripts", (spelling, shown)
         if base in _PROGRAMS:

@@ -5142,8 +5142,18 @@ def test_dockerfile_requirements_warns_about_a_local_npm_install_with_a_package_
         ("RUN git clone https://example.com/web.git /srv/web && cd /srv/web && npm install left-pad\n", True),
         # A package.json written by an earlier RUN into the working folder.
         ("RUN printf '{}' > /app/package.json\nRUN npm install left-pad\n", True),
+        # A package.json downloaded into the working folder: the URL names it.
+        ("RUN wget -q https://example.com/web/package.json && npm install left-pad\n", True),
+        # An empty package.json made by touch.
+        ("RUN touch /app/package.json\nRUN npm install left-pad\n", True),
+        # An archive unpacked into a parent of the install folder.
+        ("RUN tar xf /tmp/web.tar -C /srv && cd /srv/web && npm install left-pad\n", True),
+        # A glob that matches the install folder.
+        ("RUN cp -r /tmp/web/. /srv/w* && cd /srv/web && npm install left-pad\n", True),
         # An earlier RUN in an unrelated folder leaves the npm install a plain program.
         ("RUN mkdir -p /srv/other\nRUN npm install left-pad\n", False),
+        # So does a mkdir of the working folder itself: it adds no package.json.
+        ("RUN mkdir -p /app/cache /app\nRUN npm install left-pad\n", False),
     ],
 )
 def test_dockerfile_requirements_checks_package_json_made_by_an_earlier_run(tmp_path, body, warns):
