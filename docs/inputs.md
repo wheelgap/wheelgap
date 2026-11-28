@@ -268,9 +268,10 @@ Poetry constraint that isn't a PEP 440 specifier (`^3.9`), restrict nothing. Wit
 the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** packages whose source type is `git`, `hg`, `svn`, `bzr`, `directory`, `file` or `url`. A package from
-another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. Old locks that record only
-hashes and no file names are looked up on the index; packages in them from another index are skipped as
-`private index`.
+another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. A package with no file names
+(old locks that record only hashes, or `files = []`, which Poetry writes when the source gave it no hashes) is looked
+up on the index, since Poetry then installs the best file the index has; such a package from another index is skipped
+as `private index`.
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`

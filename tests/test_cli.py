@@ -898,6 +898,32 @@ def test_poetry_lock_private_index_with_no_files_is_not_looked_up(capsys, tmp_pa
     assert not any("acme" in url for url in fake_pypi)
 
 
+def test_poetry_lock_empty_files_are_looked_up_on_the_index(capsys, tmp_path, fake_pypi):
+    # Poetry writes `files = []` when the source gave it no hashes, and then installs the best file the index has.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "fastlib"\nversion = "2.0.0"\ndescription = ""\noptional = false\n'
+        'python-versions = ">=3.9"\ngroups = ["main"]\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err  # used to be "missing", as if the release had no files at all
+    assert json.loads(out)["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+    assert any("fastlib" in url for url in fake_pypi)
+
+
+def test_poetry_lock_empty_files_from_a_private_index_are_skipped(capsys, tmp_path, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "fastlib"\nversion = "2.0.0"\ngroups = ["main"]\nfiles = []\n\n'
+        '[package.source]\ntype = "legacy"\nurl = "https://pkgs.example.com/simple"\nreference = "private"\n\n'
+        '[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err
+    assert json.loads(out)["skipped"] == [{"name": "fastlib", "reason": "private index"}]
+    assert fake_pypi == []
+
+
 def test_offline_allows_a_private_index_package_with_no_files(capsys, tmp_path, fake_pypi):
     # fill_all skips it without contacting any index, so --offline has nothing to refuse.
     path = tmp_path / "poetry.lock"

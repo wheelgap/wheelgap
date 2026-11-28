@@ -1174,13 +1174,13 @@ def parse_poetry_lock(path: Path) -> Source:
             url = p.get("source", {}).get("url")
             pkg.registry = url if isinstance(url, str) else None
             entries = p.get("files")
-            if entries is None:
+            if not entries:
                 entries = legacy_files.get(p["name"])
-            # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
-            # packages from another index are skipped (fill_all).
-            pkg.files = (
-                None if entries is None else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
-            )
+            # No files recorded (old [metadata.hashes] locks, or `files = []`, which Poetry writes when the source
+            # gave it no hashes): Poetry installs the best file the index has, unchecked (`if not package.files:
+            # return ordered_links[0]` in poetry/installation/chooser.py). So PyPI packages are looked up on the
+            # index and packages from another index are skipped (fill_all), rather than read as having no files.
+            pkg.files = None if not entries else [f for f in (_filename(e, path.name, pkg.name) for e in entries) if f]
         edges[len(pkgs)] = _poetry_edges(p)
         requires = p.get("python-versions")
         # Not before 2.1: a direct dependency's Python marker is only in pyproject.toml there, so the range could
