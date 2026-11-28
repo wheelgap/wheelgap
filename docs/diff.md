@@ -72,6 +72,13 @@ Both lockfiles are checked and packages are matched by name. Per target:
   index) is "skipped" on that target and treated like `unknown`. Skipped on both sides is unchanged. A new skipped
   package counts as a new gap, except a uv `virtual` project, which installs nothing.
 - A package listed more than once (a `uv.lock` fork) takes its worst status on each target.
+- **After 0.14.0**, a target whose Python either lockfile's `requires-python` leaves out (`-p 3.13` for a lock
+  made for `>=3.14`) isn't compared, and a note on stderr says so. A lock isn't made for a Python outside its range:
+  uv keeps only the wheels that range can use, and the main command
+  [looks its PyPI packages up again](how-it-works.md#index-lookups) for that Python but can't do that for packages
+  from another index, so a lock that moved its packages to a mirror would look as if they all lost their wheels
+  there. Nothing on such a target counts as worse. When every target is left out, the report says "Nothing was
+  compared." rather than "Nothing got worse."
 
 With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source, is
 missing or couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
@@ -119,6 +126,9 @@ it at that ref, if any), so its format is detected and read as usual. `PATH` is 
   package in; absent for a direct dependency or an input without a dependency graph;
 - `unchecked`: the names of packages that were `unknown` on both sides of a target at the same version, so neither
   side could be checked there;
+- `not_compared` (**after 0.14.0**): the targets left out because either lockfile's `requires-python` leaves out
+  their Python ([above](#what-counts-as-worse)), each with its `target` label, the `sides` that leave it out (`old`,
+  `new` or both) and a `reason`;
 - `summary`: the `worse` and `new` counts;
 - `fix` (on each target of `worse` and `new`, with `--fix`, **after 0.14.0**): that gap's way out, as `fix` in the
   main command's [`--json`](output.md#json) has it (`kind` `upgrade`, `gap_wheel` or `none`); absent for an `unknown`

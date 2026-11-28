@@ -15,6 +15,8 @@ doesn't import wheelgap.
   code is the step's result: 0 only when `wheelgap diff` exited 0 with a valid report listing nothing, 1 when it
   exited 1 with a valid report listing something, and 2 for anything else (no report, an error, or an exit code that
   disagrees with the report), so the step never passes on a guess.
+  Targets `wheelgap diff` didn't compare (its `not_compared`: a Python a lockfile's requires-python leaves out) are
+  listed after the counts with the reason, and never count as worse.
 - `pick` prints the id of this lockfile's comment from `gh api --paginate` output: the first one by `--login`
   (the token's own identity) whose body starts with the marker. Anyone else's comment is never edited.
 - `log` copies wheelgap's stderr to stdout with anything the Actions runner would run as a workflow command
@@ -202,8 +204,10 @@ def rows(data: dict, *, suggestions: bool = False, fixes: bool = False) -> list[
     return out
 
 
-def counts(n_worse: int, n_new: int) -> str:
+def counts(n_worse: int, n_new: int, compared: bool = True) -> str:
     """As `wheelgap diff` words its last line."""
+    if not compared:
+        return "Nothing was compared."
     if not n_worse and not n_new:
         return "Nothing got worse."
     parts = []
@@ -225,7 +229,37 @@ def _valid(data: object) -> bool:
             return False
         if not all(isinstance(pkg.get(k, []), list) for k in ("versions", "old_versions", "new_versions")):
             return False
-    return isinstance(data.get("unchecked", []), list)
+    if not isinstance(data.get("unchecked", []), list) or not isinstance(data.get("not_compared", []), list):
+        return False
+    return all(
+        isinstance(entry, dict) and isinstance(entry.get("target"), str) and isinstance(entry.get("reason"), str)
+        for entry in data.get("not_compared", [])
+    )
+
+
+def compared(data: dict) -> bool:
+    """False only when the report says it left out every target it was given (`not_compared`)."""
+    targets = data.get("targets")
+    labels = [t.get("label") for t in targets if isinstance(t, dict)] if isinstance(targets, list) else []
+    left_out = [entry.get("target") for entry in data.get("not_compared", [])]
+    return not labels or any(label not in left_out for label in labels)
+
+
+def not_compared_lines(data: dict) -> list[str]:
+    """The targets `wheelgap diff` left out, grouped by its reason: a note, not a failure."""
+    by_reason: dict[str, list[str]] = {}
+    for entry in data.get("not_compared", []):
+        by_reason.setdefault(entry["reason"], []).append(entry["target"])
+    out = []
+    for reason, targets in by_reason.items():
+        names = ", ".join(code(t) for t in targets[:MAX_UNCHECKED])
+        if len(targets) > MAX_UNCHECKED:
+            names += f" and {len(targets) - MAX_UNCHECKED} more"
+        out.append(
+            f"<p>Not compared: {names}. {code(reason, MAX_MESSAGE)}: a lock isn't made for a Python outside its "
+            "requires-python, so nothing there counts as worse.</p>"
+        )
+    return out
 
 
 def load(path: str, exit_code: int) -> tuple[dict | None, str]:
@@ -265,13 +299,15 @@ def report(
         with_ = f"the base branch ({code(base)})" if base else "the base branch"
     else:
         with_ = code(base)
-    compared = f"Compared {code(lockfile)}{at} with {with_}."
+    compared_with = f"Compared {code(lockfile)}{at} with {with_}."
     header = ["### wheelgap diff", ""]
     if data is None:
-        return "\n".join([*header, f"<p>{compared} The check couldn't run: {problem}</p>", ""])
+        return "\n".join([*header, f"<p>{compared_with} The check couldn't run: {problem}</p>", ""])
     listed = bool(data["worse"] or data["new"])
     resolved = "<b>Resolved.</b> " if comment and not listed else ""
-    header.append(f"<p>{resolved}{compared} {counts(len(data['worse']), len(data['new']))}</p>")
+    header.append(f"<p>{resolved}{compared_with} {counts(len(data['worse']), len(data['new']), compared(data))}</p>")
+    if skipped := not_compared_lines(data):
+        header += ["", *skipped]
     footer = [""]
     unchecked = data.get("unchecked", [])
     if unchecked:
@@ -434,7 +470,10 @@ def run(args: argparse.Namespace) -> int:
     if data is None:
         print("wheelgap: couldn't compare the lockfiles; the job summary and the log above say why.")
         return 2
-    print(f"wheelgap: {counts(len(data['worse']), len(data['new']))} The job summary has the details.")
+    left_out = len(data.get("not_compared", []))
+    skipped = f" {left_out} target{'s' * (left_out != 1)} not compared." if left_out else ""
+    said = counts(len(data["worse"]), len(data["new"]), compared(data))
+    print(f"wheelgap: {said}{skipped} The job summary has the details.")
     return 1 if data["worse"] or data["new"] else 0
 
 
