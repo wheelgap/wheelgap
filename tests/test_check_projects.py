@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from wheelgap import make_targets
 
@@ -1170,7 +1171,22 @@ class FakePoetry:
                 "matching platform tag (e.g., `manylinux_2_36_x86_64`) and you require b==1.0, we can conclude that "
                 "your requirements are unsatisfiable.\n"
             )
-        return 0, "".join(f"{n}==1.0\n" for n in "ade" if f"{n}==1.0" in text)
+        # Like uv: a pin whose marker is false for the target isn't in the output.
+        platform = cmd[cmd.index("--python-platform") + 1]
+        env = {
+            "python_version": cmd[cmd.index("--python-version") + 1],
+            "python_full_version": cmd[cmd.index("--python-version") + 1] + ".0",
+            "sys_platform": "win32" if "windows" in platform else "darwin" if "apple" in platform else "linux",
+            "extra": "",
+        }
+        listed = []
+        for line in text.splitlines():
+            if not line or line.startswith("-"):
+                continue
+            req = Requirement(line)
+            if req.marker is None or req.marker.evaluate(env):
+                listed.append(f"{req.name}=={next(iter(req.specifier)).version}\n")
+        return 0, "".join(listed)
 
 
 def _poetry_entry(tmp_path, lock=POETRY_LOCK, pyproject=POETRY_PYPROJECT):
@@ -1335,8 +1351,14 @@ def test_poetry_groups(tmp_path):
 def test_poetry_env_isolates_poetry(tmp_path, monkeypatch):
     monkeypatch.setenv("POETRY_REPOSITORIES_X_URL", "https://x.test/simple")
     monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pip.test/simple")
+    monkeypatch.setenv("PYTHONPATH", "/somewhere/else")
+    monkeypatch.setenv("PYTHONHOME", "/somewhere/else")
+    monkeypatch.setenv("VIRTUAL_ENV", "/somewhere/venv")
     env = script.poetry_env(tmp_path)
     assert "POETRY_REPOSITORIES_X_URL" not in env and "NO_PROXY" not in env
+    assert not any(k.startswith("PIP_") for k in env)
+    assert {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"}.isdisjoint(env)
     assert env["POETRY_CONFIG_DIR"] == str(tmp_path / "config") and (tmp_path / "config").is_dir()
     assert env["PYTHON_KEYRING_BACKEND"] == "keyring.backends.null.Keyring"
 
@@ -1375,23 +1397,27 @@ def test_poetry_1x_lock_default_mode_is_not_compared(tmp_path):
     assert any(c.mode == "all" and c.verdict == "agree" for c in cells)
 
 
+# e: in the `fancy` extra, only on Python 3.10 and later, as textual's tree-sitter packages are in `syntax`.
+E_LOCK = POETRY_LOCK.replace(
+    "[metadata]",
+    '[[package]]\nname = "e"\nversion = "1.0"\ndescription = ""\noptional = true\npython-versions = ">=3.10"\n'
+    'groups = ["main"]\nmarkers = "python_version >= \\"3.10\\" and extra == \\"fancy\\""\n'
+    'files = [{file = "e-1.0-py3-none-any.whl", hash = "sha256:00"}]\n\n[extras]\nfancy = ["e"]\n\n[metadata]',
+)
+E_PYPROJECT = POETRY_PYPROJECT.replace(
+    "\n[tool.poetry.group.dev",
+    '\ne = {version = "1.0", optional = true, python = ">=3.10"}\n\n[tool.poetry.extras]\nfancy = ["e"]\n'
+    "\n[tool.poetry.group.dev",
+)
+E_EXPORTED = 'e==1.0 ; python_version >= "3.10"\n'  # Poetry has decided the extra: only the Python condition is left
+
+
 def test_poetry_extra_superset_is_not_compared(tmp_path, monkeypatch):
     """With no extra selected, wheelgap keeps a package whose marker joins an extra to another condition (Poetry
     2.0-2.2 install it without the extra) and says so; Poetry 2.5.2's export leaves it out. That is wheelgap's
     superset by design, not compared; the same package with the extra selected ("all") is compared as usual."""
-    lock = POETRY_LOCK.replace(
-        "[metadata]",
-        '[[package]]\nname = "e"\nversion = "1.0"\ndescription = ""\noptional = true\npython-versions = ">=3.10"\n'
-        'groups = ["main"]\nmarkers = "python_version >= \\"3.10\\" and extra == \\"fancy\\""\n'
-        'files = [{file = "e-1.0-py3-none-any.whl", hash = "sha256:00"}]\n\n[extras]\nfancy = ["e"]\n\n[metadata]',
-    )
-    pyproject = POETRY_PYPROJECT.replace(
-        "\n[tool.poetry.group.dev",
-        '\ne = {version = "1.0", optional = true, python = ">=3.10"}\n\n[tool.poetry.extras]\nfancy = ["e"]\n'
-        "\n[tool.poetry.group.dev",
-    )
-    monkeypatch.setitem(EXPORTED, "all", EXPORTED["all"] + 'e==1.0 ; python_version >= "3.10" and extra == "fancy"\n')
-    entry = _poetry_entry(tmp_path, lock=lock, pyproject=pyproject)
+    monkeypatch.setitem(EXPORTED, "all", EXPORTED["all"] + E_EXPORTED)
+    entry = _poetry_entry(tmp_path, lock=E_LOCK, pyproject=E_PYPROJECT)
     cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, FakePoetry(), workers=1)
     got = {(c.mode, c.package): (c.wheelgap, c.answer, c.verdict) for c in cells if c.package == "e==1.0"}
     assert got == {
@@ -1402,3 +1428,98 @@ def test_poetry_extra_superset_is_not_compared(tmp_path, monkeypatch):
         script.POETRY_KEPT_FOR_EVERY_EXTRA
     ]
     assert {c.verdict for c in cells if c.package != "e==1.0"} == {"agree"}
+
+
+def test_poetry_extra_superset_needs_the_all_export_on_that_target(tmp_path, monkeypatch):
+    """The superset rule only covers a package Poetry installs with every extra on the same target: if the "all"
+    export leaves it out there (here its marker is false on Windows), the default cell is still a disagreement."""
+    monkeypatch.setitem(
+        EXPORTED, "all", EXPORTED["all"] + 'e==1.0 ; python_version >= "3.10" and sys_platform != "linux"\n'
+    )
+    entry = _poetry_entry(tmp_path, lock=E_LOCK, pyproject=E_PYPROJECT)
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, FakePoetry(), workers=1)
+    got = {(c.mode, c.package): (c.wheelgap, c.answer, c.verdict) for c in cells if c.package == "e==1.0"}
+    assert got == {
+        ("all", "e==1.0"): ("wheel", "absent", "disagree"),
+        ("default", "e==1.0"): ("wheel", "absent", "disagree"),
+    }
+
+
+def test_poetry_extra_superset_never_hides_a_package_wheelgap_misses(tmp_path, monkeypatch):
+    """The other direction: wheelgap leaves out a package the export installs. That disagrees, extra or not."""
+    monkeypatch.setitem(EXPORTED, "all", EXPORTED["all"] + E_EXPORTED)
+    monkeypatch.setitem(EXPORTED, "default", EXPORTED["default"] + E_EXPORTED)
+    real = script.wheelgap_answer
+
+    def without_e(*args, **kwargs):
+        answer = real(*args, **kwargs)
+        answer.get("rows", {}).pop("e==1.0", None)
+        return answer
+
+    monkeypatch.setattr(script, "wheelgap_answer", without_e)
+    entry = _poetry_entry(tmp_path, lock=E_LOCK, pyproject=E_PYPROJECT)
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, FakePoetry(), workers=1)
+    got = {(c.mode, c.package): (c.wheelgap, c.answer, c.verdict) for c in cells if c.package == "e==1.0"}
+    assert got == {
+        ("all", "e==1.0"): ("absent", "wheel", "disagree"),
+        ("default", "e==1.0"): ("absent", "wheel", "disagree"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("markers", "groups", "selected", "expected"),
+    [
+        ('"python_version >= \\"3.10\\" and extra == \\"x\\""', ["main"], {"main"}, True),
+        ('"sys_platform == \\"win32\\" or extra == \\"x\\""', ["main"], {"main"}, True),
+        # Only extras: wheelgap decides these exactly, so nothing is skipped.
+        ('"extra == \\"x\\" or extra == \\"y\\""', ["main"], {"main"}, False),
+        ('"(extra == \\"x\\")"', ["main"], {"main"}, False),
+        ('"extra == \\"x\\" and (extra != \\"y\\")"', ["main"], {"main"}, False),
+        # A variable's name inside a literal is not a condition.
+        ('"extra == \\"python_version\\""', ["main"], {"main"}, False),
+        ('"sys_platform == \\"linux\\""', ["main"], {"main"}, False),
+        # Only the selected groups' markers count: an optional docs group's marker doesn't.
+        (
+            '{main = "extra == \\"x\\"", docs = "python_version >= \\"3.10\\" and extra == \\"x\\""}',
+            ["main", "docs"],
+            {"main"},
+            False,
+        ),
+        (
+            '{main = "extra == \\"x\\"", docs = "python_version >= \\"3.10\\" and extra == \\"x\\""}',
+            ["main", "docs"],
+            {"main", "docs"},
+            True,
+        ),
+        ('"python_version >= \\"3.10\\" and extra == \\"x\\""', ["docs"], {"main"}, False),
+        # No marker for a selected group: always installed.
+        ('{docs = "python_version >= \\"3.10\\" and extra == \\"x\\""}', ["main", "docs"], {"main", "docs"}, False),
+    ],
+)
+def test_poetry_extra_marked(tmp_path, markers, groups, selected, expected):
+    groups_toml = ", ".join(f'"{g}"' for g in groups)
+    (tmp_path / "poetry.lock").write_text(
+        f'[[package]]\nname = "e"\nversion = "1.0"\ngroups = [{groups_toml}]\nmarkers = {markers}\n', encoding="utf-8"
+    )
+    assert (script.poetry_extra_marked(tmp_path / "poetry.lock", selected) == {"e==1.0"}) is expected
+
+
+def test_poetry_1x_lock_default_mode_is_compared_once_wheelgap_answers(tmp_path, monkeypatch):
+    """The 1.x skip holds only while wheelgap refuses: a wheelgap that answers a group selection there is compared."""
+    lock = POETRY_LOCK.replace('groups = ["main"]\n', "").replace('groups = ["dev"]\n', "")
+    lock = lock.replace('groups = ["docs"]\n', "").replace('lock-version = "2.1"', 'lock-version = "2.0"')
+    real = script.wheelgap_answer
+    monkeypatch.setattr(script, "wheelgap_answer", lambda path, target, lock, mode: real(path, target, lock, "all"))
+    fake = FakePoetry()
+    cells = script.check_input(_poetry_entry(tmp_path, lock=lock), [LINUX], tmp_path / "out", VERSIONS, fake, 1)
+    default = {(c.package, c.verdict) for c in cells if c.mode == "default"}
+    assert ("a==1.0", "agree") in default and ("d==1.0", "disagree") in default  # the fake answers as for "all"
+    assert len([cmd for cmd, _, _ in fake.calls if cmd[0] == "uvx" and "export" in cmd]) == 2
+
+
+def test_poetry_export_that_rewrites_the_lock_is_refused(tmp_path):
+    """The same two names after the export isn't enough: a rewritten poetry.lock is noticed too."""
+    fake = FakePoetry((0, "", ["poetry.lock"]))  # the fake writes an empty poetry.lock over the staged one
+    cells = script.check_input(_poetry_entry(tmp_path), [LINUX], tmp_path / "out", VERSIONS, fake, workers=1)
+    assert [(c.mode, c.verdict) for c in cells if c.mode == "all"] == [("all", "not compared")]
+    assert "wrote into the project folder" in next(c.why for c in cells if c.mode == "all")

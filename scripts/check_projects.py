@@ -74,7 +74,11 @@ tell `source` from `missing` there, and its Requires-Python floor rule is not co
 "all", wheelgap's default for a poetry.lock against `--all-groups --all-extras`, and "default",
 `check_lockfile(extras=[], groups=[])` against a plain `poetry install`: main and every group pyproject.toml doesn't
 mark `optional = true`, given as `--with` (export itself takes only main unless told), and no extras. A Poetry 1.x
-lock has no "default" comparison: it records no groups per package, so wheelgap refuses a group selection for it. A
+lock has no "default" comparison while wheelgap refuses a group selection for it (it records no groups per package).
+In "default", a package wheelgap lists and the export leaves out is not compared when it is wheelgap's documented
+superset: its marker for a selected group joins an extra to a real environment condition (`python_version >= "3.10"
+and extra == "syntax"`, which Poetry 2.0-2.2 install without the extra), and the "all" export installs it on that
+target. A marker of extras only is decided exactly, and the other direction always counts. A
 Python that the lock's `python-versions` leaves out is compared at the target level, as uv's requires-python refusal
 is; one it takes only some patch releases of (`>=3.13.2`), or a `python-versions` a SpecifierSet can't hold for sure
 (`||`, two clauses with only a space between them), is not compared.
@@ -85,7 +89,8 @@ the staged folder holds only pyproject.toml and poetry.lock; with no poetry.lock
 refused too; export itself only reads the lock (`Locker`) and pyproject.toml, and writes the file it's given, here
 outside the staged folder. It runs with no POETRY_* settings, Poetry's config, cache and data in a fresh folder, a
 null keyring, UV_OFFLINE=1 and every proxy pointing at a closed port, so it can't fetch anything; an export whose log
-says it is locking, resolving or building, or that leaves a file in the staged folder, is refused. uvx installs the
+says it is locking, resolving or building, or that adds or changes a file in the staged folder (names and sha256),
+is refused. uvx installs the
 pinned Poetry beforehand in a separate step that names nothing of the input. A stale lock (Poetry's "pyproject.toml
 changed significantly since poetry.lock was last generated"), which `poetry install` refuses too, is not compared.
 This was checked with a canary: a project with a path dependency on a folder whose setup.py writes a file, an in-tree
@@ -1174,6 +1179,11 @@ def poetry_referee(
     return uv_pip_referee(run, folder, target, flat, confdir)
 
 
+def folder_digest(folder: Path) -> dict[str, str]:
+    """Each entry's name and the sha256 of its bytes (a folder's is empty), so a rewritten file shows too."""
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "" for p in sorted(folder.iterdir())}
+
+
 def poetry_export(run: Runner, folder: Path, work: Path, mode: str) -> tuple[Flat | None, str, str]:
     """(the exported file's pins, or None; why not; the command, as a user would type it) for one selection mode."""
     found = {p.name for p in folder.iterdir()}
@@ -1195,8 +1205,9 @@ def poetry_export(run: Runner, folder: Path, work: Path, mode: str) -> tuple[Fla
     output = out_dir / "requirements.txt"
     cmd = poetry_export_command(folder, output, mode, groups)
     shown = shlex.join(["poetry", *cmd[len(POETRY) :]]).replace(str(folder), ".").replace(str(output), "exported.txt")
+    before = folder_digest(folder)
     code, log = run(cmd, folder, poetry_env(work / "_poetry_home"))
-    if sorted(p.name for p in folder.iterdir()) != sorted(found):
+    if folder_digest(folder) != before:
         return None, "poetry export wrote into the project folder: the input must be refused", shown
     if re.search(r"\bLocking\b|Resolving dependencies|Building ", log):
         return None, "poetry export started to lock or build: the input must be refused", shown
@@ -1607,8 +1618,11 @@ def _check_staged(
         python = poetry_python(main) if main.is_file() else None
         if own_python and python is not None:
             targets = [*targets, *own_targets(str(python), targets)]  # as for a uv.lock
+        everything: dict[str, dict] = {}  # the "all" export's answers, by target label
         for mode in ("all", "default"):
-            cells += _check_poetry(entry, targets, folder, work, out, versions, run, workers, mode)
+            got, by_target = _check_poetry(entry, targets, folder, work, out, versions, run, workers, mode, everything)
+            cells += got
+            everything = by_target if mode == "all" else everything
         return cells
     flat = flatten(main)
     if flat.refuse:
@@ -1676,24 +1690,30 @@ def _check_poetry(
     run: Runner,
     workers: int,
     mode: str,
-) -> list[Cell]:
+    everything: dict[str, dict] | None = None,
+) -> tuple[list[Cell], dict[str, dict]]:
     """A poetry.lock's cells for one selection mode: Poetry exports the lock, uv pip compile answers for the export,
-    and wheelgap answers for the lock itself."""
+    and wheelgap answers for the lock itself. Also the referee's answers by target label. `everything`: the "all"
+    mode's answers, for the "default" mode's superset rule."""
     kind, main = entry["kind"], folder / entry["main"]
-    if mode == "default" and main.is_file() and not poetry_lock_has_groups(main):
-        # wheelgap refuses a group selection here (by design: the lock doesn't say which group needs what), so there
-        # is nothing to compare; the "all" comparison still covers every package.
-        why = "a Poetry 1.x lock records no groups per package, so wheelgap refuses a group selection for it"
-        return [
-            Cell(entry["id"], kind, "poetry export", mode, pin.label(t), "*", "-", "-", NOT_COMPARED, why)
-            for t in targets
-        ]
+    if mode == "default" and targets and main.is_file() and not poetry_lock_has_groups(main):
+        refused = wheelgap_answer(main, targets[0], None, mode).get("refused")
+        if refused:
+            # wheelgap refuses a group selection here (by design: the lock doesn't say which group needs what), so
+            # there is nothing to compare; the "all" comparison still covers every package. Only while it refuses.
+            why = f"a Poetry 1.x lock records no groups per package, and wheelgap refuses a group selection: {refused}"
+            cells = [
+                Cell(entry["id"], kind, "poetry export", mode, pin.label(t), "*", "-", "-", NOT_COMPARED, why)
+                for t in targets
+            ]
+            return cells, {}
     exported, why, shown = poetry_export(run, main.parent, work, mode)  # the lock's own folder
     if exported is None:
-        return [
+        cells = [
             Cell(entry["id"], kind, "poetry export", mode, pin.label(t), "*", "-", "-", NOT_COMPARED, why, shown)
             for t in targets
         ]
+        return cells, {}
     python = poetry_python(main)
     confdir = work / "_no_uv_config"
     version = f"{versions['uv']}; poetry {POETRY_VERSION}, poetry-plugin-export {POETRY_EXPORT_VERSION}"
@@ -1712,17 +1732,22 @@ def _check_poetry(
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         answers = list(pool.map(ask, targets))
-    cells: list[Cell] = []
-    with_extra = poetry_extra_marked(main) if mode == "default" else set()
+    cells = []
+    with_extra: set[str] = set()
+    if mode == "default":
+        groups = poetry_groups(main.parent / "pyproject.toml") or []
+        with_extra = poetry_extra_marked(main, {"main", *groups})
     for target, answer in zip(targets, answers, strict=True):
         ours = wheelgap_answer(main, target, None, mode)
+        in_all = (everything or {}).get(pin.label(target), {}).get("status", {})
         for c in compare(entry=entry, referee="poetry export", mode=mode, target=target, wheelgap=ours, answer=answer):
-            if c.package in with_extra and c.answer == ABSENT and c.wheelgap != ABSENT:
+            if c.package in with_extra and c.package in in_all and c.answer == ABSENT and c.wheelgap != ABSENT:
                 # wheelgap's superset, by design: with no extra selected it keeps a package whose marker joins an
                 # extra to other conditions, which Poetry 2.0-2.2 install without the extra (2.3 and later don't).
+                # Only when Poetry's export with every extra installs it on this target.
                 c.verdict, c.why = NOT_COMPARED, POETRY_KEPT_FOR_EVERY_EXTRA
             cells.append(c)
-    return cells
+    return cells, {pin.label(t): a for t, a in zip(targets, answers, strict=True)}
 
 
 POETRY_KEPT_FOR_EVERY_EXTRA = (
@@ -1731,17 +1756,47 @@ POETRY_KEPT_FOR_EVERY_EXTRA = (
 )
 
 
-def poetry_extra_marked(lock: Path) -> set[str]:
-    """The lock's packages (as cell keys) whose markers, for any group, name an extra alongside other conditions."""
+# The PEP 508 environment markers other than `extra`.
+_MARKER_VARIABLE = re.compile(
+    r"\b(?:python_version|python_full_version|os_name|sys_platform|platform_release|platform_system|platform_version|"
+    r"platform_machine|platform_python_implementation|implementation_name|implementation_version)\b"
+)
+
+
+def extra_with_other_conditions(marker: str) -> bool:
+    """Whether a marker names an extra and also a real environment variable (`python_version >= "3.10" and extra ==
+    "x"`), not only extras joined by `and`, `or` and parentheses (`extra == "x" or extra == "y"`), which wheelgap
+    decides exactly."""
+    try:
+        Marker(marker)
+    except ValueError:  # InvalidMarker
+        return False
+    return bool(_EXTRA_ATOM.search(marker)) and bool(_MARKER_VARIABLE.search(_LITERAL.sub("''", marker)))
+
+
+def poetry_extra_marked(lock: Path, groups: set[str]) -> set[str]:
+    """The lock's packages (as cell keys) installed for one of `groups` whose markers for those groups join an extra
+    to other conditions. A package with no marker for one of them is always installed, so it isn't one."""
     try:
         packages = tomllib.loads(lock.read_text(encoding="utf-8")).get("package", [])
     except (OSError, ValueError):
         return set()
+    wanted = {canonicalize_name(g) for g in groups}
     found = set()
     for p in packages if isinstance(packages, list) else []:
-        markers = p.get("markers") if isinstance(p, dict) else None
-        texts = [markers] if isinstance(markers, str) else list(markers.values()) if isinstance(markers, dict) else []
-        if any(isinstance(t, str) and _EXTRA_ATOM.search(t) and _EXTRA_ATOM.sub("", t).strip() for t in texts):
+        if not isinstance(p, dict) or not isinstance(p.get("groups"), list):
+            continue
+        selected = [g for g in p["groups"] if isinstance(g, str) and canonicalize_name(g) in wanted]
+        markers = p.get("markers")
+        if not selected or markers is None:
+            continue
+        if isinstance(markers, dict):
+            if any(g not in markers for g in selected):
+                continue
+            texts = [markers[g] for g in selected]
+        else:
+            texts = [markers]
+        if any(isinstance(t, str) and extra_with_other_conditions(t) for t in texts):
             found.add(key(str(p.get("name", "")), str(p.get("version", ""))))
     return found
 
