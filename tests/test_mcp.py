@@ -3960,3 +3960,23 @@ def test_tool_result_translates_source_error_reaching_it_directly(monkeypatch):
     text = result["content"][0]["text"]
     assert "--online" not in text
     assert "call again with offline: false" in text
+
+
+def test_diff_lockfiles_leaves_out_a_python_the_new_pdm_lock_targets_drop(fake_pypi, fixtures, tmp_path, capsys):
+    # As `wheelgap diff`: not compared, rather than an error from the check refusing 3.12 on the new lock.
+    from wheelgap import diff
+
+    text = (fixtures / "pdmtargets" / "pdm.lock").read_text(encoding="utf-8")
+    paths = []
+    for side, python in (("old", ">=3.12"), ("new", "==3.13.*")):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / "pdm.lock").write_text(text.replace('"==3.13.*"', f'"{python}"'), encoding="utf-8")
+        paths.append(str(tmp_path / side / "pdm.lock"))
+    assert diff.main([*paths, "-p", "3.12", "-p", "3.13", "-t", "linux-x86_64", "--json"]) == 0
+    expected = json.loads(capsys.readouterr().out)
+    args = {"old": paths[0], "new": paths[1], "python": "3.12,3.13", "targets": ["linux-x86_64"]}
+    (_, reply) = run(init(), call("diff_lockfiles", **args))
+    data = reply["result"]["structuredContent"]
+    assert reply["result"]["isError"] is False and data["ok"] is True
+    assert data["not_compared"] == expected["not_compared"]
+    assert [(e["target"], e["sides"]) for e in data["not_compared"]] == [("3.12 linux-x86_64", ["new"])]

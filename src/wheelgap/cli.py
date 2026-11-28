@@ -38,9 +38,11 @@ from .check import (
     explain,
     explain_lines,
     lock_environment_targets,
+    lock_environments_label,
     lock_environments_note,
     marker_holds,
     narrow_to_lock_environments,
+    poetry_roots_note,
     reachable,
 )
 from .codequality import write_codequality
@@ -883,6 +885,10 @@ def render_explain(
         needs = describe(info, sources) if info and sources else None
         ask = (issues_urls or {}).get(id(r.package))  # once per release, under its first gap
         gap_wheel = filled.get(id(r))  # once per release, under its first filled target
+        unsure = [t for t in targets if t in r.unknown_reasons and t not in r.ignored]
+        if unsure:  # a Poetry 1.x lock without its project's dependencies (#815): one reason for every such target
+            head = f"{r.package.name} {r.package.version or '?'} on {', '.join(t.label(multi_py) for t in unsure)}:"
+            out += [f"{style.bold(head)} {style.dim(CELL[Status.UNKNOWN][0])}", f"  {r.unknown_reasons[unsure[0]]}", ""]
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -1065,6 +1071,8 @@ def report_json(
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
         if r.package.pip_refuses:
             out["pip_refuses"] = r.package.pip_refuses
+        if r.unknown_reasons:  # why a target is `unknown` when the lookup didn't fail (a Poetry 1.x lock, #815)
+            out["unknown_reasons"] = {t.label(multi_py): why for t, why in r.unknown_reasons.items()}
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [
@@ -1605,6 +1613,10 @@ def render_markdown(
     for r in rows:
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
+        elif r.unknown_reasons:
+            where = ", ".join(t.label(multi_py) for t in r.unknown_reasons)
+            why = _md(next(iter(r.unknown_reasons.values())))
+            out += [f"Could not tell whether {_md(r.package.name)} is installed on {where}: {why}", ""]
     if dropped:
         out += [
             f"- {_code(label)}: {_code(version)} had a wheel, this release has none"
@@ -2542,8 +2554,10 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             args.python
             or config.get("python")
             or read_python_version(project_dir(config_inputs or ([str(project)] if project else [])))
-            or [running_python()]
+            or []
         )
+        default_python = not pythons  # the running one: a lock that doesn't cover it says so (#816)
+        pythons = pythons or [running_python()]
         platforms = args.target or config.get("targets", [])
         if not platforms and pyproject:
             platforms = load_uv_targets(pyproject, pythons)
@@ -2732,8 +2746,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if unlocked and len(unlocked) < len(targets):
                 if not quiet:
                     print(
-                        f"wheelgap: note: {', '.join(s.label for s in sources if s.supported_markers)} is locked for "
-                        "`[tool.uv] environments` only, which leave out the advisory targets "
+                        f"wheelgap: note: {lock_environments_label(sources)}, which leave out the advisory targets "
                         f"{', '.join(t.label(len({t.python for t in targets}) > 1) for t in targets if t in unlocked)}"
                         ": not checking them",
                         file=sys.stderr,
@@ -2745,7 +2758,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if source.found is not None:
                 for line in directory_notes(source.found):  # always: the file read isn't the one the name promises
                     print(f"wheelgap: note: {line}", file=sys.stderr)
-            check_lock_environments(source, targets)
+            check_lock_environments(source, targets, default_python=default_python)
             if source.passed_over is not None and not quiet:
                 print(
                     f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
@@ -3139,6 +3152,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     for r in rows:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
+    # After --ignore, so an ignored package (or package:target) isn't named.
+    if not quiet and (roots_note := poetry_roots_note(sources, rows)):
+        print(f"wheelgap: note: {roots_note}", file=sys.stderr)
     # A uv.lock checked with --online (sources.restore_uv_python_files): the answer is uv's, and pip's differs.
     pip_refusals = len({(r.package.key, r.package.version) for r in rows if r.package.pip_refuses})
     if pip_refusals and not quiet:

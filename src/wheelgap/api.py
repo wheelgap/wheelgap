@@ -138,6 +138,9 @@ class Result:
     direct: dict[Target, tuple[str, ...]] = field(default_factory=dict)
     issues_url: str | None = None
     pip_refuses: dict[str, str] = field(default_factory=dict)
+    # Why a target is UNKNOWN when the lookup didn't fail: a Poetry 1.x lock checked without its project's
+    # dependencies, where no dependency installs the package there but the project may require it directly.
+    unknown_reasons: dict[Target, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -215,6 +218,8 @@ class Result:
             out["bundled_version_differs"] = self.bundled_version_differs
         if self.pip_refuses:
             out["pip_refuses"] = dict(self.pip_refuses)
+        if self.unknown_reasons:
+            out["unknown_reasons"] = {t.label(True): why for t, why in self.unknown_reasons.items()}
         if explain:
             out["rejected"] = {
                 t.label(True): [{"file": f, "reason": why} for f, why in rejected]
@@ -255,6 +260,7 @@ def _result(
     via: dict[Target, list[str]] | None = None,
     direct_via: dict[Target, tuple[str, ...]] | None = None,
     issues_url: str | None = None,
+    unknown_reasons: dict[Target, str] | None = None,
 ) -> Result:
     applied = [lock for lock in pyodide_locks if any(bundles(lock, pkg.key, t, s) for t, s in statuses.items())]
     statuses = {
@@ -288,6 +294,7 @@ def _result(
         },
         issues_url=issues_url,
         pip_refuses=dict(pkg.pip_refuses),
+        unknown_reasons=dict(unknown_reasons or {}),
     )
     object.__setattr__(result, "_resolutions", pkg.resolutions)
     return result
@@ -341,7 +348,15 @@ def check_packages(
         rows = [r for r in check([source], targets) if r.needed]
         issues = explain_issues_urls(rows, [source])
         return [
-            _result(r.package, dict(r.results), pyodide_locks, r.via, r.direct_via, issues.get(id(r.package)))
+            _result(
+                r.package,
+                dict(r.results),
+                pyodide_locks,
+                r.via,
+                r.direct_via,
+                issues.get(id(r.package)),
+                r.unknown_reasons,
+            )
             for r in rows
         ]
     source = Source("api", pkgs, pypi_only=True)
@@ -634,7 +649,15 @@ def _check_lockfile(
     issues = explain_issues_urls(rows, [source])
     return (
         [
-            _result(r.package, dict(r.results), pyodide_locks, r.via, r.direct_via, issues.get(id(r.package)))
+            _result(
+                r.package,
+                dict(r.results),
+                pyodide_locks,
+                r.via,
+                r.direct_via,
+                issues.get(id(r.package)),
+                r.unknown_reasons,
+            )
             for r in rows
         ],
         source,

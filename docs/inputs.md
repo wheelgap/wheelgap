@@ -144,18 +144,29 @@ another index keep their locked files and are never looked up on PyPI.
 
 A script's lock from `uv lock --script example.py`, `example.py.lock`, has the same format and is read the same way,
 from the script's `[manifest] requirements`: `wheelgap example.py.lock` and `wheelgap diff old.py.lock new.py.lock`.
-The lock doesn't record `no-build`, `no-binary`, `no-build-package` or `no-binary-package` set in the script's own
-`[tool.uv]`, so when the script beside the lock sets any of them, the lock is refused (exit 2) rather than read without
-them.
+The lock doesn't record `no-build`, `no-binary`, `no-build-package` or `no-binary-package`, so they're read from the
+script beside it, as `uv run` applies them (see below).
 
 **Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
-`no-binary-package` from the adjacent `pyproject.toml`'s `[tool.uv]` table or `uv.toml`. When both
-files are present, `uv.toml` takes precedence, as it does for `uv sync`. These settings affect
+`no-binary-package` from the uv settings `uv sync` applies: the nearest `uv.toml`, or `pyproject.toml` with a
+`[tool.uv]` table, from the lock's folder up. A `uv.toml` takes precedence over a `pyproject.toml` in the same folder,
+a `pyproject.toml` without `[tool.uv]` is skipped, and the search goes on past a repository root to the top of the
+filesystem, as uv 0.13.1 does. The first `pyproject.toml` above the project's folder must parse: `uv sync` and
+`uv lock` stop with an error on one that doesn't while looking for the project's workspace, so wheelgap refuses the
+input too (exit 2). For a script's lock, the script's own `[tool.uv]` comes first and
+is combined with the nearest settings from the script's folder up, as `uv run` combines them: the script's
+`no-build` and `no-binary` win, and the package lists are joined. When nothing is found from the script's folder
+up, `uv run` uses the settings of the folder it runs in, which wheelgap can't know. These settings affect
 index packages (not local, Git or editable packages that wheelgap skips). `no-build` forbids
-source builds; `no-binary` excludes wheels. `--explain` identifies the applicable settings.
-Invalid setting types are input errors. Only the files beside the lock are read: settings in a `uv.toml` in a
-parent directory, in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't. `wheelgap diff`
-with a git ref reads that ref's `pyproject.toml` and `uv.toml` beside the lock.
+source builds; `no-binary` excludes wheels. As in uv, a package list overrides the other kind's blanket setting: with
+`no-binary = true`, a package in `no-build-package` still takes a wheel, and with `no-build = true`, one in
+`no-binary-package` still builds; `no-binary = false` (or `no-build = false`) turns its package list off.
+`--explain` identifies the applicable settings, with the file's path when
+it's in a folder above (`../uv.toml no-binary-package`). Invalid setting types, and a `uv.toml` that can't be read, are
+input errors. Settings in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't read.
+`--dockerfile-inputs` refuses a `uv sync` line when settings above the lock's folder set a build restriction, since
+the image doesn't have them. `wheelgap diff` with a git ref reads that ref's `pyproject.toml` and `uv.toml` beside
+the lock.
 
 **Python versions outside `requires-python`:** uv only keeps the wheels that can serve the lock's `requires-python`.
 If it leaves out a Python you check (say `==3.13.*`, checked with `-p 3.14t`), wheelgap also looks the lock's PyPI
@@ -268,13 +279,21 @@ Poetry constraint that isn't a PEP 440 specifier (`^3.9`), restrict nothing. Wit
 the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** packages whose source type is `git`, `hg`, `svn`, `bzr`, `directory`, `file` or `url`. A package from
-another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. Old locks that record only
-hashes and no file names are looked up on the index; packages in them from another index are skipped as
-`private index`.
+another index (a `legacy` source) keeps its locked files and isn't looked up on PyPI. A package with no file names
+(old locks that record only hashes, or `files = []`, which Poetry writes when the source gave it no hashes) is looked
+up on the index, since Poetry then installs the best file the index has; such a package from another index is skipped
+as `private index`.
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
-next to the lock. `--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
+next to the lock. Without a `pyproject.toml` there that declares them (none, one that can't be read, or one with no
+dependencies at all), wheelgap can't tell a direct dependency that another package needs only under a marker
+(`colorama`, which `click` needs on Windows only) from one installed only under that marker, and Poetry installs a
+direct dependency everywhere. So a package that no dependency installs on a target, and that has no wheel there, is
+`unknown` on that target rather than `n/a`, unless another version of it is installed there. `--explain` and
+`unknown_reasons` in `--json` say why, and a note on stderr names the packages. It counts as any `unknown` does, and
+`--ignore` takes it; where a left-out package has a wheel anyway, the answer is the same either way and nothing changes.
+`--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
 lock doesn't say which Pythons a direct dependency is installed for (`numpy = [{version = "1.26.4", python = "<3.13"},
 ...]` is only in `pyproject.toml`), so the range would report a pin as `missing` on a Python Poetry never installs it
 on.
@@ -317,6 +336,19 @@ answer only for a Python outside the range the project was locked for. It isn't 
 on the index goes by the index's per-file `Requires-Python` instead.
 
 **Skipped:** `git`, `hg`, `svn`, `bzr`, `path`, `url` and `file` packages.
+
+**Lock targets:** a lock made with `pdm lock --platform`, `--python` or `--implementation` records them as
+`[[metadata.targets]]` (a plain `pdm lock` records the project's `requires-python` there), keeps only the packages and
+wheels those targets need, and `pdm install` fails anywhere else ("No compatible lock target found"). wheelgap
+follows PDM as it does [`[tool.uv] environments`](#uvlock): a target you asked for outside them is an error (exit code
+2) naming the targets the lock doesn't cover and the ones it does, and the built-in default platforms are narrowed to
+the ones it covers, with a note. A target is inside when one lock target takes it, as PDM 2.29 decides: its
+`requires_python` takes the target's Python, its `implementation` (if any) is CPython with the target's
+`gil_disabled`, and its `platform` (if any) has the target's operating system (manylinux, musllinux, macOS or
+Windows) and architecture. The glibc, musl or macOS version doesn't count, since PDM installs a `manylinux_2_40` lock
+on glibc 2.36 too, with a warning. A `requires_python` that holds for some patch releases only (`>=3.13.2` for
+`-p 3.13`), and a platform or key PDM doesn't know, can't be decided: wheelgap says so and stops, also with exit code 2.
+To check a target the lock doesn't cover, add it with `pdm lock --append --platform ... --python ...`. The error names each target with its Python, since the Python can be the cause, and when no `-p`, `python` setting or `.python-version` picked it (so it's the one wheelgap runs on), it says so and names a Python the lock covers.
 
 **Dependency groups:** the same selectors work with PDM's meanings, and configured `groups` apply too. Every group the
 lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups locked with
@@ -577,6 +609,24 @@ kept where wheelgap doesn't read them (check a lockfile instead).
 
 `check_lockfile()` and `wheelgap diff` don't read `pyproject.toml` as an input.
 
+**uv settings and sources:** the requirements are answered the way uv installs them. uv's `no-build`, `no-binary`,
+`no-build-package` and `no-binary-package` are applied as for a [`uv.lock`](#uvlock), from the nearest `uv.toml` or
+`pyproject.toml` `[tool.uv]` from the file's folder up (for a uv workspace member, the workspace root's settings, as
+uv ignores the member's own). `--deps` refuses a file that sets one. `[tool.uv.sources]` is followed too, the
+workspace root's included for a member (the member's own entry wins): a `git`, `url`, `path` or `workspace` source is
+skipped with that reason (`editable` for an editable path), and an `index` source takes the package from that
+`[[tool.uv.index]]`, so it's skipped as a private index unless that index is PyPI (or `WHEELGAP_INDEX_URL`). A
+package whose source depends on a marker, extra or group is `unknown`, and so is one whose source names an index the
+project's own `[[tool.uv.index]]` (or the workspace root's) doesn't define, which uv refuses even when a `uv.toml`
+defines it. `no-sources = true` turns the sources off. A package without a source of its own goes to PyPI only when
+the uv settings name no other index: with an `[[tool.uv.index]]` marked `default = true`, `index-url` or
+`default-index`, it's skipped as a private index (unless that index is PyPI or `WHEELGAP_INDEX_URL`), and with
+an index that isn't `explicit`, `extra-index-url`, `find-links` or `no-index`, it's `unknown`, since uv may take it
+from there first. Either way its name isn't sent to PyPI. When wheelgap can't tell whether the file is a workspace
+member and the answer would depend on it, it's an input error, and so is a first `pyproject.toml` above it that
+doesn't parse, as for a [`uv.lock`](#uvlock). Settings in your user-level uv config or in `UV_NO_BUILD`-style
+environment variables aren't read.
+
 uv's `exclude-newer` upload cutoff is applied: see [Resolution upload cutoffs](#resolution-upload-cutoffs).
 
 ## Python scripts
@@ -614,6 +664,12 @@ flags use ([which names leave the run](how-it-works.md#pypi-origin)). [`--fix`](
 lines to add to the block for `uv run`. To check what the script installs, pass its lock instead
 (`example.py.lock`, from `uv lock --script`), which is read as a [`uv.lock`](#uvlock). Without `--deps`,
 `check_lockfile()` and `wheelgap diff` don't read a script.
+
+The block's `[tool.uv.sources]` and build restrictions are followed as in a [`pyproject.toml`](#pyprojecttoml), with
+the block's settings combined with the nearest `uv.toml` or `pyproject.toml` `[tool.uv]` from the script's folder up,
+as `uv run` combines them (see [uv.lock](#uvlock)). When nothing is found from the script's folder up, `uv run` uses
+the settings of the folder it runs in, which wheelgap can't know. Settings in your user-level uv config or in
+`UV_NO_BUILD`-style environment variables aren't read.
 
 A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 
