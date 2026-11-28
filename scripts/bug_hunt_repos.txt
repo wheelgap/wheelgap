@@ -1,0 +1,22 @@
+# Public repositories scanned weekly by .github/workflows/bug-hunt.yml (#777).
+# Each entry has a root uv.lock or a root pinned requirements.txt.
+wheelgap/wheelgap
+searxng/searxng
+pytest-dev/pluggy
+pytest-dev/iniconfig
+pydantic/pydantic
+pydantic/pydantic-ai
+jlowin/fastmcp
+Textualize/textual
+fastapi/typer
+PrefectHQ/prefect
+dlt-hub/dlt
+mitmproxy/mitmproxy
+beancount/fava
+streamlit/streamlit
+modelcontextprotocol/python-sdk
+astral-sh/ty
+encode/httpx
+encode/uvicorn
+saleor/saleor
+getsentry/sentry

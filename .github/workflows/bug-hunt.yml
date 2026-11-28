@@ -1,0 +1,137 @@
+name: Bug hunt
+
+# Weekly: run scripts/check_projects.py repo over the 20 public repositories in
+# scripts/bug_hunt_repos.txt and file one deduplicated issue per real disagreement (#777).
+
+on:
+  schedule:
+    - cron: "17 8 * * 2" # Tuesdays
+  workflow_dispatch:
+    inputs:
+      file_issues:
+        description: "File GitHub issues for disagreements (keep false on forks)"
+        type: boolean
+        required: false
+        default: false
+      targets:
+        description: "Optional comma-separated target labels (blank uses default targets)"
+        type: string
+        required: false
+        default: ""
+
+# Two jobs, so the job that reads scanned repositories never holds a token that can write anything:
+# - check (contents: read): one step fetches each repo's inputs with the token (it only downloads, runs nothing of
+#   them), then a step with no token in its environment checks them offline from GitHub and uploads the results;
+# - file (issues: write): a fresh runner that reads only those results, checks every field again and files the
+#   issues (scripts/bug_hunt_file.py).
+# No uv cache in either job: the check job mustn't save one that a later job restores.
+permissions:
+  contents: read
+
+concurrency:
+  group: bug-hunt
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Install Python versions used by default targets
+        run: uv python install 3.13 3.15
+      - name: Fetch repositories
+        # The only step with the token (for api.github.com's rate limits on shared runners). It resolves each
+        # commit and downloads the repo's lockfiles and requirements files into bug-hunt-corpus/: no referee runs.
+        # A repo that fails here fails the check step below, which shows it as an "error" row.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p bug-hunt-corpus
+          while IFS= read -r repo || [ -n "$repo" ]; do
+            repo="${repo%%#*}"
+            repo="$(echo "$repo" | xargs)"
+            [ -z "$repo" ] && continue
+            safe="${repo//\//__}"
+            uv run --python 3.14 --no-dev --with pip python scripts/check_projects.py repo "$repo" \
+              --fetch-only "bug-hunt-corpus/${safe}" || echo "Fetching $repo failed: the check step shows it as an error."
+          done < scripts/bug_hunt_repos.txt
+      - name: Check repositories
+        # No token here. Each repo's exit code is recorded, not hidden: 0 all agree, 1 a disagreement, anything else
+        # couldn't be checked (2: a referee's error, a tripwire or no input), which the file job shows as an "error"
+        # row and fails on.
+        env:
+          INPUT_TARGETS: ${{ inputs.targets }}
+        run: |
+          mkdir -p bug-hunt-results
+          : > bug-hunt-results/status.tsv
+          target_args=()
+          if [ -n "$INPUT_TARGETS" ]; then
+            IFS=',' read -ra raw_targets <<< "$INPUT_TARGETS"
+            for t in "${raw_targets[@]}"; do
+              t_trimmed="$(echo "$t" | xargs)"
+              [ -n "$t_trimmed" ] && target_args+=(-t "$t_trimmed")
+            done
+          fi
+          while IFS= read -r repo || [ -n "$repo" ]; do
+            repo="${repo%%#*}"
+            repo="$(echo "$repo" | xargs)"
+            [ -z "$repo" ] && continue
+            safe="${repo//\//__}"
+            echo "::group::$repo"
+            code=0
+            uv run --python 3.14 --no-dev --with pip python scripts/check_projects.py repo "$repo" \
+              --from-dir "bug-hunt-corpus/${safe}" "${target_args[@]}" \
+              --issues-json "bug-hunt-results/${safe}.json" || code=$?
+            printf '%s\t%s\n' "$repo" "$code" >> bug-hunt-results/status.tsv
+            echo "::endgroup::"
+          done < scripts/bug_hunt_repos.txt
+      - name: Upload the results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bug-hunt-results
+          path: bug-hunt-results/
+          if-no-files-found: error
+
+  file:
+    needs: check
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bug-hunt-results
+          path: bug-hunt-results
+      - name: File deduplicated issues and write the job summary
+        # scripts/bug_hunt_file.py: treats the results as untrusted (repos from scripts/bug_hunt_repos.txt only,
+        # each issue rebuilt from checked fields), creates the bug-hunt label, dedups against open and closed issues
+        # (and files nothing if it can't list them), files at most 5 per run, and fails the job on any of that or
+        # on a repo that couldn't be checked.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SHOULD_FILE: ${{ (github.event_name == 'schedule' && github.repository == 'wheelgap/wheelgap') || inputs.file_issues }}
+        run: |
+          file_flag=()
+          if [ "$SHOULD_FILE" = "true" ]; then
+            file_flag=(--file)
+          fi
+          uv run --python 3.14 --no-dev python scripts/bug_hunt_file.py bug-hunt-results "${file_flag[@]}"

@@ -804,12 +804,12 @@ def test_check_input_stages_outside_the_output_folder(tmp_path, monkeypatch):
 def test_flatten_reads_includes_and_markers(tmp_path):
     (tmp_path / "base.txt").write_text("idna==3.10 \\\n  --hash=sha256:aa\n", encoding="utf-8")
     (tmp_path / "requirements.txt").write_text(
-        "--extra-index-url https://example.test/simple\n-r base.txt\nsix==1.17.0 ; sys_platform == 'win32'\n",
+        "--extra-index-url https://pypi.org/simple\n--pre\n-r base.txt\nsix==1.17.0 ; sys_platform == 'win32'\n",
         encoding="utf-8",
     )
     flat = script.flatten(tmp_path / "requirements.txt")
     assert flat.refuse is None
-    assert flat.options == ["--extra-index-url https://example.test/simple"]
+    assert flat.options == ["--pre"]  # PyPI's own index is dropped: the referees use it anyway
     assert [(p.name, p.version, p.marker, p.line) for p in flat.pins] == [
         ("idna", "3.10", "", "idna==3.10"),
         ("six", "1.17.0", 'sys_platform == "win32"', "six==1.17.0 ; sys_platform == 'win32'"),
@@ -839,6 +839,18 @@ def test_flatten_reads_includes_and_markers(tmp_path):
         "--extra-index-url https://x.test/simple \\\n  --only-binary :none:",
         "-i --no-binary=:all:",
         "--extra-index-url https://x.test/${GITHUB_TOKEN}/simple",  # pip and uv expand it from os.environ
+        # A scanned file never points the referees at an index or host of its own, or marks one as trusted.
+        "-i https://x.test/simple",
+        "--index-url=https://x.test/simple",
+        "--index-url https://pypi.org.x.test/simple",
+        "--extra-index-url https://download.pytorch.org/whl/cpu",
+        "--extra-index-url=http://pypi.org/simple",
+        "--trusted-host x.test",
+        "--trusted-host=pypi.org",
+        "--find-links https://x.test/links",
+        "-f https://x.test/links",
+        "--no-index",
+        "--index-strategy unsafe-best-match",
     ],
 )
 def test_flatten_refuses(tmp_path, line):
@@ -847,12 +859,88 @@ def test_flatten_refuses(tmp_path, line):
 
 
 @pytest.mark.parametrize(
-    "line", ["-i https://pypi.org/simple", "--index-url=https://pypi.org/simple", "--trusted-host x.test", "--pre"]
+    ("line", "options"),
+    [
+        ("-i https://pypi.org/simple", []),
+        ("--index-url=https://pypi.org/simple/", []),
+        ("--extra-index-url https://pypi.org/simple", []),
+        ("--pre", ["--pre"]),
+        ("--prefer-binary", ["--prefer-binary"]),
+    ],
 )
-def test_flatten_passes_index_options(tmp_path, line):
+def test_flatten_passes_only_safe_options(tmp_path, line, options):
     (tmp_path / "requirements.txt").write_text(f"{line}\nidna==3.10\n", encoding="utf-8")
     flat = script.flatten(tmp_path / "requirements.txt")
-    assert flat.refuse is None and flat.options == [line]
+    assert flat.refuse is None and flat.options == options
+
+
+def test_a_requirements_file_with_its_own_index_is_not_compared(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "--extra-index-url https://x.test/simple\n--trusted-host x.test\nidna==3.10\n", encoding="utf-8"
+    )
+    entry = {"id": "o/r", "kind": "requirements", "dir": str(tmp_path), "main": "requirements.txt"}
+    entry["files"] = ["requirements.txt"]
+    calls = []
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, lambda *a: calls.append(a), workers=1)
+    assert calls == []  # no referee ran
+    assert cells and all(c.verdict == "not compared" and "only read PyPI" in c.why for c in cells)
+
+
+def test_referees_never_get_an_index_option(tmp_path):
+    # Even a Flat built some other way: only --pre and --prefer-binary reach a referee's requirements file.
+    flat = script.Flat(
+        [script.Pin("a", "1.0", "", "a==1.0")],
+        ["--index-url https://x.test/simple", "--trusted-host x.test", "--pre", "-f https://x.test/links"],
+    )
+    seen = []
+
+    def fake(cmd, cwd, env):
+        path = cmd[cmd.index("-r") + 1] if "-r" in cmd else cmd[3]
+        seen.append(Path(path).read_text(encoding="utf-8"))
+        return 0, "a==1.0\n"
+
+    script.pip_referee(fake, tmp_path, LINUX, flat, tmp_path / "cache")
+    script.uv_pip_referee(fake, tmp_path, LINUX, flat, tmp_path)
+    assert len(seen) == 2 and all(text == "--pre\na==1.0\n" for text in seen)
+
+
+def test_run_command_drops_the_github_token(monkeypatch, tmp_path):
+    got = {}
+
+    def fake_run(cmd, cwd, env, **kwargs):
+        got.update(env)
+        return script.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    script.run_command(["true"], tmp_path, {"GITHUB_TOKEN": "t", "GH_TOKEN": "t", "PATH": "/bin"})
+    assert got == {"PATH": "/bin", "PYTHONSAFEPATH": "1"}  # and no child Python puts its cwd on sys.path
+
+
+def test_fetch_keeps_the_token_off_redirects(monkeypatch):
+    sent = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        sent.append(req)
+        return Response()
+
+    monkeypatch.setattr(script.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    script._urllib_fetch("https://api.github.com/repos/o/r")
+    script._urllib_fetch("https://raw.githubusercontent.com/o/r/x/uv.lock")
+    api, raw = sent
+    # Unredirected headers aren't copied to a redirect's request by urllib's HTTPRedirectHandler.
+    assert api.unredirected_hdrs == {"Authorization": "Bearer secret"} and "Authorization" not in api.headers
+    assert not raw.has_header("Authorization")
 
 
 def test_pip_sdist_seen():
@@ -909,6 +997,9 @@ def test_pip_referee(tmp_path):
     assert len(fake.calls) == 3
     first = fake.calls[0]
     assert "--only-binary=:all:" in first and "--no-deps" in first and "--isolated" in first
+    # Isolated mode: the staged folder (pip's cwd) is never on sys.path, so a staged pip.py can't run instead of pip.
+    assert first[1:4] == ["-I", "-m", "pip"]
+    assert answer["command"].startswith("pip install --dry-run ")
     assert first[first.index("--abi") + 1] == "cp313"
 
 
@@ -1103,6 +1194,247 @@ wheels = [{ url = "https://files.pythonhosted.org/w/winthing-1.0-py3-none-any.wh
     assert "uv sync: source" in text
     assert "wheelgap command: uvx wheelgap uv.lock" in text
     assert "referee command: " in text and "uv sync" in text
+
+
+def test_check_repo_issues_json_writes_disagreements_and_dedup_marker(tmp_path):
+    import io
+
+    sha = "c" * 40
+    pyproject = (
+        b'[project]\nname = "demo"\nversion = "0.1.0"\nrequires-python = ">=3.13"\n'
+        b'dependencies = ["winthing", "okpkg"]\n'
+    )
+    uv_lock = b"""\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [{ name = "winthing" }, { name = "okpkg" }]
+
+[[package]]
+name = "winthing"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.pythonhosted.org/w/winthing-1.0-py3-none-any.whl" }]
+
+[[package]]
+name = "okpkg"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://files.pythonhosted.org/o/okpkg-1.0-py3-none-any.whl" }]
+"""
+    files = {
+        f"https://api.github.com/repos/org/demo/commits/{sha}": json.dumps({"sha": sha}).encode(),
+        f"https://raw.githubusercontent.com/org/demo/{sha}/uv.lock": uv_lock,
+        f"https://raw.githubusercontent.com/org/demo/{sha}/pyproject.toml": pyproject,
+    }
+
+    def fake_fetch(url: str) -> bytes:
+        if url not in files:
+            raise FileNotFoundError(url)
+        return files[url]
+
+    # winthing==1.0 disagrees (wheelgap wheel vs uv source); okpkg==1.0 agrees (both wheel).
+    def fake_run(cmd, cwd, env):
+        if cmd[:3] == ["uv", "python", "find"]:
+            return 0, "/usr/bin/python3.13\n"
+        if "--no-build" in cmd and "--no-install-package" not in cmd:
+            return (
+                1,
+                "error: Distribution `winthing==1.0 @ registry+https://pypi.org/simple` "
+                "can't be installed because it is marked as `--no-build` but has no binary distribution\n",
+            )
+        if "--no-install-package" in cmd:
+            return 0, " + okpkg==1.0\n"
+        return 0, " + okpkg==1.0\n + winthing==1.0\n"
+
+    issues_path = tmp_path / "issues.json"
+    out = io.StringIO()
+    code = script.check_repo(
+        "org/demo",
+        ref=sha,
+        target_names=["3.13 linux-x86_64"],
+        issues_json=issues_path,
+        fetch=fake_fetch,
+        run=fake_run,
+        versions={"uv": "0.6.0", "pip": "25.0", "wheelgap": "0.14.0", "wheelgap_commit": "0" * 40},
+        out=out,
+    )
+    assert code == 1
+    payload = json.loads(issues_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["compared"] == 4
+    assert payload["summary"]["agree"] == 2
+    assert payload["summary"]["disagree"] == 2
+    disagreements = payload["disagreements"]
+    assert len(disagreements) == 1
+    item = disagreements[0]
+    # No version in the marker: a lock that bumps winthing doesn't file the same bug again.
+    expected_marker = "<!-- bug-hunt org/demo uv.lock 3.13 linux-x86_64 winthing @ https://pypi.org/simple -->"
+    assert item["marker"] == expected_marker
+    assert item["body"].endswith(f"\n{expected_marker}\n")
+    assert "\n```text\n--- Bug report: org/demo @ " in item["body"]  # the scanned repo's text never renders
+    assert item["title"] == "bug-hunt: winthing==1.0 on 3.13 linux-x86_64 (org/demo)"
+    assert item["package"] == "winthing==1.0 @ https://pypi.org/simple"
+
+
+def test_bug_hunt_marker_and_title_hold_no_markup():
+    marker = script.bug_hunt_marker("o/r", "uv.lock", "3.13 win-amd64", "x==1 @ https://e.test/--> @someone\n[a](b)")
+    assert marker == "<!-- bug-hunt o/r uv.lock 3.13 win-amd64 x @ https://e.test/--_ _someone__a_(b) -->"
+    assert marker.count("-->") == 1 and "\n" not in marker
+    assert script.bug_hunt_marker("o/r", "requirements.txt", "3.13 win-amd64", "x==2.0") == (
+        "<!-- bug-hunt o/r requirements.txt 3.13 win-amd64 x -->"
+    )
+
+
+@pytest.mark.parametrize(("text", "fence"), [("plain @user [x](y)", "```"), ("a ``` b ````` c", "``````")])
+def test_text_fence_outlasts_the_text(text, fence):
+    assert script.text_fence(text) == f"{fence}text\n{text}\n{fence}"
+
+
+def test_main_output_cant_run_workflow_commands(capsys, monkeypatch):
+    def fake_check_repo(repo, **kwargs):
+        print("::error::from a lockfile")
+        print("x ##[warning]y", file=sys.stderr)
+        return 0
+
+    monkeypatch.setattr(script, "check_repo", fake_check_repo)
+    monkeypatch.setattr(script.pin, "default_cpython", lambda: True)
+    assert script.main(["repo", "o/r"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "\\u003a:error::from a lockfile\n"
+    assert out.err == "x \\u0023#[warning]y\n"
+
+
+# --- the bug hunt's untrusted inputs: includes, comments, fetch then check, failed checks ---------------------------
+
+
+def test_an_include_must_be_a_requirements_file(tmp_path):
+    # `python -m pip` with the staged folder as cwd would import a staged pip.py: never stage, fetch or follow one.
+    (tmp_path / "pip.py").write_text("import os\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-r pip.py\nfoo==1.0\n", encoding="utf-8")
+    flat = script.flatten(tmp_path / "requirements.txt")
+    assert flat.refuse == "-r pip.py: an include that isn't a .txt or .in file"
+    assert script.included_files(tmp_path, "requirements.txt") == []
+    (tmp_path / "base.in").write_text("idna==3.10\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-r base.in\n-c pip.py\nfoo==1.0\n", encoding="utf-8")
+    assert script.included_files(tmp_path, "requirements.txt") == ["base.in"]
+
+
+def test_a_backslash_never_continues_a_comment_line(tmp_path):
+    # As pip reads it: `# note \` is a comment on its own, so the next line is a requirement (here an invalid one),
+    # not part of the comment, and a file that is also Python can't hide its code that way.
+    text = "# note \\\nimport os; os.system('x')\nidna==3.10 \\\n  # trailing comment\nsix==1.17.0\n"
+    assert list(script.requirement_lines(text)) == [
+        (2, "import os; os.system('x')"),
+        (3, "idna==3.10"),
+        (5, "six==1.17.0"),
+    ]
+    (tmp_path / "requirements.txt").write_text(text, encoding="utf-8")
+    assert "import os" in script.flatten(tmp_path / "requirements.txt").refuse
+
+
+def test_fetch_repo_corpus_never_fetches_a_python_include(tmp_path):
+    sha = "e" * 40
+    raw = f"https://raw.githubusercontent.com/org/demo/{sha}"
+    files = {f"{raw}/requirements.txt": b"-r pip.py\nfoo==1.0\n", f"{raw}/pip.py": b"import os\n"}
+    fetched = []
+
+    def fake_fetch(url: str) -> bytes:
+        fetched.append(url)
+        if url not in files:
+            raise FileNotFoundError(url)
+        return files[url]
+
+    manifest = script.fetch_repo_corpus("org/demo", sha, tmp_path / "corpus", fetch=fake_fetch)
+    assert f"{raw}/pip.py" not in fetched
+    assert not (tmp_path / "corpus" / "repos" / "org__demo" / "pip.py").exists()
+    [entry] = manifest["inputs"]
+    assert entry["files"] == ["requirements.txt"]
+    calls = []
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, lambda *a: calls.append(a), workers=1)
+    assert calls == [] and all(c.verdict == "not compared" and "isn't a .txt or .in" in c.why for c in cells)
+
+
+def test_fetch_only_then_from_dir_needs_no_github(tmp_path, monkeypatch):
+    import io
+
+    sha = "d" * 40
+    files = {
+        "https://api.github.com/repos/org/demo": json.dumps({"default_branch": "main"}).encode(),
+        "https://api.github.com/repos/org/demo/commits/main": json.dumps({"sha": sha}).encode(),
+        f"https://raw.githubusercontent.com/org/demo/{sha}/requirements.txt": b"six==1.16.0\n",
+    }
+
+    def fake_fetch(url: str) -> bytes:
+        if url not in files:
+            raise FileNotFoundError(url)
+        return files[url]
+
+    corpus = tmp_path / "corpus"
+    manifest = script.fetch_repo("org/demo", None, corpus, fetch=fake_fetch)
+    assert [e["kind"] for e in manifest["inputs"]] == ["requirements"]
+    with pytest.raises(ValueError, match="isn't empty"):
+        script.fetch_repo("org/demo", None, corpus, fetch=fake_fetch)
+    with pytest.raises(ValueError, match="isn't a --fetch-only folder"):
+        script.read_fetched("org/other", corpus)
+    seen = []
+    monkeypatch.setattr(script, "check_input", lambda entry, *args, **kwargs: seen.append(entry) or [])
+
+    def no_fetch(url: str) -> bytes:
+        raise AssertionError(f"fetched {url}")
+
+    out = io.StringIO()
+    code = script.check_repo(
+        "org/demo", target_names=["3.13 linux-x86_64"], from_dir=corpus, fetch=no_fetch, versions=VERSIONS, out=out
+    )
+    assert code == 0 and seen == manifest["inputs"]
+    assert f"Repo: org/demo @ {sha}" in out.getvalue()
+
+
+def test_referee_errors_are_failed_checks_but_limits_are_not():
+    def one(answer):
+        [cell] = script.compare(
+            entry=ENTRY, referee="pip", mode="all", target=LINUX, wheelgap={"rows": {}}, answer=answer
+        )
+        return cell
+
+    tripwire = one({"error": "pip started a build (Building wheel): the input must be refused"})
+    failed = one({"error": "pip: Could not fetch URL https://pypi.org/simple/x/"})
+    limit = one({"error": "uv's --python-platform can't express this target", "limit": True})
+    assert tripwire.failure and failed.failure and not limit.failure
+    assert {tripwire.verdict, failed.verdict, limit.verdict} == {"not compared"}
+
+
+@pytest.mark.parametrize(
+    ("failure", "disagree", "code"), [(True, True, 2), (True, False, 2), (False, True, 1), (False, False, 0)]
+)
+def test_check_repo_failed_checks_win_over_disagreements(tmp_path, monkeypatch, failure, disagree, code):
+    import io
+
+    entry = {"id": "org/demo", "kind": "uv.lock", "main": "uv.lock"}
+    why = "pip: pip started a build (Building wheel): the input must be refused"
+    target = "3.13 linux-x86_64"
+    cells = [
+        script.Cell("org/demo", "uv.lock", "pip", "all", target, "*", "-", "-", "not compared", why, failure=failure)
+    ]
+    if disagree:
+        package = "w==1.0 @ https://pypi.org/simple"
+        cells.append(
+            script.Cell("org/demo", "uv.lock", "uv sync", "all", target, package, "wheel", "source", "disagree")
+        )
+    monkeypatch.setattr(script, "resolve_repo_commit", lambda repo, ref, fetch: "b" * 40)
+    monkeypatch.setattr(script, "fetch_repo_corpus", lambda repo, sha, corpus_dir, fetch: {"inputs": [entry]})
+    monkeypatch.setattr(script, "check_input", lambda *args, **kwargs: cells)
+    path = tmp_path / "issues.json"
+    got = script.check_repo("org/demo", target_names=[target], issues_json=path, versions=VERSIONS, out=io.StringIO())
+    assert got == code
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["summary"]["failed_checks"] == int(failure)
+    assert len(data["disagreements"]) == int(disagree)  # still reported next to the failed check
 
 
 # --- poetry.lock: poetry export, then uv pip compile -------------------------------------------------------------
@@ -1302,6 +1634,9 @@ def test_poetry_export_failures_are_not_compared(tmp_path, export, why):
         ("default", "*", "not compared"),
     }
     assert all(why in c.why for c in cells if c.mode == "all" or not export[2])
+    # A tripwire is a failed check (the repo is an error row); a stale lock or no file is the input's own.
+    tripwire = why in ("started to lock or build", "wrote into the project folder")
+    assert {c.failure for c in cells if c.mode == "all"} == {tripwire}
     if export[2]:
         assert all("poetry export would see ['.poetry', 'poetry.lock', 'pyproject.toml']" in c.why for c in cells[1:])
 
