@@ -130,7 +130,12 @@ MISREAD, CHANGED, WARNING = "misread", "upstream changed", "warning"
 @pytest.mark.parametrize(
     ("name", "text", "kind", "finding"),
     [
-        ("uv.lock", "this isn't = = toml", MISREAD, "can't read it: TOMLDecodeError"),
+        (
+            "uv.lock",
+            "this isn't = = toml",
+            MISREAD,
+            "can't read it: SourceError: \"uv.lock: invalid TOML:",
+        ),
         ("uv.lock", UV_HEAD, MISREAD, "no packages"),
         (
             "uv.lock",

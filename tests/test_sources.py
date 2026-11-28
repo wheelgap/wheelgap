@@ -122,6 +122,28 @@ def test_uv_lock_edge_of_the_wrong_type_in_a_group_or_the_manifest_raises(tmp_pa
         load_inputs([str(tmp_path)])
 
 
+@pytest.mark.parametrize(
+    "filename, contents",
+    [
+        ("uv.lock", "package = 1\n"),
+        ("uv.lock", 'package = "x"\n'),
+        ("uv.lock", "[manifest]\nmembers = 1\n"),
+        ("uv.lock", 'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\nwheels = ["x"]\n'),
+        ("pylock.toml", "packages = -1\n"),
+        ("pylock.toml", "packages = [1]\n"),
+        ("pylock.toml", 'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\nwheels = [true]\n'),
+        ("uv.lock", "this is not = toml\n"),
+        ("pylock.toml", "this is not = toml\n"),
+    ],
+)
+def test_wrong_type_lockfile_values_raise_source_error(tmp_path, filename, contents):
+    """Malformed lockfiles must fail as SourceError from the reader, not a raw TypeError/TOMLDecodeError (#796)."""
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        load_inputs([str(tmp_path)])
+    assert filename in str(caught.value)
+
+
 def test_uv_lock_manifest_that_is_not_a_table_raises(tmp_path):
     (tmp_path / "uv.lock").write_text("version = 1\nmanifest = 5\n", encoding="utf-8")
     with pytest.raises(SourceError, match=re.escape("uv.lock: `manifest` isn't a table")):
