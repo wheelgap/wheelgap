@@ -1142,7 +1142,7 @@ def test_check_lockfile_names_a_pyproject_beside_the_lock_that_isnt_utf8(tmp_pat
         encoding="utf-8",
     )
     (tmp_path / "pyproject.toml").write_bytes("[tool.uv]\n# café\n".encode("latin-1"))
-    with pytest.raises(SourceError, match=r"pyproject\.toml: isn't UTF-8, so its uv build restrictions can't be read"):
+    with pytest.raises(SourceError, match=r"pyproject\.toml: isn't UTF-8, so its uv settings can't be read"):
         wheelgap.check_lockfile(tmp_path / "uv.lock", wheelgap.make_targets("3.13", "linux-x86_64"), offline=True)
     assert not fake_pypi
 

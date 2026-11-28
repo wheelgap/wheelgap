@@ -144,18 +144,23 @@ another index keep their locked files and are never looked up on PyPI.
 
 A script's lock from `uv lock --script example.py`, `example.py.lock`, has the same format and is read the same way,
 from the script's `[manifest] requirements`: `wheelgap example.py.lock` and `wheelgap diff old.py.lock new.py.lock`.
-The lock doesn't record `no-build`, `no-binary`, `no-build-package` or `no-binary-package` set in the script's own
-`[tool.uv]`, so when the script beside the lock sets any of them, the lock is refused (exit 2) rather than read without
-them.
+The lock doesn't record `no-build`, `no-binary`, `no-build-package` or `no-binary-package`, so they're read from the
+script beside it, as `uv run` applies them (see below).
 
 **Build restrictions:** wheelgap reads `no-build`, `no-build-package`, `no-binary` and
-`no-binary-package` from the adjacent `pyproject.toml`'s `[tool.uv]` table or `uv.toml`. When both
-files are present, `uv.toml` takes precedence, as it does for `uv sync`. These settings affect
+`no-binary-package` from the uv settings `uv sync` applies: the nearest `uv.toml`, or `pyproject.toml` with a
+`[tool.uv]` table, from the lock's folder up. A `uv.toml` takes precedence over a `pyproject.toml` in the same folder,
+a `pyproject.toml` without `[tool.uv]` (or one uv can't parse) is skipped, and the search goes on past a repository
+root to the top of the filesystem, as uv 0.13.1 does. For a script's lock, the script's own `[tool.uv]` comes first and
+is combined with the nearest settings from the script's folder up, as `uv run` combines them: the script's
+`no-build` and `no-binary` win, and the package lists are joined. These settings affect
 index packages (not local, Git or editable packages that wheelgap skips). `no-build` forbids
-source builds; `no-binary` excludes wheels. `--explain` identifies the applicable settings.
-Invalid setting types are input errors. Only the files beside the lock are read: settings in a `uv.toml` in a
-parent directory, in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't. `wheelgap diff`
-with a git ref reads that ref's `pyproject.toml` and `uv.toml` beside the lock.
+source builds; `no-binary` excludes wheels. `--explain` identifies the applicable settings, with the file's path when
+it's in a folder above (`../uv.toml no-binary-package`). Invalid setting types, and a `uv.toml` that can't be read, are
+input errors. Settings in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't read.
+`--dockerfile-inputs` refuses a `uv sync` line when settings above the lock's folder set a build restriction, since
+the image doesn't have them. `wheelgap diff` with a git ref reads that ref's `pyproject.toml` and `uv.toml` beside
+the lock.
 
 **Python versions outside `requires-python`:** uv only keeps the wheels that can serve the lock's `requires-python`.
 If it leaves out a Python you check (say `==3.13.*`, checked with `-p 3.14t`), wheelgap also looks the lock's PyPI

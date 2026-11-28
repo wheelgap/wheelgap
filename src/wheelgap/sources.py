@@ -575,42 +575,6 @@ def _uv_config(directory: Path) -> tuple[Path, object] | None:
     return None
 
 
-def _refuse_script_build_restrictions(path: Path) -> None:
-    """A script's lock (example.py.lock) doesn't record the build restrictions in the script's own [tool.uv], which
-    `uv run` applies; rather than answer as if they weren't there, refuse a lock whose script beside it sets them.
-    The same goes for a uv.toml or pyproject.toml [tool.uv] in a folder above the lock (up to the repository root),
-    which uv also applies when there's none beside it (a pyproject.toml without [tool.uv] doesn't count):
-    _uv_build_restrictions reads only the lock's own folder."""
-    if not path.name.endswith(".py.lock"):
-        return
-    folder = path.resolve().parent
-    if _uv_config(folder) is None and not (folder / ".git").exists():
-        for directory in folder.parents:
-            if (found := _uv_config(directory)) is not None:
-                config, uv = found
-                if keys := _sets_build_restriction(uv):
-                    raise SourceError(
-                        f"{path.name}: {config} sets {', '.join(keys)}, which wheelgap doesn't read from a folder "
-                        "above a script's lock yet, so it can't say what `uv run` would install"
-                    )
-                break
-            if (directory / ".git").exists():
-                break
-    script = path.with_name(path.name.removesuffix(".lock"))
-    if not script.is_file():
-        return
-    try:
-        data = _script_metadata(script)
-    except (SourceError, OSError):
-        return  # no readable block beside it: nothing to apply, and the lock itself is still read
-    uv = data.get("tool", {}).get("uv", {}) if isinstance(data.get("tool"), dict) else {}
-    if keys := _sets_build_restriction(uv):
-        raise SourceError(
-            f"{path.name}: the script {script.name} sets {', '.join(keys)} in its [tool.uv], which wheelgap "
-            "doesn't read for a script's lock yet, so it can't say what `uv run` would install"
-        )
-
-
 def tool_table(data: dict, path: Path | str) -> dict:
     """Return the [tool] table from parsed TOML, or raise SourceError when tool is not a table."""
     tool = data.get("tool", {})
@@ -619,63 +583,172 @@ def tool_table(data: dict, path: Path | str) -> dict:
     return tool
 
 
-def _uv_build_restrictions(path: Path, source: Source) -> None:
-    """Apply uv's project-level build and wheel restrictions to index packages in a lockfile.
+# The shared reader of the uv settings uv applies to an input (#812): a project's uv.lock and a script's lock go
+# through _find_uv_settings and _uv_build_policy.
 
-    uv.toml takes precedence over [tool.uv] in pyproject.toml when both are present.
-    uv's pip-only [tool.uv.pip] options do not apply to uv sync.
-    """
-    _refuse_script_build_restrictions(path)
-    config_path = path.with_name("uv.toml")
-    standalone = config_path.is_file()
-    if not standalone:
-        config_path = path.with_name("pyproject.toml")
-        if not config_path.is_file():
-            return
+
+@dataclass
+class _UvLayer:
+    """One table of uv settings that applies to an input: a uv.toml, a pyproject.toml's [tool.uv], or a script's
+    [tool.uv]. `table` names it in errors ("uv.toml" or "[tool.uv]"), after `config`; `shown` names it in an install
+    policy, relative to the input's folder (`[tool.uv]`, `uv.toml`, `../uv.toml`, `../pyproject.toml [tool.uv]`)."""
+
+    settings: dict
+    config: Path
+    table: str
+    shown: str
+
+
+def _uv_settings_file(config: Path, strict: bool) -> dict | None:
+    """The settings in a uv.toml, or in a pyproject.toml's [tool.uv] table (None without one). uv 0.13.1 stops with
+    an error on a uv.toml it can't read, but only warns about a pyproject.toml it can't read and looks further up;
+    `strict` makes that an error too, for the input's own pyproject.toml."""
+    standalone = config.name == "uv.toml"
     try:
-        text = config_path.read_text(encoding="utf-8-sig")  # -sig: Windows editors add a BOM
-    except UnicodeDecodeError:
-        raise SourceError(f"{config_path}: isn't UTF-8, so its uv build restrictions can't be read") from None
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise SourceError(f"{config_path}: invalid TOML: {exc}") from None
-    setting_table = "uv.toml" if standalone else "[tool.uv]"
-    tool = tool_table(data, config_path)
-    uv = data if standalone else tool.get("uv", {})
-    if not isinstance(uv, dict):
-        raise SourceError(f"{config_path}: {setting_table} must be a table")
+        data = tomllib.loads(config.read_text(encoding="utf-8-sig"))  # -sig: Windows editors add a BOM
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        if not (standalone or strict):
+            return None
+        if isinstance(e, UnicodeDecodeError):
+            raise SourceError(f"{config}: isn't UTF-8, so its uv settings can't be read") from None
+        if isinstance(e, tomllib.TOMLDecodeError):
+            raise SourceError(f"{config}: invalid TOML: {e}") from None
+        raise SourceError(f"{config}: can't be read ({e}), so its uv settings can't be read") from None
+    if standalone:
+        return data
+    if not strict:  # uv warns about a [tool] or [tool.uv] that isn't a table and keeps looking
+        uv = _table(data, "tool").get("uv")
+        return uv if isinstance(uv, dict) else None
+    uv = tool_table(data, config).get("uv")
+    if uv is not None and not isinstance(uv, dict):
+        raise SourceError(f"{config}: [tool.uv] must be a table")
+    return uv
 
-    for key in ("no-build", "no-binary"):
-        if not isinstance(uv.get(key, False), bool):
-            raise SourceError(f"{config_path}: {setting_table} {key} must be a boolean")
 
-    selected: dict[str, set[str]] = {}
-    for key in ("no-build-package", "no-binary-package"):
-        values = uv.get(key, [])
-        if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
-            raise SourceError(f"{config_path}: {setting_table} {key} must be a list of strings")
-        if any(not _NAME_RE.fullmatch(name) for name in values):
-            raise SourceError(f"{config_path}: {setting_table} {key} must contain valid package names")
-        selected[key] = {canonicalize_name(name) for name in values}
+def _find_uv_settings(folder: Path, own: Path | None = None) -> tuple[Path, dict] | None:
+    """The uv settings uv finds from `folder` (FilesystemOptions::find in uv 0.13.1), with the file they're in: in
+    each folder from it up to the filesystem root, its uv.toml, else a pyproject.toml with a [tool.uv] table. uv
+    skips a pyproject.toml without one, and one it can't read (`own`, the input's own pyproject.toml, is an error
+    instead), and it doesn't stop at a repository root."""
+    for directory in (folder, *folder.parents):
+        for name in ("uv.toml", "pyproject.toml"):
+            config = directory / name
+            if config.is_file() and (settings := _uv_settings_file(config, strict=config == own)) is not None:
+                return config, settings
+    return None
 
-    for pkg in source.packages:
-        if pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
-            continue
+
+def _input_folder(path: Path) -> Path:
+    return Path(os.path.normpath(path.absolute())).parent
+
+
+def _uv_layer(found: tuple[Path, dict], folder: Path, own: Path | None) -> _UvLayer:
+    config, settings = found
+    table = "uv.toml" if config.name == "uv.toml" else "[tool.uv]"
+    if config == own or (table == "uv.toml" and config.parent == folder):
+        return _UvLayer(settings, config, table, table)
+    shown = os.path.relpath(config, folder)
+    return _UvLayer(settings, config, table, shown if table == "uv.toml" else f"{shown} [tool.uv]")
+
+
+def _script_uv_layers(script: Path, block: dict) -> list[_UvLayer]:
+    """A script's settings, as `uv run` applies them: its own [tool.uv], combined with the settings found from the
+    script's folder up (uv 0.13.1 looks there whatever folder it runs in, and only in the folder it runs in when
+    there are none; wheelgap can't know that folder)."""
+    folder = _input_folder(script)
+    layers = [_UvLayer(block, script, "[tool.uv]", "[tool.uv]")]
+    if (found := _find_uv_settings(folder)) is not None:
+        layers.append(_uv_layer(found, folder, None))
+    return layers
+
+
+def _lock_uv_layers(path: Path) -> list[_UvLayer]:
+    """The settings `uv sync` applies to a project's uv.lock: those found from the lock's folder, the workspace
+    root, up; or for a script's lock (example.py.lock), what `uv run` applies to the script beside it."""
+    if path.name.endswith(".py.lock"):
+        script = path.with_name(path.name.removesuffix(".lock"))
+        block: dict = {}
+        if script.is_file():
+            try:
+                block = _table(_table(_script_metadata(script), "tool"), "uv")
+            except (SourceError, OSError):
+                pass  # no readable block beside it: nothing of its own to apply, and the lock itself is still read
+        return _script_uv_layers(script, block)
+    folder = _input_folder(path)
+    own = folder / "pyproject.toml"
+    found = _find_uv_settings(folder, own)
+    return [] if found is None else [_uv_layer(found, folder, own)]
+
+
+def uv_lock_settings_above(path: Path) -> tuple[Path, list[str]] | None:
+    """The uv.toml or pyproject.toml in a folder above a project's uv.lock whose build restrictions the lock check
+    applies, with them (for --dockerfile-inputs, where the image may not have it)."""
+    folder = _input_folder(path)
+    found = _find_uv_settings(folder, folder / "pyproject.toml")
+    if found is None or found[0].parent == folder or not (keys := _sets_build_restriction(found[1])):
+        return None
+    return found[0], keys
+
+
+@dataclass
+class _BuildPolicy:
+    """The build and wheel restrictions uv applies to index packages, each as the setting that turns it on is named
+    in an install policy (`[tool.uv] no-binary-package`)."""
+
+    no_build: str | None = None
+    no_binary: str | None = None
+    no_build_package: dict[str, str] = field(default_factory=dict)
+    no_binary_package: dict[str, str] = field(default_factory=dict)
+
+    def apply(self, pkg: Package) -> None:
         restrictions = []
-        if uv.get("no-build"):
+        if self.no_build or pkg.key in self.no_build_package:
             pkg.only_binary = True
-            restrictions.append(f"{setting_table} no-build")
-        elif pkg.key in selected["no-build-package"]:
-            pkg.only_binary = True
-            restrictions.append(f"{setting_table} no-build-package")
-        if uv.get("no-binary"):
+            restrictions.append(self.no_build or self.no_build_package[pkg.key])
+        if self.no_binary or pkg.key in self.no_binary_package:
             pkg.no_binary = True
-            restrictions.append(f"{setting_table} no-binary")
-        elif pkg.key in selected["no-binary-package"]:
-            pkg.no_binary = True
-            restrictions.append(f"{setting_table} no-binary-package")
+            restrictions.append(self.no_binary or self.no_binary_package[pkg.key])
         pkg.install_policy = ", ".join(restrictions) or None
+
+
+def _uv_build_policy(layers: list[_UvLayer]) -> _BuildPolicy:
+    """The restrictions in `layers`, highest precedence first, combined as uv combines a script's [tool.uv] with
+    the settings found for it: the first layer that sets no-build or no-binary decides it, and the
+    package lists are joined (uv 0.13.1 builds a package either names). uv's pip-only [tool.uv.pip] options don't
+    apply to uv sync or uv run."""
+    policy = _BuildPolicy()
+    decided: set[str] = set()
+    for layer in layers:
+        for key in ("no-build", "no-binary"):
+            if key not in layer.settings:
+                continue
+            value = layer.settings[key]
+            if not isinstance(value, bool):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must be a boolean")
+            if key in decided:
+                continue
+            decided.add(key)
+            if value:
+                setattr(policy, key.replace("-", "_"), f"{layer.shown} {key}")
+        for key in ("no-build-package", "no-binary-package"):
+            values = layer.settings.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must be a list of strings")
+            if any(not _NAME_RE.fullmatch(name) for name in values):
+                raise SourceError(f"{layer.config}: {layer.table} {key} must contain valid package names")
+            names = policy.no_build_package if key == "no-build-package" else policy.no_binary_package
+            for name in values:
+                names.setdefault(canonicalize_name(name), f"{layer.shown} {key}")
+    return policy
+
+
+def _uv_build_restrictions(path: Path, source: Source) -> None:
+    """Apply the build and wheel restrictions of the uv settings `uv sync` (or `uv run`, for a script's lock)
+    applies to the index packages in a uv.lock (_lock_uv_layers)."""
+    policy = _uv_build_policy(_lock_uv_layers(path))
+    for pkg in source.packages:
+        if not pkg.skip:  # uv may build first-party/editable dependencies; wheelgap skips these.
+            policy.apply(pkg)
 
 
 def parse_uv_lock(path: Path) -> Source:
