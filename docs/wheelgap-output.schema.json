@@ -506,6 +506,11 @@
                     "description": "Present for a uv.lock or a script's lock checked with --online, when the package has files that uv installs and pip would refuse: each such file mapped to why, such as \"requires Python <3.15,>=3.10\". uv checks the Requires-Python lower bound, so these files count in results, which follow uv sync; pip (on an exported requirements file, say) refuses them on these targets' Python. With several Pythons the package has one entry per differing answer, and the key is on the entry for the Python pip refuses. Never empty: left out when pip refuses nothing.",
                     "type": "object",
                     "additionalProperties": {"type": "string", "description": "Keyed by filename, not by target label: why pip refuses that file."}
+                },
+                "unknown_reasons": {
+                    "description": "Present when a target is unknown for a reason other than a failed lookup: a Poetry 1.x poetry.lock checked without a pyproject.toml that declares the project's dependencies, where no dependency installs the package on that target, it has no wheel there, and Poetry installs it anyway if the project requires it directly. Keyed by target label, as results is. Never empty: left out otherwise.",
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
                 }
             }
         }

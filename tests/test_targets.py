@@ -568,3 +568,77 @@ def test_libc_versions_require_minor_and_valid_major():
     assert parse_version_pair("1.1", "musl") == (1, 1)
     assert parse_version_pair("1.2", "musl") == (1, 2)
     assert parse_version_pair("15", "macOS") == (15, 0)
+
+
+# Edges that mutation testing (.github/workflows/mutation.yml) showed no test pinned down.
+
+
+def test_legacy_manylinux_aliases_start_at_their_exact_glibc():
+    # manylinux2010 is glibc 2.12 and manylinux1 is 2.5 (PEP 571, PEP 513): a target at exactly that glibc takes
+    # them, one release lower doesn't.
+    mp = manylinux_platforms
+    assert "manylinux2010_x86_64" in mp("x86_64", (2, 12))
+    assert "manylinux2010_x86_64" not in mp("x86_64", (2, 11))
+    assert mp("x86_64", (2, 5)) == ["manylinux_2_5_x86_64", "manylinux1_x86_64"]
+    assert "manylinux1_i686" in mp("i686", (2, 5))
+    assert "manylinux2014_aarch64" in mp("aarch64", (2, 17))
+    # Each alias sits right after the manylinux_2_N tag it stands for, in pip's order.
+    tags = mp("x86_64", (2, 17))
+    assert tags[tags.index("manylinux_2_17_x86_64") + 1] == "manylinux2014_x86_64"
+    assert tags[tags.index("manylinux_2_12_x86_64") + 1] == "manylinux2010_x86_64"
+    assert tags[-2:] == ["manylinux_2_5_x86_64", "manylinux1_x86_64"]
+
+
+def test_musllinux_platforms_are_every_minor_down_to_zero():
+    assert target_module.musllinux_platforms("x86_64", (1, 2)) == [
+        "musllinux_1_2_x86_64",
+        "musllinux_1_1_x86_64",
+        "musllinux_1_0_x86_64",
+    ]
+    assert target_module.musllinux_platforms("aarch64", (1, 0)) == ["musllinux_1_0_aarch64"]
+
+
+@pytest.mark.parametrize("spec", ["2.0", "2.99", "1.0", "1.99"])
+def test_version_pairs_at_the_edges_of_the_range_are_accepted(spec):
+    what = "glibc" if spec.startswith("2") else "musl"
+    assert target_module.parse_version_pair(spec, what) == tuple(int(p) for p in spec.split("."))
+
+
+def test_macos_versions_at_the_edges_of_the_range():
+    # macOS has no fixed major (unlike glibc 2.x and musl 1.x), so the 0..99 range is the only bound on it.
+    assert target_module.parse_version_pair("0.0", "macOS") == (0, 0)
+    assert target_module.parse_version_pair("99.99", "macOS") == (99, 99)
+    with pytest.raises(TargetError, match="out of range"):
+        target_module.parse_version_pair("100.0", "macOS")
+
+
+@pytest.mark.parametrize("spec", ["2.100", "100.0"])
+def test_version_pairs_past_99_are_out_of_range(spec):
+    with pytest.raises(TargetError, match="out of range"):
+        target_module.parse_version_pair(spec, "glibc")
+
+
+def test_android_api_level_floor_and_ceiling_are_inclusive():
+    assert target_module.parse_api_level(str(target_module.ANDROID_FLOOR)) == target_module.ANDROID_FLOOR
+    assert target_module.parse_api_level(str(target_module.ANDROID_CEILING)) == target_module.ANDROID_CEILING
+    with pytest.raises(TargetError, match="too old"):
+        target_module.parse_api_level(str(target_module.ANDROID_FLOOR - 1))
+    with pytest.raises(TargetError, match="doesn't exist"):
+        target_module.parse_api_level(str(target_module.ANDROID_CEILING + 1))
+
+
+def test_ios_floor_is_inclusive():
+    assert target_module.parse_ios_version("12.0") == target_module.IOS_FLOOR
+    with pytest.raises(TargetError, match="too old"):
+        target_module.parse_ios_version("11.9")
+
+
+def test_target_defaults_are_the_documented_defaults():
+    # The dataclass's defaults must match the DEFAULT_* values the CLI and the docs name.
+    t0 = Target(3, 13, False, "macos-arm64")
+    pair = target_module.parse_version_pair
+    assert t0.glibc == pair(target_module.DEFAULT_GLIBC, "glibc")
+    assert t0.musl == pair(target_module.DEFAULT_MUSL, "musl")
+    assert t0.macos == pair(target_module.DEFAULT_MACOS, "macOS")
+    assert t0.ios == target_module.parse_ios_version(target_module.DEFAULT_IOS)
+    assert t0.android_api == int(target_module.DEFAULT_ANDROID_API)

@@ -2252,56 +2252,86 @@ def test_script_lock_fork_markers_never_hide_an_entry(tmp_path, markers, expecte
     assert {r.package.version for r in results if r.needed} == expected
 
 
-@pytest.mark.parametrize("setting", ['no-binary-package = ["purewheel"]', "no-build = true"])
-def test_script_lock_refused_when_its_script_sets_build_restrictions(tmp_path, capsys, fake_pypi, setting):
+def _script_lock_results(capsys, lock) -> tuple[int, dict[str, str]]:
+    code = main([str(lock), "-p", "3.13", "-t", "win-arm64", "--json"])
+    packages = json.loads(capsys.readouterr().out)["packages"]
+    return code, {p["name"]: p["results"]["win-arm64"] for p in packages}
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ('no-binary-package = ["purewheel"]', {"purewheel": "missing", "puresdist": "source"}),
+        ("no-build = true", {"purewheel": "wheel", "puresdist": "missing"}),
+    ],
+)
+def test_script_lock_applies_the_build_restrictions_its_script_sets(tmp_path, capsys, fake_pypi, setting, expected):
+    # uv run applies the script's own [tool.uv] to the packages of its lock (uv 0.13.1 builds them from source).
     (tmp_path / "example.py").write_text(
-        f'# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# {setting}\n# ///\nprint("hi")\n',
+        f'# /// script\n# dependencies = ["purewheel", "puresdist"]\n# [tool.uv]\n# {setting}\n# ///\nprint("hi")\n',
+        encoding="utf-8",
+    )
+    lock = tmp_path / "example.py.lock"
+    lock.write_text(_script_lock("purewheel", "puresdist"), encoding="utf-8")
+    code, results = _script_lock_results(capsys, lock)
+    assert code == 1
+    assert results == expected
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    ("name", "config", "policy"),
+    [
+        (
+            "pyproject.toml",
+            '[tool.uv]\nno-binary-package = ["purewheel"]\n',
+            "../pyproject.toml [tool.uv] no-binary-package",
+        ),
+        ("uv.toml", "no-binary = true\n", "../uv.toml no-binary"),
+    ],
+)
+def test_script_lock_applies_the_build_restrictions_a_folder_above_sets(
+    tmp_path, capsys, fake_pypi, name, config, policy
+):
+    # uv run applies the nearest uv.toml or pyproject.toml [tool.uv] from the script's folder up, past a repository
+    # root too (uv 0.13.1 doesn't stop at a .git).
+    (tmp_path / name).write_text(config, encoding="utf-8")
+    (tmp_path / "scripts" / ".git").mkdir(parents=True)
+    lock = tmp_path / "scripts" / "example.py.lock"
+    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
+    assert _script_lock_results(capsys, lock) == (1, {"purewheel": "missing"})
+    main([str(lock), "-p", "3.13", "-t", "win-arm64", "--explain"])
+    assert f"install policy: {policy}" in capsys.readouterr().out
+
+
+def test_script_lock_joins_the_package_lists_of_its_script_and_a_folder_above(tmp_path, capsys, fake_pypi):
+    # uv 0.13.1 builds a package that either list names: the script's [tool.uv] is combined with the settings found.
+    (tmp_path / "uv.toml").write_text('no-binary-package = ["purewheel"]\n', encoding="utf-8")
+    (tmp_path / "example.py").write_text(
+        '# /// script\n# dependencies = ["purewheel"]\n# [tool.uv]\n# no-binary-package = ["other"]\n# ///\n',
         encoding="utf-8",
     )
     lock = tmp_path / "example.py.lock"
     lock.write_text(_script_lock("purewheel"), encoding="utf-8")
-    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 2
-    err = capsys.readouterr().err
-    assert "example.py.lock: the script example.py sets" in err
-    assert setting.split(" ")[0] in err
-    assert fake_pypi == []
+    assert _script_lock_results(capsys, lock)[1] == {"purewheel": "missing"}
 
 
 @pytest.mark.parametrize(
-    ("name", "config"),
-    [("pyproject.toml", '[tool.uv]\nno-binary-package = ["purewheel"]\n'), ("uv.toml", "no-build = true\n")],
-)
-def test_script_lock_refused_when_a_folder_above_sets_build_restrictions(tmp_path, capsys, fake_pypi, name, config):
-    # uv run applies the nearest uv.toml or pyproject.toml, which for a script lock is often in a folder above it.
-    (tmp_path / ".git").mkdir()
-    (tmp_path / name).write_text(config, encoding="utf-8")
-    (tmp_path / "scripts").mkdir()
-    lock = tmp_path / "scripts" / "example.py.lock"
-    lock.write_text(_script_lock("purewheel"), encoding="utf-8")
-    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == 2
-    err = capsys.readouterr().err
-    assert f"example.py.lock: {tmp_path.resolve() / name} sets" in err
-    assert fake_pypi == []
-
-
-@pytest.mark.parametrize(
-    ("beside", "code"),
+    ("beside", "expected"),
     [
         # uv skips a pyproject.toml without [tool.uv] and keeps looking, so the restriction above applies.
-        ('[project]\nname = "s"\nversion = "0"\n', 2),
+        ('[project]\nname = "s"\nversion = "0"\n', "missing"),
         # One with [tool.uv] is the nearest config, so the restriction above it doesn't.
-        ('[tool.uv]\nexclude-newer = "2025-01-01T00:00:00Z"\n', 0),
+        ('[tool.uv]\nexclude-newer = "2025-01-01T00:00:00Z"\n', "wheel"),
     ],
 )
-def test_script_lock_folder_above_and_the_pyproject_beside_it(tmp_path, capsys, fake_pypi, beside, code):
-    (tmp_path / "pyproject.toml").write_text("[tool.uv]\nno-build = true\n", encoding="utf-8")
+def test_script_lock_folder_above_and_the_pyproject_beside_it(tmp_path, capsys, fake_pypi, beside, expected):
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\nno-binary = true\n", encoding="utf-8")
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "pyproject.toml").write_text(beside, encoding="utf-8")
     lock = tmp_path / "scripts" / "example.py.lock"
     lock.write_text(_script_lock("purewheel"), encoding="utf-8")
-    assert main([str(lock), "-p", "3.13", "-t", "win-arm64"]) == code
-    if code == 2:
-        assert "no-build" in capsys.readouterr().err
+    assert _script_lock_results(capsys, lock)[1] == {"purewheel": expected}
 
 
 @pytest.mark.parametrize("setting", ["no-build = false", "no-binary-package = []"])

@@ -425,8 +425,7 @@ POETRY_LOCK = (
         ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "not toml ["}, False),  # can't be read: maybe an index
         ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "native-tls = true\n"}, True),
         ({"pyproject.toml": PYPROJECT}, True),
-        ({"pyproject.toml": PYPROJECT + "\n[tool.uv]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
-        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.sources]\nnowheels = { index = 'corp' }\n"}, False),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.sources]\nother = { index = 'corp' }\n"}, False),
         ({"pyproject.toml": PYPROJECT + "\n[tool.uv.pip]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
         (
             {
@@ -440,8 +439,19 @@ POETRY_LOCK = (
             False,
         ),
         ({"pyproject.toml": PYPROJECT + "\n[tool.uv]\npackage = false\n"}, True),
-        ({"pyproject.toml": PYPROJECT, "uv.toml": "[[index]]\nurl = 'https://x.example/simple'\n"}, False),
-        ({"pyproject.toml": PYPROJECT + "\n[[tool.uv.index]]\nurl = 'https://pypi.corp.example/simple'\n"}, False),
+        # An explicit index serves only the sources that name it, so nowheels is still looked up on PyPI; one that
+        # isn't explicit, or index-url, keeps it off PyPI altogether (tests/test_uv_settings.py).
+        (
+            {"pyproject.toml": PYPROJECT, "uv.toml": "[[index]]\nurl = 'https://x.example/simple'\nexplicit = true\n"},
+            False,
+        ),
+        (
+            {
+                "pyproject.toml": PYPROJECT
+                + "\n[[tool.uv.index]]\nurl = 'https://pypi.corp.example/simple'\nexplicit = true\n"
+            },
+            False,
+        ),
         ({"Pipfile.lock": pipfile([PYPI_SOURCE], "pypi")}, True),
         ({"Pipfile.lock": pipfile([PYPI_SOURCE])}, True),  # the only source is PyPI
         ({"Pipfile.lock": pipfile([CORP_SOURCE, PYPI_SOURCE])}, False),  # no index: maybe the default, corp
