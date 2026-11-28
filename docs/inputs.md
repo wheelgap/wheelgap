@@ -275,11 +275,13 @@ as `private index`.
 
 **Lock versions before 2.1** (all of Poetry 1.x) record markers only on dependency edges, so wheelgap walks the
 dependency graph from the packages nothing depends on and from the dependencies declared in the `pyproject.toml`
-next to the lock. Without a readable `pyproject.toml` there, wheelgap can't tell a direct dependency that another
-package needs only under a marker (`colorama`, which `click` needs on Windows only) from one installed only under that
-marker, and Poetry installs a direct dependency everywhere. Where that could hide a gap (a package left out on a target
-that has no wheel for it), the run is an error (exit code 2, and the [error object](output.md#json) with `--json`)
-that names those packages and targets; where every package left out has a wheel anyway, the lock is checked as usual.
+next to the lock. Without a `pyproject.toml` there that declares them (none, one that can't be read, or one with no
+dependencies at all), wheelgap can't tell a direct dependency that another package needs only under a marker
+(`colorama`, which `click` needs on Windows only) from one installed only under that marker, and Poetry installs a
+direct dependency everywhere. So a package that no dependency installs on a target, and that has no wheel there, is
+`unknown` on that target rather than `n/a`, unless another version of it is installed there. `--explain` and
+`unknown_reasons` in `--json` say why, and a note on stderr names the packages. It counts as any `unknown` does, and
+`--ignore` takes it; where a left-out package has a wheel anyway, the answer is the same either way and nothing changes.
 `--explain` shows the dependency path for these locks. `python-versions` isn't applied to them: the
 lock doesn't say which Pythons a direct dependency is installed for (`numpy = [{version = "1.26.4", python = "<3.13"},
 ...]` is only in `pyproject.toml`), so the range would report a pin as `missing` on a Python Poetry never installs it

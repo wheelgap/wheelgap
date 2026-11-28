@@ -13,7 +13,6 @@ import wheelgap
 from wheelgap import cli
 from wheelgap.check import Status
 from wheelgap.cli import main
-from wheelgap.sources import SourceError
 from wheelgap.targets import ALIASES, DEFAULT_PLATFORMS, PLATFORMS
 
 NOTES_HINT = (
@@ -5216,33 +5215,99 @@ POETRY_1X_CLICK_COLORAMA = (
 )
 
 
-def test_poetry_1x_lock_without_its_pyproject_is_refused_where_it_could_hide_a_gap(capsys, tmp_path, fake_pypi):
+def test_poetry_1x_lock_without_its_pyproject_is_unknown_where_it_could_hide_a_gap(capsys, tmp_path, fake_pypi):
     (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64", "--json")
-    assert code == 2  # used to be a pass, with colorama hidden on Linux and no note
-    message = json.loads(out)["error"]["message"]
-    assert "Poetry 1.x lock (lock-version 2.0)" in message and "there is none" in message
-    assert "they have no wheel there: colorama on linux-x86_64." in message
-    assert err.startswith("wheelgap: error: ")
+    assert code == 1  # used to be a pass, with colorama hidden on Linux and no note
+    rows = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert rows["colorama"]["results"] == {"linux-x86_64": "unknown", "win-amd64": "source"}  # not ✓
+    (reason,) = rows["colorama"]["unknown_reasons"].values()
+    assert "the pyproject.toml beside the lock is needed to tell" in reason
+    assert "(there is no pyproject.toml beside poetry.lock)" in reason
+    assert rows["click"]["results"] == {"linux-x86_64": "wheel", "win-amd64": "wheel"}
+    assert "unknown_reasons" not in rows["click"]
+    assert (
+        "wheelgap: note: a Poetry 1.x lock doesn't record the project's own dependencies, and there is no "
+        "pyproject.toml beside poetry.lock: colorama is `unknown` where no dependency installs it"
+    ) in err
+    # --explain says why, and --ignore takes it like any other unknown.
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    assert "colorama 0.4.6 on linux-x86_64: ? unknown\n  no dependency installs it here" in out
+    assert run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--ignore", "colorama")[0] == 0
 
 
-def test_poetry_1x_lock_with_an_unreadable_pyproject_is_refused_too(tmp_path, fake_pypi):
+def test_poetry_1x_lock_without_its_pyproject_answers_the_rest(capsys, tmp_path, fake_pypi):
+    # pywin32 has Windows wheels only, and only app-lib's Windows marker installs it: maybe a direct dependency too.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app-lib"\nversion = "1.0"\nfiles = [{ file = "app_lib-1.0-py3-none-any.whl" }]\n\n'
+        '[package.dependencies]\npywin32 = {version = ">=300", markers = "sys_platform == \\"win32\\""}\n'
+        'nowheels = "*"\n\n'
+        '[[package]]\nname = "pywin32"\nversion = "306"\n'
+        'files = [{ file = "pywin32-306-cp313-cp313-win_amd64.whl" }]\n\n'
+        '[[package]]\nname = "nowheels"\nversion = "0.9"\nfiles = [{ file = "nowheels-0.9.tar.gz" }]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    assert code == 1, err
+    rows = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert rows["pywin32"]["results"] == {"linux-x86_64": "unknown", "win-amd64": "wheel"}
+    assert list(rows["pywin32"]["unknown_reasons"]) == ["linux-x86_64"]
+    assert rows["nowheels"]["results"] == {"linux-x86_64": "source", "win-amd64": "source"}
+    assert "unknown_reasons" not in rows["nowheels"]
+    # The Python API gives the same answer and reason.
+    lin, win = wheelgap.make_targets(["3.13"], ["linux-x86_64", "win-amd64"])
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path / "poetry.lock", [lin, win])}
+    assert results["pywin32"].statuses == {lin: Status.UNKNOWN, win: Status.WHEEL}
+    assert "pyproject.toml beside the lock is needed" in results["pywin32"].unknown_reasons[lin]
+    assert results["pywin32"].to_dict()["unknown_reasons"] == {
+        "3.13 linux-x86_64": results["pywin32"].unknown_reasons[lin]
+    }
+
+
+def test_poetry_1x_lock_without_its_pyproject_names_at_most_five_packages(capsys, tmp_path, fake_pypi):
+    names = [f"nvidia-lib{i}" for i in range(7)]
+    lock = '[[package]]\nname = "torch"\nversion = "2"\nfiles = [{ file = "torch-2-py3-none-any.whl" }]\n\n'
+    lock += "[package.dependencies]\n" + "".join(
+        f'{n} = {{version = "*", markers = "sys_platform == \\"linux\\""}}\n' for n in names
+    )
+    wheel = "{}-1-py3-none-manylinux_2_17_x86_64.whl"
+    lock += "".join(
+        f'\n[[package]]\nname = "{n}"\nversion = "1"\nfiles = [{{ file = "{wheel.format(n.replace("-", "_"))}" }}]\n'
+        for n in names
+    )
+    (tmp_path / "poetry.lock").write_text(lock + '\n[metadata]\nlock-version = "2.0"\n', encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64")
+    assert code == 1
+    assert ": nvidia-lib0, nvidia-lib1, nvidia-lib2, nvidia-lib3, nvidia-lib4 and 2 more are `unknown`" in err
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "why"),
+    [
+        ("[tool.ruff]\nline-length = 100\n", "the pyproject.toml beside poetry.lock declares no dependencies"),
+        ("[tool.poetry\n", "the pyproject.toml beside poetry.lock can't be read"),
+    ],
+)
+def test_poetry_1x_lock_with_a_pyproject_that_declares_nothing_is_unknown_too(tmp_path, fake_pypi, pyproject, why):
     (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text("[tool.poetry\n", encoding="utf-8")
-    # The command line already refuses it for its [tool.wheelgap] table; the Python API reads no config.
-    with pytest.raises(SourceError, match="that file can't be read"):
-        wheelgap.check_lockfile(tmp_path / "poetry.lock", wheelgap.make_targets(["3.13"], ["linux-x86_64"]))
+    (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    # The Python API: the command line refuses a pyproject.toml that isn't TOML for its [tool.wheelgap] table first.
+    (lin,) = wheelgap.make_targets(["3.13"], ["linux-x86_64"])
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path / "poetry.lock", [lin])}
+    assert results["colorama"].statuses == {lin: Status.UNKNOWN}  # a [tool.ruff]-only one used to give ✓
+    assert results["colorama"].unknown_reasons[lin].endswith(f"({why})")
 
 
 def test_poetry_1x_lock_with_its_pyproject_checks_direct_dependencies_everywhere(capsys, tmp_path, fake_pypi):
     (tmp_path / "poetry.lock").write_text(POETRY_1X_CLICK_COLORAMA, encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "^8.1"\ncolorama = "^0.4"\n', encoding="utf-8"
-    )
+    pyproject = '[tool.poetry.dependencies]\npython = "^3.11"\nclick = "^8.1"\ncolorama = "^0.4"\n'
+    (tmp_path / "pyproject.toml").write_bytes(b"\xef\xbb\xbf" + pyproject.encode())  # a BOM is still readable
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
     assert code == 1, err
     (row,) = [p for p in json.loads(out)["packages"] if p["name"] == "colorama"]
-    assert row["results"]["linux-x86_64"] == "source"
+    assert row["results"]["linux-x86_64"] == "source" and "unknown_reasons" not in row
+    assert "note:" not in err
 
 
 def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_has_a_gap(capsys, tmp_path, fake_pypi):
@@ -5250,7 +5315,27 @@ def test_poetry_1x_lock_without_its_pyproject_is_checked_when_nothing_left_out_h
     lock = POETRY_1X_CLICK_COLORAMA.replace("colorama-0.4.6.tar.gz", "colorama-0.4.6-py2.py3-none-any.whl")
     (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64")
-    assert code == 0, err
+    assert code == 0 and "note:" not in err, err
+
+
+def test_poetry_1x_lock_without_its_pyproject_counts_another_installed_version(capsys, tmp_path, fake_pypi):
+    # On 3.12, app-lib installs numpy 1.26.4 (with a wheel); the left-out 1.24.4 isn't another package to doubt.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app-lib"\nversion = "1.0"\nfiles = [{ file = "app_lib-1.0-py3-none-any.whl" }]\n\n'
+        '[package.dependencies]\nnumpy = [{version = "1.24.4", markers = "python_version < \\"3.9\\""}, '
+        '{version = ">=1.26", markers = "python_version >= \\"3.9\\""}]\n\n'
+        '[[package]]\nname = "numpy"\nversion = "1.24.4"\nfiles = [{ file = "numpy-1.24.4.tar.gz" }]\n\n'
+        '[[package]]\nname = "numpy"\nversion = "1.26.4"\n'
+        'files = [{ file = "numpy-1.26.4-cp312-cp312-manylinux_2_17_x86_64.whl" }]\n\n'
+        '[metadata]\nlock-version = "1.1"\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64", "--json")
+    assert code == 0 and "note:" not in err, err
+    assert {(p["name"], p["version"]): p["results"] for p in json.loads(out)["packages"]} == {
+        ("app-lib", "1.0"): {"linux-x86_64": "wheel"},
+        ("numpy", "1.26.4"): {"linux-x86_64": "wheel"},
+    }
 
 
 def test_a_failing_via_hint_never_costs_the_check(capsys, tmp_path, fake_pypi, monkeypatch):

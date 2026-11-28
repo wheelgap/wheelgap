@@ -42,6 +42,7 @@ from .check import (
     lock_environments_note,
     marker_holds,
     narrow_to_lock_environments,
+    poetry_roots_note,
     reachable,
 )
 from .codequality import write_codequality
@@ -884,6 +885,10 @@ def render_explain(
         needs = describe(info, sources) if info and sources else None
         ask = (issues_urls or {}).get(id(r.package))  # once per release, under its first gap
         gap_wheel = filled.get(id(r))  # once per release, under its first filled target
+        unsure = [t for t in targets if t in r.unknown_reasons and t not in r.ignored]
+        if unsure:  # a Poetry 1.x lock without its project's dependencies (#815): one reason for every such target
+            head = f"{r.package.name} {r.package.version or '?'} on {', '.join(t.label(multi_py) for t in unsure)}:"
+            out += [f"{style.bold(head)} {style.dim(CELL[Status.UNKNOWN][0])}", f"  {r.unknown_reasons[unsure[0]]}", ""]
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -1066,6 +1071,8 @@ def report_json(
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
         if r.package.pip_refuses:
             out["pip_refuses"] = r.package.pip_refuses
+        if r.unknown_reasons:  # why a target is `unknown` when the lookup didn't fail (a Poetry 1.x lock, #815)
+            out["unknown_reasons"] = {t.label(multi_py): why for t, why in r.unknown_reasons.items()}
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [
@@ -1606,6 +1613,10 @@ def render_markdown(
     for r in rows:
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
+        elif r.unknown_reasons:
+            where = ", ".join(t.label(multi_py) for t in r.unknown_reasons)
+            why = _md(next(iter(r.unknown_reasons.values())))
+            out += [f"Could not tell whether {_md(r.package.name)} is installed on {where}: {why}", ""]
     if dropped:
         out += [
             f"- {_code(label)}: {_code(version)} had a wheel, this release has none"
@@ -3098,11 +3109,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if source.path in uv_files or id(source) in uv_named:
             restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
-    try:
-        rows = [r for r in check(sources, targets) if r.needed]
-    except SourceError as e:  # a Poetry 1.x lock without its pyproject.toml, where that could hide a gap
-        print(f"wheelgap: error: {e}", file=sys.stderr)
-        return input_error_json(e) if args.json else 2
+    rows = [r for r in check(sources, targets) if r.needed]
+    if not quiet and (roots_note := poetry_roots_note(sources, rows)):
+        print(f"wheelgap: note: {roots_note}", file=sys.stderr)
     if pyodide_lock:
         apply_bundled(rows, targets, pyodide_lock)
     rows.sort(key=lambda r: r.package.key)

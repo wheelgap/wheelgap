@@ -85,6 +85,9 @@ class Row:
     input_package: Package | None = field(default=None, repr=False, compare=False)
     # Direct dependencies that reach a transitive package on a target, for concise text/Markdown hints.
     direct_via: dict[Target, tuple[str, ...]] = field(default_factory=dict, repr=False, compare=False)
+    # Why a target is UNKNOWN when the lookup didn't fail: a Poetry 1.x lock checked without its project's dependencies
+    # (#815), where no dependency needs the package there but the project may require it directly.
+    unknown_reasons: dict[Target, str] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def counted(self) -> list[Status]:
@@ -1447,8 +1450,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
         # The (via ...) hint, per target, worked out only when a gap needs it, so gap-free runs never pay. Text and
         # Markdown tables show it, and `--json --explain` writes it as `direct`.
         hints: dict[Target, dict[int, tuple[str, ...]]] = {}
-        # Poetry 1.x without its pyproject.toml: packages the walk leaves out on a target that would have a gap there.
-        unsure: dict[str, list[Target]] = {}
+        # Poetry 1.x without its project's dependencies (#815): the names each target installs, for left-out packages.
+        installed_keys: dict[Target, set[str]] = {}
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
@@ -1476,8 +1479,15 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                     if needed or source.poetry_roots_unknown
                     else Status.NOT_NEEDED
                 )
-                if not needed and status not in (Status.WHEEL, Status.NOT_NEEDED):
-                    unsure.setdefault(pkg.name, []).append(t)
+                if not needed and status not in (Status.WHEEL, Status.NOT_NEEDED) and installed is not None:
+                    # No dependency installs it here, but Poetry installs a direct dependency everywhere, and only the
+                    # pyproject.toml can say whether it is one. Another version of the name installed here settles it.
+                    if t not in installed_keys:
+                        installed_keys[t] = {source.packages[j].key for j in installed[t]}
+                    if pkg.key not in installed_keys[t]:
+                        row.results[t] = Status.UNKNOWN
+                        row.unknown_reasons[t] = poetry_roots_reason(source)
+                        continue
                 row.results[t] = status if needed else Status.NOT_NEEDED
                 if needed and installed is not None:
                     row.via[t] = (
@@ -1497,20 +1507,28 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                         if direct := hints[t].get(i):
                             row.direct_via[t] = direct
             rows.extend(resolved_rows.values())
-        if unsure:
-            raise SourceError(_poetry_roots_unknown_message(source, unsure, targets))
     return rows
 
 
-def _poetry_roots_unknown_message(source: Source, unsure: dict[str, list[Target]], targets: list[Target]) -> str:
-    """Why check() refuses a Poetry 1.x lock read without its pyproject.toml (#815)."""
-    with_python = len({t.python for t in targets}) > 1
-    where = "; ".join(
-        f"{name} on {', '.join(dict.fromkeys(t.label(with_python) for t in some))}" for name, some in unsure.items()
-    )
+def poetry_roots_reason(source: Source) -> str:
+    """Why a package a Poetry 1.x lock's walk leaves out is UNKNOWN on a target (#815)."""
     return (
-        f"{source.poetry_roots_unknown}. Poetry installs a direct dependency everywhere, even one another package "
-        "needs only under a marker, so wheelgap can't tell whether these are installed where the markers leave them "
-        f"out, and they have no wheel there: {where}. Check the lock beside its pyproject.toml, or relock with "
-        "Poetry 2 (lock-version 2.1 records where each package is installed)"
+        "no dependency installs it here, but Poetry installs it on every target if the project requires it directly, "
+        "and a Poetry 1.x lock doesn't record that: the pyproject.toml beside the lock is needed to tell "
+        f"({source.poetry_roots_unknown})"
+    )
+
+
+def poetry_roots_note(sources: list[Source], rows: list[Row]) -> str | None:
+    """The run's note for the packages poetry_roots_reason made UNKNOWN, naming at most five."""
+    names = list(dict.fromkeys(r.package.name for r in rows if r.unknown_reasons))
+    why = "; ".join(source.poetry_roots_unknown for source in sources if source.poetry_roots_unknown)
+    if not names or not why:
+        return None
+    shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    return (
+        f"a Poetry 1.x lock doesn't record the project's own dependencies, and {why}: {shown} "
+        f"{'is' if len(names) == 1 else 'are'} `unknown` where no dependency installs "
+        f"{'it' if len(names) == 1 else 'them'} and there's no wheel, since Poetry installs a direct dependency "
+        "there too; check the lock beside its pyproject.toml"
     )
