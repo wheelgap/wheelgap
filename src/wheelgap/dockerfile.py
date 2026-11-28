@@ -2399,8 +2399,9 @@ _UV_HARMLESS_ENV = frozenset(
 # "boolish" switch takes y, yes, t, true, on, 1 and their opposites, in any capitals; a link mode is one of four
 # lowercase words; UV_PYTHON_DOWNLOADS takes those words and 1 or 0 in any capitals; numbers take an optional "+"
 # (a leading zero is fine), the timeout is a u64, the retries a u32, and a concurrency limit is at most 2**61 - 1.
-_UV_BOOLISH = "(?i:y|yes|t|true|on|1|n|no|f|false|off|0)"
+_UV_BOOLISH = "(?ai:y|yes|t|true|on|1|n|no|f|false|off|0)"
 _UV_NUMBER = r"\+?[0-9]+"
+_UV_TRUE = ("y", "yes", "t", "true", "on", "1")  # the boolish values uv reads as true
 _UV_VALUES: dict[str, tuple[str, str, int | None]] = {
     **dict.fromkeys(
         "UV_NO_CACHE UV_COMPILE_BYTECODE UV_NO_PROGRESS UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT "
@@ -2409,7 +2410,7 @@ _UV_VALUES: dict[str, tuple[str, str, int | None]] = {
     ),
     "UV_LINK_MODE": ("clone|copy|hardlink|symlink", "clone, copy, hardlink or symlink", None),
     "UV_PYTHON_DOWNLOADS": (
-        "(?i:auto|automatic|manual|never|true|false|1|0)",
+        "(?ai:auto|automatic|manual|never|true|false|1|0)",
         "auto, automatic, manual, never, true, false, 1 or 0",
         None,
     ),
@@ -4717,6 +4718,7 @@ def _dockerfile_requirements(
                             )
                         )
                     continue
+                own_value = value  # before an ENV of the same name makes it ambiguous
                 if keyword == "ARG" and name in env_names:
                     # BuildKit puts an ARG with a value in the environment over an earlier ENV of the same name
                     # (dispatchArg: `d.state.AddEnv` in dockerfile2llb/convert.go); the classic builder keeps the
@@ -4783,12 +4785,20 @@ def _dockerfile_requirements(
                 if _installer_setting(name):
                     # The value is left out: an index URL may hold credentials.
                     run_error = f"line {number}: {keyword} {name} may change what pip or uv installs"
-                elif (problem := _uv_value_problem(name, value)) is not None:
-                    uv_value_errors[name] = f"line {number}: {keyword} {problem}"
-                else:
-                    uv_value_errors.pop(name, None)  # a later value uv takes replaces the refused one
+                elif name in _UV_VALUES:
+                    # `ENV UV_LINK_MODE=$UV_LINK_MODE` passes an ARG on: check the value it expands to. After an ENV
+                    # of the same name, an ARG's own value may be the one a RUN sees, so it is checked too.
+                    seen = own_value
+                    if keyword == "ENV" and seen is None and (written := _written_value(args, name)) is not None:
+                        expanded = _expand_known(written, before)
+                        seen = None if "$" in expanded else expanded
+                    if (problem := _uv_value_problem(name, seen)) is not None:
+                        uv_value_errors[name] = f"line {number}: {keyword} {problem}"
+                    elif seen is not None and name not in reader.ambiguous:
+                        uv_value_errors.pop(name, None)  # a later value uv takes replaces the refused one
+                    # An unknown value keeps an earlier refusal: it may be that value passed on.
                     if name == "UV_SYSTEM_PYTHON":
-                        uv_system = value is not None and value.lower() in ("y", "yes", "t", "true", "on", "1")
+                        uv_system = name not in reader.ambiguous and (seen or "").lower() in _UV_TRUE
         elif keyword == "RUN":
             if windows and not _PLAIN_ARGS_RE.fullmatch(_args_after_flags(args, "\\").strip()):
                 raise DockerfileError(

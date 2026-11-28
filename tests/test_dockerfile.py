@@ -5472,6 +5472,24 @@ def test_dockerfile_requirements_reads_pip_installs_whatever_the_uv_settings(tmp
         # Too many digits for int() is still a refusal, not a crash.
         (f"ENV UV_HTTP_TIMEOUT={'9' * 5000}\nRUN {_UV_PIP}\n", ":5: ENV UV_HTTP_TIMEOUT=9+ is not a value uv takes"),
         (f"ENV UV_HTTP_TIMEOUT=+{'0' * 5000}30\nRUN {_UV_PIP}\n", None),
+        # An ENV that passes a known value on is checked on the value it expands to.
+        (
+            f"ARG UV_LINK_MODE=bogus\nENV UV_LINK_MODE=$UV_LINK_MODE\nRUN {_UV_PIP}\n",
+            ":6: ENV UV_LINK_MODE=bogus is not a value uv takes",
+        ),
+        (
+            f"ENV UV_HTTP_TIMEOUT=abc\nENV UV_HTTP_TIMEOUT=${{UV_HTTP_TIMEOUT}}\nRUN {_UV_PIP}\n",
+            ":6: ENV UV_HTTP_TIMEOUT=abc is not a value uv takes",
+        ),
+        (f"ARG UV_LINK_MODE=copy\nENV UV_LINK_MODE=$UV_LINK_MODE\nRUN {_UV_PIP}\n", None),
+        # A value wheelgap can't resolve keeps an earlier refusal: it may be that value passed on.
+        (f"ENV UV_LINK_MODE=bogus\nENV UV_LINK_MODE=$MODE\nRUN {_UV_PIP}\n", ":5: ENV UV_LINK_MODE=bogus is not"),
+        # An ARG after an ENV of the same name: either value may be the one uv reads, so either refused refuses.
+        (f"ENV UV_LINK_MODE=copy\nARG UV_LINK_MODE=bogus\nRUN {_UV_PIP}\n", ":6: ARG UV_LINK_MODE=bogus is not"),
+        (f"ENV UV_LINK_MODE=bogus\nARG UV_LINK_MODE=copy\nRUN {_UV_PIP}\n", ":5: ENV UV_LINK_MODE=bogus is not"),
+        # uv lowercases ASCII letters only: a long s (U+017F) isn't an s to it.
+        (f"ENV UV_NO_CACHE=ye\u017f\nRUN {_UV_PIP}\n", ":5: ENV UV_NO_CACHE=ye\u017f is not a value uv takes"),
+        (f"ENV UV_PYTHON_DOWNLOADS=fal\u017fe\nRUN {_UV_PIP}\n", ":5: ENV UV_PYTHON_DOWNLOADS=fal\u017fe is not"),
     ],
 )
 def test_dockerfile_requirements_reads_uv_setting_values_edges(tmp_path, body, error):
