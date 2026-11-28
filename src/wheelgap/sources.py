@@ -2921,7 +2921,7 @@ def _read_requirements(
                     _apply_release_options(line, format_control, where, handled=False)
                 if not already_seen:
                     name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
-                    append(Package(name, None, skip="editable", origin=path.name))
+                    append(Package(name, None, skip="editable", origin=_shown(path, stack)))
                 continue
             if line.startswith("-"):
                 if format_control is not None:
@@ -2958,16 +2958,16 @@ def _read_requirements(
                 compiler_signs.append("hash")
             line = " ".join(words[:first_option]).strip()
             if line.startswith((".", "/")):
-                append(Package(line, None, skip="path", origin=path.name, hashes=req_hashes))
+                append(Package(line, None, skip="path", origin=_shown(path, stack), hashes=req_hashes))
                 continue
             if "://" in line and not _NAMED_URL_RE.match(line):
                 # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
                 # "name @ url" lines are left to Requirement, which knows the name and markers.
                 egg = _EGG_RE.search(line)
                 name = egg.group(1) if egg else line.split(";", 1)[0].strip()
-                append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
+                append(Package(name, None, skip="url", origin=_shown(path, stack), hashes=req_hashes))
                 continue
-            append(requirement_to_package(line, path.name, hashes=req_hashes))
+            append(requirement_to_package(line, _shown(path, stack), hashes=req_hashes))
             if req_lines is not None and not constraint:
                 req_lines.append(line)
     finally:

@@ -1404,6 +1404,17 @@ def test_fix_upgrade_for_hash_pinned_requirements_says_to_regenerate(capsys, fak
     ) in out
 
 
+def test_fix_names_an_included_requirements_file_by_its_relative_path(capsys, fake_pypi, gap_wheels, tmp_path):
+    # #826: an included file used to be named by basename, sending the reader to the top file.
+    folder = tmp_path / "inc"
+    (folder / "common").mkdir(parents=True)
+    (folder / "requirements.txt").write_text("-r common/requirements.txt\n", encoding="utf-8")
+    (folder / "common" / "requirements.txt").write_text("fixme==1.0\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(folder / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "common/requirements.txt" in out
+    assert "In requirements.txt, change" not in out
+
+
 def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_pypi, gap_wheels, tmp_path):
     _, out, _ = run(capsys, _fixme_requirements(tmp_path, "fixme<1.3\n"), "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
