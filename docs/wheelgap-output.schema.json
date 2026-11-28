@@ -443,12 +443,13 @@
                             "prerelease": {"type": "boolean", "description": "kind upgrade, from 0.15.0 on: whether version is a pre-release. Only a pre-release pin gets one: one final release for every target, else one pre-release for every target, else a final release where one fits and a pre-release for the rest."},
                             "exclude_newer": {
                                 "type": ["object", "null"],
-                                "description": "kind upgrade, from 0.15.0 on: null, or when the release was uploaded after uv's exclude-newer for this package (so uv can't pick it until the cutoff moves): setting (exclude-newer, or exclude-newer-package NAME), cutoff (the cutoff now) and move_past (when the release's last file was uploaded: the cutoff must be later). Only a release no release within the cutoff can replace gets one.",
+                                "description": "kind upgrade, from 0.15.0 on: null, or when the release was uploaded after uv's exclude-newer for this package (so uv can't pick it until the cutoff moves): setting (exclude-newer, or exclude-newer-package NAME), cutoff (the cutoff, or null when it's a duration), span (the duration as written, such as P850D or 850 days, which uv counts back from the time it locks; null for a fixed cutoff) and move_past (when the release's last file was uploaded: the cutoff must be later). Only a release no release within the cutoff can replace gets one.",
                                 "additionalProperties": false,
-                                "required": ["setting", "cutoff", "move_past"],
+                                "required": ["setting", "cutoff", "span", "move_past"],
                                 "properties": {
                                     "setting": {"type": "string"},
-                                    "cutoff": {"type": "string"},
+                                    "cutoff": {"type": ["string", "null"]},
+                                    "span": {"type": ["string", "null"]},
                                     "move_past": {"type": "string"}
                                 }
                             },

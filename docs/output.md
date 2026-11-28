@@ -489,8 +489,9 @@ With `--json --fix`, each package also gets `fix`: an object keyed by its gap ta
 values have `kind` and that kind's keys:
 
 - `"upgrade"`: `version` (the release), `prerelease` (whether it's a pre-release, named only for a pre-release pin
-  when no one final release fits every target), `exclude_newer` (`null`, or `setting`, `cutoff` and `move_past` when the release
-  was uploaded after uv's exclude-newer, so the cutoff must move past `move_past` first), `how` (what to run or change), `constraint` (`null`, or `file`,
+  when no one final release fits every target), `exclude_newer` (`null`, or `setting`, `cutoff`, `span` and `move_past` when the
+  release was uploaded after uv's exclude-newer, so the cutoff must move past `move_past` first; for a duration such
+  as `850 days`, `span` is the duration and `cutoff` is `null`, since the time it gives moves every run), `how` (what to run or change), `constraint` (`null`, or `file`,
   `requirements`, `allows` and `via`: your own requirement, or `-c` constraint, and whether the release fits it) and
   `gap_wheel` (the fallback:
   `null`, or `wheel`, `url`, `sha256` and `unofficial: true`);

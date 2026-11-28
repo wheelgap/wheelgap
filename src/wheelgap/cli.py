@@ -1996,7 +1996,7 @@ def release_lookups(
                 try:
                     cutoff = fix.upload_cutoff(source, r.package)
                 except ValueError as e:  # a release uv can't pick mustn't be named: look nothing up
-                    skipped[id(r.package)] = f"the exclude-newer in {source.label}'s [options] can't be read ({e})"
+                    skipped[id(r.package)] = f"wheelgap can't read {e}"
                     continue
                 asked.setdefault(r.package.key, []).append(r)
                 cutoffs.setdefault(r.package.key, []).append(cutoff)

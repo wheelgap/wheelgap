@@ -1842,7 +1842,7 @@ def test_fix_says_a_release_past_exclude_newer_needs_the_cutoff_moved(
     assert (
         f"  cutlib 1.0 -> 2.0: linux-x86_64 (needs uv's {setting} moved past 2024-08-18T12:00:00Z)\n"
         f"First move uv's {setting} (2024-08-01T00:00:00Z) past 2024-08-18T12:00:00Z: cutlib==2.0 was uploaded after "
-        "it, so uv can't pick it before that.\n"
+        "its cutoff, so uv can't pick it before that.\n"
         f"In {tmp_path}, run uv lock --upgrade-package cutlib, then uv sync"
     ) in out
     _, data, _ = gap_wheels_json(capsys, *args)
@@ -1851,6 +1851,7 @@ def test_fix_says_a_release_past_exclude_newer_needs_the_cutoff_moved(
     assert cell["exclude_newer"] == {
         "setting": setting,
         "cutoff": "2024-08-01T00:00:00Z",
+        "span": None,
         "move_past": "2024-08-18T12:00:00Z",
     }
 
@@ -1873,14 +1874,83 @@ def test_fix_upgrade_within_exclude_newer_needs_no_move(capsys, fake_pypi, gap_w
     assert data["packages"][0]["fix"]["linux-x86_64"]["exclude_newer"] is None
 
 
+@pytest.mark.parametrize(
+    "options,setting",
+    [
+        ('[options]\nexclude-newer = "last week-ish"\n', "the exclude-newer"),
+        ("[options.exclude-newer-package]\nCutLib = { since = 3 }\n", "the exclude-newer-package for CutLib"),
+        ('[options]\nexclude-newer-span = "P3Q"\n', "the exclude-newer"),
+    ],
+)
 def test_fix_looks_nothing_up_when_the_locks_exclude_newer_cant_be_read(
-    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch
+    capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch, options, setting
 ):
     monkeypatch.setitem(FAKE_INDEX, "cutlib", CUTLIB)
-    (tmp_path / "uv.lock").write_text(cutlib_uv_lock('[options]\nexclude-newer = "last week-ish"\n'), encoding="utf-8")
+    (tmp_path / "uv.lock").write_text(cutlib_uv_lock(options), encoding="utf-8")
     _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix")
-    assert "Newer releases of cutlib weren't looked up: the exclude-newer in uv.lock's [options] can't be read (" in out
+    assert (
+        f"Newer releases of cutlib weren't looked up: wheelgap can't read {setting} that uv recorded in uv.lock.\n"
+        in out
+    )
     assert not [url for url in fake_pypi if url.endswith("/cutlib/json")]
+
+
+# numpy as PyPI has it, for the real locks in tests/fixtures/uvspan and uvspanpackage (uv 0.13.1, numpy pinned at
+# 1.26.4, which has no cp313 wheel): 2.1.0 is the first release with one, uploaded after an 850-day cutoff.
+SPAN_NUMPY = {
+    "1.26.4": [{"filename": "numpy-1.26.4.tar.gz", "upload_time_iso_8601": "2024-02-06T00:26:44Z"}],
+    "2.0.1": [{"filename": "numpy-2.0.1.tar.gz", "upload_time_iso_8601": "2024-07-21T13:58:00Z"}],
+    "2.1.0": [
+        {
+            "filename": "numpy-2.1.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+            "upload_time_iso_8601": "2024-08-18T21:00:00Z",
+        },
+        {"filename": "numpy-2.1.0.tar.gz", "upload_time_iso_8601": "2024-08-18T22:13:47Z"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "folder,setting",
+    [
+        # [options] exclude-newer-span = "P850D", from exclude-newer = "850 days"
+        ("uvspan", "exclude-newer"),
+        # [options.exclude-newer-package] numpy = { timestamp = "0001-01-01T00:00:00Z", span = "P850D" }
+        ("uvspanpackage", "exclude-newer-package numpy"),
+    ],
+)
+def test_fix_reads_the_durations_uv_records_in_a_lock(
+    capsys, fake_pypi, gap_wheels, fixtures, monkeypatch, folder, setting
+):
+    # A duration counts back from the time uv locks: the output names it, never the time it gives this run (#822).
+    from datetime import UTC, datetime
+
+    from wheelgap import cutoff
+
+    monkeypatch.setitem(FAKE_INDEX, "numpy", SPAN_NUMPY)
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2026, 11, 28, tzinfo=UTC))  # 850 days: 2024-07-31
+    args = [str(fixtures / folder / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--fix"]
+    _, out, _ = run(capsys, *args)
+    assert (
+        "  numpy 1.26.4 -> 2.1.0: linux-x86_64 (within your pyproject.toml constraint numpy>=1.26; "
+        f"needs uv's {setting} duration (P850D) shortened, or set to a time past 2024-08-18T22:13:47Z)\n"
+        f"First shorten uv's {setting} (P850D, a duration), or set it to a time past 2024-08-18T22:13:47Z: "
+        "numpy==2.1.0 was uploaded after its cutoff, so uv can't pick it before that.\n"
+    ) in out
+    assert "2024-07-31" not in out
+    _, data, _ = gap_wheels_json(capsys, *args)
+    cell = data["packages"][0]["fix"]["linux-x86_64"]
+    assert cell["exclude_newer"] == {
+        "setting": setting,
+        "cutoff": None,
+        "span": "P850D",
+        "move_past": "2024-08-18T22:13:47Z",
+    }
+    assert "2024-07-31" not in cell["how"]
+    # A shorter duration reaches 2.1.0: within the cutoff, nothing to move.
+    monkeypatch.setattr(cutoff, "current_time", lambda: datetime(2026, 12, 20, tzinfo=UTC))
+    _, out, _ = run(capsys, *args)
+    assert "  numpy 1.26.4 -> 2.1.0: linux-x86_64 (within your pyproject.toml constraint numpy>=1.26)\n" in out
 
 
 def test_fix_on_a_pyproject_applies_its_exclude_newer(capsys, fake_pypi, gap_wheels, tmp_path, monkeypatch):

@@ -25,7 +25,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import gapwheels
 from .check import ABI3_ON_FREETHREADED, Row, Status, marker_value, rejection
-from .cutoff import describe, parse_cutoff
+from .cutoff import describe, is_duration, parse_cutoff
 from .sources import Package, Source
 from .suggest import Suggestion
 from .targets import Target
@@ -160,25 +160,57 @@ def upload_cutoff(source: Source, pkg: Package) -> datetime | None:
     """uv's exclude-newer for a package, which `uv lock --upgrade-package` applies too (#822): from a uv.lock's
     [options] (exclude-newer-package, else exclude-newer-span, a duration counted back from now as uv counts it each
     time it locks, else exclude-newer), or as a pyproject.toml or script sets it (Package.exclude_newer); None for
-    other inputs. ValueError when a uv.lock's can't be read."""
+    other inputs. ValueError, naming the setting, when one uv recorded in a uv.lock can't be read."""
+    return _cutoff(source, pkg)[0]
+
+
+def cutoff_span(source: Source, pkg: Package) -> str | None:
+    """The duration a package's cutoff counts back from now, as written (P850D, "850 days"); None for a fixed time."""
+    try:
+        return _cutoff(source, pkg)[1]
+    except ValueError:
+        return None
+
+
+def _cutoff(source: Source, pkg: Package) -> tuple[datetime | None, str | None]:
     if source.kind != "uv":
-        return pkg.exclude_newer
+        setting = cutoff_setting(source, pkg.key)
+        span = next(
+            (
+                d[len(setting) + 4 : d.index('" is ')]
+                for d in source.exclude_newer_durations
+                if d.startswith(f'{setting} = "')
+            ),
+            None,
+        )
+        return pkg.exclude_newer, span
     options = source.uv_options
     if options is None:
-        return None
+        return None, None
+    recorded = f"that uv recorded in {source.label}"
     if not isinstance(options, dict):
-        raise ValueError("it isn't a table")
+        raise ValueError(f"the [options] {recorded}")
     per = options.get("exclude-newer-package", {})
     if not isinstance(per, dict):
-        raise ValueError("exclude-newer-package isn't a table")
-    per = {canonicalize_name(name): value for name, value in per.items()}
-    if pkg.key in per:
-        return None if per[pkg.key] is False else parse_cutoff(per[pkg.key])
-    if (span := options.get("exclude-newer-span")) is not None:
-        return parse_cutoff(span)
-    if (value := options.get("exclude-newer")) is not None:
-        return parse_cutoff(value)
-    return None
+        raise ValueError(f"the exclude-newer-package table {recorded}")
+    named: dict[str, tuple[str, object]] = {canonicalize_name(n): (n, v) for n, v in per.items()}
+    try:
+        if pkg.key in named:
+            value = named[pkg.key][1]
+            if value is False:
+                return None, None
+            # uv records a duration as { timestamp = "0001-01-01T00:00:00Z", span = "P850D" }: the span counts.
+            if isinstance(value, dict):
+                value = value["span"] if "span" in value else value.get("timestamp")
+            return parse_cutoff(value), value if isinstance(value, str) and is_duration(value) else None
+        if (span := options.get("exclude-newer-span")) is not None:
+            return parse_cutoff(span), span if isinstance(span, str) else None
+        if (value := options.get("exclude-newer")) is not None:
+            return parse_cutoff(value), value if isinstance(value, str) and is_duration(value) else None
+    except ValueError:
+        what = f"exclude-newer-package for {named[pkg.key][0]}" if pkg.key in named else "exclude-newer"
+        raise ValueError(f"the {what} {recorded}") from None
+    return None, None
 
 
 def cutoff_setting(source: Source, key: str) -> str:
@@ -190,11 +222,15 @@ def cutoff_setting(source: Source, key: str) -> str:
 
 
 def cutoff_text(cell: Cell, code: Callable[[str], str]) -> str:
-    """What an upgrade past exclude-newer needs, for its line (empty for one within it)."""
+    """What an upgrade past exclude-newer needs, for its line (empty for one within it). For a duration, which uv
+    counts back from the time it locks, the release's upload time only: the cutoff itself moves every run."""
     if cell.cutoff is None:
         return ""
     setting = cutoff_setting(cell.source, cell.row.package.key)
-    return f"needs uv's {code(setting)} moved past {describe(cell.cutoff[1])}"
+    past = describe(cell.cutoff[1])
+    if (span := cutoff_span(cell.source, cell.row.package)) is not None:
+        return f"needs uv's {code(setting)} duration ({span}) shortened, or set to a time past {past}"
+    return f"needs uv's {code(setting)} moved past {past}"
 
 
 def _uv_specifiers(source: Source, key: str, target: Target) -> list[str] | None:
@@ -369,18 +405,24 @@ def how(source: Source, cells: list[Cell], code: Callable[[str], str] = _plain) 
 
 
 def _cutoff_lines(cells: list[Cell], code: Callable[[str], str]) -> list[str]:
-    by_setting: dict[tuple[str, datetime], list[Cell]] = {}
+    by_setting: dict[tuple[str, str], list[Cell]] = {}
     for c in cells:
         if c.cutoff is not None:
-            by_setting.setdefault((cutoff_setting(c.source, c.row.package.key), c.cutoff[0]), []).append(c)
+            span = cutoff_span(c.source, c.row.package)
+            # A duration is shown as written: the time it gives moves with every run.
+            now = f"{span}, a duration" if span is not None else describe(c.cutoff[0])
+            by_setting.setdefault((cutoff_setting(c.source, c.row.package.key), now), []).append(c)
     out = []
-    for (setting, cutoff), cs in by_setting.items():
-        pins, past = _pins(cs), max(c.cutoff[1] for c in cs if c.cutoff is not None)
+    for (setting, now), cs in by_setting.items():
+        pins, past = _pins(cs), describe(max(c.cutoff[1] for c in cs if c.cutoff is not None))
         one = len(pins) == 1
+        if now.endswith(", a duration"):
+            change = f"First shorten uv's {code(setting)} ({now}), or set it to a time past {past}"
+        else:
+            change = f"First move uv's {code(setting)} ({now}) past {past}"
         out.append(
-            f"First move uv's {code(setting)} ({describe(cutoff)}) past {describe(past)}: "
-            f"{', '.join(map(code, pins))} {'was' if one else 'were'} uploaded after it, so uv can't pick "
-            f"{'it' if one else 'them'} before that."
+            f"{change}: {', '.join(map(code, pins))} {'was' if one else 'were'} uploaded after its cutoff, so uv "
+            f"can't pick {'it' if one else 'them'} before that."
         )
     return out
 
@@ -670,7 +712,9 @@ def to_json(cell: Cell) -> dict[str, object]:
             if cell.cutoff is None
             else {
                 "setting": cutoff_setting(cell.source, cell.row.package.key),
-                "cutoff": describe(cell.cutoff[0]),
+                # A duration's cutoff moves every run: its span instead, as written.
+                "cutoff": None if (span := cutoff_span(cell.source, cell.row.package)) else describe(cell.cutoff[0]),
+                "span": span,
                 "move_past": describe(cell.cutoff[1]),
             },
             "how": " ".join(how(cell.source, [cell])),
