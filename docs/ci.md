@@ -149,7 +149,10 @@ On each run of a pull request:
 - **It fails only on what got worse.** The rule is [`wheelgap diff`'s](diff.md#what-counts-as-worse): a target whose
   status got worse (`✓ → ● source`), or a new package with a gap. Gaps the base branch already has don't fail it and
   aren't listed. A package that couldn't be checked (`unknown`) on both sides counts as worse when its version changed,
-  since the new version was never checked.
+  since the new version was never checked. **After 0.14.0**, a target whose Python the lockfile's `requires-python`
+  leaves out on either side isn't compared: the job summary lists it under "Not compared" with the reason, and it
+  never fails the step. When only the pull request's lockfile leaves it out, the pull request dropped that Python:
+  the summary leads with "This change drops Python 3.13 support" and the log gets a warning.
 - **It says how to fix each one.** `fix: true` (the default) runs `wheelgap diff --fix`, which works out each listed
   gap's way out exactly as [`wheelgap uv.lock --fix`](cli.md#fix) would for the pull request's lockfile: an upgrade to
   the nearest newer official release with the wheel first (with what to run, and whether your own requirement allows
