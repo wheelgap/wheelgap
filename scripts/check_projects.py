@@ -6,7 +6,8 @@
     uv run --with pip python scripts/check_projects.py repo OWNER/NAME [--ref COMMIT] [-t TARGET]  # one public repo
 
 scripts/check_against_pip.py checks one pinned package at a time. This script checks inputs the way projects use
-them: a `uv.lock` with its `pyproject.toml`, or a fully pinned requirements file, read whole, so the markers, forks,
+them: a `uv.lock` with its `pyproject.toml`, a `poetry.lock` with its `pyproject.toml`, or a fully pinned
+requirements file, read whole, so the markers, forks,
 `[tool.uv] sources`, extras, `conflicts`, dependency groups, `environments` and includes all count. For each input
 and target (Python 3.13 and 3.15 on linux-x86_64, linux-aarch64, macos-arm64, win-amd64, musl-x86_64 and win-arm64
 by default) it compares two things with a referee: which packages install, at which version, and for each one
@@ -24,7 +25,7 @@ into a fresh temporary folder (removed afterwards), and uv and pip only read the
   (-i/--index-url, --extra-index-url, --trusted-host, --pre, --prefer-binary): any other option, such as an
   --only-binary :none: or --find-links that would bring back an sdist, refuses the file before a referee runs;
   pip's log is also checked for "Preparing metadata", "Getting requirements to build" and "Building wheel";
-- poetry is never run.
+- Poetry only runs `poetry export` (see below), offline, on the staged poetry.lock and pyproject.toml.
 This was checked with a canary sdist whose setup.py writes a file: given in a requirements file with
 `--only-binary :none:` and `--find-links`, the file is refused and the canary never runs (it does run, and the pip
 check above catches it, when the allow-list is bypassed by hand); locked in a uv.lock from a find-links folder,
@@ -62,9 +63,36 @@ check_against_pip.py. pip's "source" (an sdist that --only-binary skipped) isn't
 Requires-Python leaves the target out, since pip's log can't show that check. --only-binary keeps pip and uv from
 building anything to read metadata (see above for the options that would override it).
 
-poetry.lock: not compared. Poetry has no way to install for another platform (no --platform), it isn't installed
-here, and running it on an untrusted project is what this script must not do. Each poetry.lock input is listed as
-not compared, with that reason.
+poetry.lock: Poetry can't install for another platform (it has no --platform), so the referee is Poetry's own
+reading of the lock, then the requirements referee for what it reads. `poetry export --format requirements.txt
+--without-hashes` (Poetry 2.5.2 with poetry-plugin-export 1.10.2, pinned, through uvx) writes the packages the lock
+installs, each `name==version ; markers`, with the markers Poetry works out from the lock's groups, extras and
+dependency edges (`get_project_dependency_packages2` for a lock with per-package groups and markers, the dependency
+walk from pyproject.toml for an older one); then `uv pip compile --no-deps --only-binary :all: --python-platform`
+evaluates those markers for the target and says wheel or no wheel for each pin, as for a requirements file (uv can't
+tell `source` from `missing` there, and its Requires-Python floor rule is not compared). Two comparisons:
+"all", wheelgap's default for a poetry.lock against `--all-groups --all-extras`, and "default",
+`check_lockfile(extras=[], groups=[])` against a plain `poetry install`: main and every group pyproject.toml doesn't
+mark `optional = true`, given as `--with` (export itself takes only main unless told), and no extras. A Poetry 1.x
+lock has no "default" comparison: it records no groups per package, so wheelgap refuses a group selection for it. A
+Python that the lock's `python-versions` leaves out is compared at the target level, as uv's requires-python refusal
+is; one it takes only some patch releases of (`>=3.13.2`), or a `python-versions` a SpecifierSet can't hold for sure
+(`||`, two clauses with only a space between them), is not compared.
+Why that runs nothing of the project (Poetry 2.5.2's source): only `poetry install` installs a project's
+`requires-plugins` (`console/commands/install.py`, `ensure_project_plugins`); every command puts the project's
+`.poetry/plugins` folder on its path (`PluginManager.add_project_plugin_path`), so the export is refused unless
+the staged folder holds only pyproject.toml and poetry.lock; with no poetry.lock, export would lock, so that is
+refused too; export itself only reads the lock (`Locker`) and pyproject.toml, and writes the file it's given, here
+outside the staged folder. It runs with no POETRY_* settings, Poetry's config, cache and data in a fresh folder, a
+null keyring, UV_OFFLINE=1 and every proxy pointing at a closed port, so it can't fetch anything; an export whose log
+says it is locking, resolving or building, or that leaves a file in the staged folder, is refused. uvx installs the
+pinned Poetry beforehand in a separate step that names nothing of the input. A stale lock (Poetry's "pyproject.toml
+changed significantly since poetry.lock was last generated"), which `poetry install` refuses too, is not compared.
+This was checked with a canary: a project with a path dependency on a folder whose setup.py writes a file, an in-tree
+build backend that writes one, and `requires-plugins` naming a package that doesn't exist, exported in its whole
+folder (not only the staged copy) with the environment above: neither file was written, no plugin was installed,
+nothing in the folder changed, and the export (`local @ file:///...`) succeeded with every proxy closed. Path, URL
+and git lines of an export are left out of both sides, as wheelgap skips those packages.
 
 Emulation limits are not counted against wheelgap. uv's --python-platform sets markers from the triple, not from a
 real interpreter: x86_64-pc-windows-msvc says platform_machine `x86_64` where CPython on Windows says `AMD64`, and
@@ -77,8 +105,9 @@ wrong row below it. Targets a referee
 refuses (uv: outside the lock's `environments`, or outside the project's requires-python) are compared at the
 target level: when wheelgap refuses too, they agree; when wheelgap answers for a Python the project excludes, that is
 wheelgap's design (it shows what blocks the upgrade), so it is not compared. So that such a project is compared at
-all, a uv.lock whose requires-python allows none of the targets' Pythons (`==3.11.*`) is also checked at the newest
-Python it allows (3.9 to 3.14) on the same platforms (--no-own-python turns this off). A project whose
+all, a uv.lock whose requires-python allows none of the targets' Pythons (`==3.11.*`), or a poetry.lock whose
+python-versions does (`>=3.8,<3.12`), is also checked at the newest Python it allows (3.9 to 3.14) on the same
+platforms (--no-own-python turns this off). A project whose
 `required-version` needs a newer uv is listed as not compared. uv runs with --python-preference system, so a
 project's `python-preference = "only-managed"` doesn't stop it: it picks where the interpreter comes from, not what
 installs.
@@ -90,10 +119,10 @@ reproduce it). Rates are over per-package cells; target-level cells (package `*`
 or one that couldn't be compared) are counted on their own, with the share of input × targets that had nothing
 compared and the inputs with nothing compared at all. The referees' answers are cached in DIR/cache (DIR holds
 nothing else of the inputs), keyed by the input's files, the target in full, the tool's version, the referee's exact
-command, the macOS deployment target, this script's referee version and, for pip and uv pip compile (which read the
-live index), the day; an answer with an error (a timeout, a network failure, a uv error that isn't a refusal) isn't
-kept. So a rerun on a new wheelgap commit only recomputes wheelgap's side. Exit code: 0 when every compared cell
-agrees, 1 if any disagrees, 2 if a check couldn't be made.
+command, the macOS deployment target, this script's referee version and, for pip, uv pip compile and the poetry.lock
+referee (which read the live index), the day; an answer with an error (a timeout, a network failure, a uv error that
+isn't a refusal) isn't kept. So a rerun on a new wheelgap commit only recomputes wheelgap's side. Exit code: 0 when
+every compared cell agrees, 1 if any disagrees, 2 if a check couldn't be made.
 
 It needs uv on PATH with CPython 3.13 and 3.15 installed for it (`uv python install 3.13 3.15`), pip in this
 environment, and the network for pip and for wheelgap's own lookups (uv.lock checks are offline for uv). The tests
@@ -155,7 +184,7 @@ pin = _load_pin_checker()
 
 SCHEMA = 1
 # Bump a referee's number when its logic changes, so its cached answers are recomputed.
-REFEREE_VERSION = {"uv sync": 3, "pip": 1, "uv pip compile": 1}
+REFEREE_VERSION = {"uv sync": 3, "pip": 1, "uv pip compile": 1, "poetry export": 1}
 PYTHONS = ("3.13", "3.15")
 PLATFORMS = ("linux-x86_64", "linux-aarch64", "macos-arm64", "win-amd64", "musl-x86_64", "win-arm64")
 MAX_RUNS = 400  # per pass: one run per package without a wheel, plus one
@@ -1023,6 +1052,169 @@ def uv_pip_referee(run: Runner, folder: Path, target: Target, flat: Flat, confdi
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# poetry.lock: Poetry's own export of the lock, then uv pip compile for the exported file
+
+POETRY_VERSION = "2.5.2"
+POETRY_EXPORT_VERSION = "1.10.2"
+POETRY = (
+    *("uvx", "--from", f"poetry=={POETRY_VERSION}", "--with", f"poetry-plugin-export=={POETRY_EXPORT_VERSION}"),
+    "poetry",
+)
+# What poetry export may find in the staged folder. With no poetry.lock it would lock (resolve, maybe build), and a
+# .poetry/plugins folder there is put on its sys.path, with its .pth files run, by every command.
+POETRY_FILES = frozenset({"pyproject.toml", "poetry.lock"})
+DEAD_PROXY = "http://127.0.0.1:9"  # nothing listens on the discard port: any request Poetry makes fails at once
+
+
+def poetry_env(home: Path) -> dict[str, str]:
+    """No POETRY_* settings (a user's repositories or credentials), Poetry's config, cache and data in a fresh folder,
+    no keyring, and no network: uvx runs the Poetry it has already installed, and every proxy goes nowhere."""
+    drop = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONPATH", "PYTHONHOME", "NO_PROXY", "no_proxy")
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.upper().startswith(("POETRY_", "PIP_")) and k not in drop and k.lower() not in ("all_proxy",)
+    }
+    for name in ("config", "cache", "data"):
+        (home / name).mkdir(parents=True, exist_ok=True)
+    env.update(
+        POETRY_CONFIG_DIR=str(home / "config"),
+        POETRY_CACHE_DIR=str(home / "cache"),
+        POETRY_DATA_DIR=str(home / "data"),
+        PYTHON_KEYRING_BACKEND="keyring.backends.null.Keyring",
+        UV_OFFLINE="1",
+        NO_COLOR="1",
+    )
+    for proxy in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env[proxy] = DEAD_PROXY
+    return env
+
+
+def poetry_groups(pyproject: Path) -> list[str] | None:
+    """The groups a plain `poetry install` installs besides main: every group pyproject.toml declares that isn't
+    `optional = true` (a [tool.poetry.group.NAME] table, the old [tool.poetry.dev-dependencies] one as `dev`, and
+    [dependency-groups]). None if pyproject.toml can't be read."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    poetry = data.get("tool", {}).get("poetry", {})
+    tables = poetry.get("group", {}) if isinstance(poetry, dict) else {}
+    if not isinstance(tables, dict):
+        return None
+    names = [str(n) for n in tables]
+    if isinstance(poetry, dict) and isinstance(poetry.get("dev-dependencies"), dict):
+        names.append("dev")
+    pep735 = data.get("dependency-groups", {})
+    names += [str(n) for n in pep735] if isinstance(pep735, dict) else []
+    optional = {canonicalize_name(n) for n, t in tables.items() if isinstance(t, dict) and t.get("optional") is True}
+    return sorted({canonicalize_name(n) for n in names} - optional - {"main"})
+
+
+def poetry_export_command(folder: Path, output: Path, mode: str, groups: Sequence[str]) -> list[str]:
+    """`all`: wheelgap's default for a poetry.lock, every group and extra. `default`: a plain `poetry install`, main
+    and the non-optional groups, no extras (export itself only takes main unless told)."""
+    select = ["--all-groups", "--all-extras"] if mode == "all" else [f"--with={g}" for g in groups]
+    return [
+        *POETRY,
+        *("export", "--directory", str(folder), "--format", "requirements.txt", "--without-hashes", *select),
+        *("--output", str(output), "--no-interaction", "--no-ansi"),
+    ]
+
+
+def poetry_python(lock: Path) -> SpecifierSet | None:
+    """The project's Python range, from the lock's [metadata] python-versions (Poetry writes ^ and ~ there too); None
+    if it can't be read for sure (an `||`, a space between two clauses, a bare version: Poetry's own syntax)."""
+    try:
+        text = tomllib.loads(lock.read_text(encoding="utf-8")).get("metadata", {}).get("python-versions")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(text, str) or "||" in text:
+        return None
+    specs = []
+    for part in (p.strip() for p in text.split(",")):
+        if match := re.fullmatch(r"([\^~])\s*(\d+)((?:\.\d+)*)", part):
+            op, release = match[1], [int(n) for n in f"{match[2]}{match[3]}".split(".")]
+            # ^3.9.1 is >=3.9.1,<4; ~3.9.1 and ~3.9 are >=3.9(.1),<3.10; ~3 is >=3,<4
+            high = f"{release[0] + 1}" if op == "^" or len(release) == 1 else f"{release[0]}.{release[1] + 1}"
+            specs += [f">={'.'.join(map(str, release))}", f"<{high}"]
+        elif part != "*":
+            specs.append(part)
+    try:
+        return SpecifierSet(",".join(specs))
+    except InvalidSpecifier:
+        return None
+
+
+def poetry_lock_has_groups(lock: Path) -> bool:
+    """Whether every package in the lock lists its groups (Poetry 2.x, lock-version 2.1), as wheelgap's group
+    selection needs."""
+    try:
+        packages = tomllib.loads(lock.read_text(encoding="utf-8")).get("package", [])
+    except (OSError, ValueError):
+        return False
+    return isinstance(packages, list) and all(
+        isinstance(p, dict) and isinstance(p.get("groups"), list) for p in packages
+    )
+
+
+def poetry_referee(
+    run: Runner, folder: Path, target: Target, flat: Flat, confdir: Path, python: SpecifierSet | None
+) -> dict:
+    """uv pip compile's answer for Poetry's export, or a refusal of a Python the project leaves out. A range that
+    takes some of the target's patch releases and not others (>=3.13.2) can't say which one Poetry would run on."""
+    if python is None:
+        return {"error": "poetry.lock's python-versions can't be read for sure"}
+    version = f"{target.major}.{target.minor}"
+    first, late = (python.contains(f"{version}.{patch}", prereleases=True) for patch in (0, 99))
+    if not first and not late:
+        return {"refused": "requires-python", "command": f"poetry.lock's python-versions is {python}"}
+    if first != late:
+        return {"error": f"poetry.lock's python-versions ({python}) takes only some {version} patch releases"}
+    return uv_pip_referee(run, folder, target, flat, confdir)
+
+
+def poetry_export(run: Runner, folder: Path, work: Path, mode: str) -> tuple[Flat | None, str, str]:
+    """(the exported file's pins, or None; why not; the command, as a user would type it) for one selection mode."""
+    found = {p.name for p in folder.iterdir()}
+    if found != POETRY_FILES:
+        # Without pyproject.toml Poetry looks for one in the folders above; without poetry.lock it would lock.
+        return None, f"poetry export would see {sorted(found)}, not just pyproject.toml and poetry.lock", ""
+    groups = poetry_groups(folder / "pyproject.toml")
+    if groups is None:
+        return None, "pyproject.toml can't be read for its groups", ""
+    out_dir = work / "_poetry_export" / mode
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # uvx installs the pinned Poetry first, if it must, with the network and away from the project: nothing of the
+    # input is in this command. The export itself then runs offline.
+    code, log = run(
+        [*POETRY, "--version"], out_dir, {k: v for k, v in os.environ.items() if not k.startswith("POETRY_")}
+    )
+    if code != 0 or POETRY_VERSION not in log:
+        return None, f"Poetry {POETRY_VERSION} isn't available through uvx: {first_error(log)}", ""
+    output = out_dir / "requirements.txt"
+    cmd = poetry_export_command(folder, output, mode, groups)
+    shown = shlex.join(["poetry", *cmd[len(POETRY) :]]).replace(str(folder), ".").replace(str(output), "exported.txt")
+    code, log = run(cmd, folder, poetry_env(work / "_poetry_home"))
+    if sorted(p.name for p in folder.iterdir()) != sorted(found):
+        return None, "poetry export wrote into the project folder: the input must be refused", shown
+    if re.search(r"\bLocking\b|Resolving dependencies|Building ", log):
+        return None, "poetry export started to lock or build: the input must be refused", shown
+    if code != 0 or not output.is_file():
+        lines = [line.strip() for line in log.splitlines() if line.strip()]
+        return None, f"poetry export failed: {lines[-1] if lines else 'no output'}", shown
+    # A path, URL or git dependency is exported as `-e file:///...` or `name @ URL`: wheelgap skips those packages,
+    # so they're left out of both sides (as for a uv.lock); the referee never sees them.
+    lines = output.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if not (line.startswith("-e ") or re.match(r"^[A-Za-z0-9][\w.\[\],-]*\s+@\s", line))]
+    output.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    flat = flatten(output)
+    if flat.refuse:
+        return None, f"the exported file: {flat.refuse}", shown
+    return flat, "", shown
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # wheelgap's side
 
 
@@ -1078,7 +1270,7 @@ ABSENT = "absent"
 
 
 def same(wheelgap: str, answer: str, referee: str) -> bool:
-    if referee == "uv pip compile":
+    if referee in ("uv pip compile", "poetry export"):
         return (wheelgap == WHEEL) == (answer == WHEEL) and (wheelgap == ABSENT) == (answer == ABSENT)
     return wheelgap == answer
 
@@ -1111,7 +1303,8 @@ def compare(
                 )
             ]
         if a_refused == "requires-python" and not w_refused:
-            why = "uv refuses a Python outside the project's requires-python; wheelgap answers for it by design"
+            why = f"{'uv' if referee != 'poetry export' else 'Poetry'} refuses a Python outside the project's "
+            why += "requires-python; wheelgap answers for it by design"
             return [cell("*", "answered", "refused", NOT_COMPARED, why, answer.get("command", ""))]
         if a_refused == "uv-version":
             why = "the project's required-version needs a newer uv than the referee's"
@@ -1162,7 +1355,12 @@ def compare(
                     f"pip's --only-binary run skips the sdist before it reads its Requires-Python, which {capped[0]}: "
                     "pip can't show here whether it would build it"
                 )
-        elif referee == "uv pip compile" and w in (SOURCE, MISSING) and a == WHEEL and package in results:
+        elif (
+            referee in ("uv pip compile", "poetry export")
+            and w in (SOURCE, MISSING)
+            and a == WHEEL
+            and package in results
+        ):
             known = pin.uv_reads_requires_python_as_a_floor(
                 results[package], Status(w), pin.InstallerAnswer(wheel="wheel")
             )
@@ -1253,6 +1451,7 @@ def tool_versions() -> dict[str, str]:
     return {
         "uv": first_line(["uv", "--version"]),
         "pip": pip_version,
+        "poetry": f"poetry {POETRY_VERSION}, poetry-plugin-export {POETRY_EXPORT_VERSION} (uvx)",
         "wheelgap": __version__,
         "wheelgap_commit": src + (" (edited)" if dirty else ""),
         "checkout_head": first_line([*git, "rev-parse", "HEAD"]),
@@ -1262,7 +1461,7 @@ def tool_versions() -> dict[str, str]:
 def cache_path(cache: Path, digest: str, referee: str, target: Target, version: str, command: Sequence[str]) -> Path:
     """Where a referee's answer is kept: keyed by the input's files (digest), the target in full, the tool's version,
     the referee's exact command for the target and its macOS deployment target, this script's referee version, and,
-    for pip and uv pip compile, which read the live index, today's UTC date."""
+    for every referee but uv sync (pip and uv pip compile read the live index), today's UTC date."""
     parts = [str(REFEREE_VERSION[referee]), referee, version, repr(target), shlex.join(command)]
     if target.platform.startswith("macos-"):
         parts.append(pin.uv_deployment_target(target))
@@ -1307,8 +1506,9 @@ OWN_PYTHONS = ("3.14", "3.12", "3.11", "3.10", "3.9")
 
 
 def own_targets(requires_python: str, targets: Sequence[Target]) -> list[Target]:
-    """When a uv.lock's requires-python leaves out every Python among the targets (`==3.11.*`), the newest Python it
-    allows on the same platforms, so the project is compared at all (uv refuses a Python outside it)."""
+    """When a uv.lock's requires-python (or a poetry.lock's python-versions) leaves out every Python among the
+    targets (`==3.11.*`), the newest Python it allows on the same platforms, so the project is compared at all (uv
+    and Poetry refuse a Python outside it)."""
     try:
         spec = SpecifierSet(requires_python)
     except InvalidSpecifier:
@@ -1333,10 +1533,6 @@ def check_input(
     own_python: bool = True,
 ) -> list[Cell]:
     """Every cell of one input on every target."""
-    kind = entry["kind"]
-    if kind == "poetry.lock":
-        why = "no referee: Poetry can't install for another platform, and it isn't run on untrusted projects here"
-        return [Cell(entry["id"], kind, "-", "all", pin.label(t), "*", "-", "-", NOT_COMPARED, why) for t in targets]
     work = Path(tempfile.mkdtemp(prefix="wheelgap-projects-"))
     try:
         return _check_staged(entry, targets, out, versions, run, workers, own_python, work)
@@ -1407,6 +1603,13 @@ def _check_staged(
                                 "uv refused some ways of picking the conflicts: " + ", ".join(all_answer["partial"]),
                             )
         return cells
+    if kind == "poetry.lock":
+        python = poetry_python(main) if main.is_file() else None
+        if own_python and python is not None:
+            targets = [*targets, *own_targets(str(python), targets)]  # as for a uv.lock
+        for mode in ("all", "default"):
+            cells += _check_poetry(entry, targets, folder, work, out, versions, run, workers, mode)
+        return cells
     flat = flatten(main)
     if flat.refuse:
         return [
@@ -1461,6 +1664,86 @@ def _check_staged(
             entry=entry, referee="uv pip compile", mode="all", target=target, wheelgap=ours, answer=uv_answer
         )
     return cells
+
+
+def _check_poetry(
+    entry: dict,
+    targets: Sequence[Target],
+    folder: Path,
+    work: Path,
+    out: Path,
+    versions: dict[str, str],
+    run: Runner,
+    workers: int,
+    mode: str,
+) -> list[Cell]:
+    """A poetry.lock's cells for one selection mode: Poetry exports the lock, uv pip compile answers for the export,
+    and wheelgap answers for the lock itself."""
+    kind, main = entry["kind"], folder / entry["main"]
+    if mode == "default" and main.is_file() and not poetry_lock_has_groups(main):
+        # wheelgap refuses a group selection here (by design: the lock doesn't say which group needs what), so there
+        # is nothing to compare; the "all" comparison still covers every package.
+        why = "a Poetry 1.x lock records no groups per package, so wheelgap refuses a group selection for it"
+        return [
+            Cell(entry["id"], kind, "poetry export", mode, pin.label(t), "*", "-", "-", NOT_COMPARED, why)
+            for t in targets
+        ]
+    exported, why, shown = poetry_export(run, main.parent, work, mode)  # the lock's own folder
+    if exported is None:
+        return [
+            Cell(entry["id"], kind, "poetry export", mode, pin.label(t), "*", "-", "-", NOT_COMPARED, why, shown)
+            for t in targets
+        ]
+    python = poetry_python(main)
+    confdir = work / "_no_uv_config"
+    version = f"{versions['uv']}; poetry {POETRY_VERSION}, poetry-plugin-export {POETRY_EXPORT_VERSION}"
+    # The export's content is part of the key: the same input and Poetry give the same file.
+    exported_digest = hashlib.sha256("\n".join(p.line for p in exported.pins).encode()).hexdigest()[:12]
+
+    def ask(target: Target) -> dict:
+        command = [*shown.split(), *uv_compile_command(target, pin.uv_platform(target) or "", Path("exported.txt"))]
+        answer = cached(
+            cache_path(out / "cache", folder.name, "poetry export", target, f"{version}; {exported_digest}", command),
+            lambda: poetry_referee(run, folder, target, exported, confdir, python),
+        )
+        if answer.get("command"):
+            answer = dict(answer, command=f"{shown} && {answer['command'].replace('requirements.txt', 'exported.txt')}")
+        return answer
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        answers = list(pool.map(ask, targets))
+    cells: list[Cell] = []
+    with_extra = poetry_extra_marked(main) if mode == "default" else set()
+    for target, answer in zip(targets, answers, strict=True):
+        ours = wheelgap_answer(main, target, None, mode)
+        for c in compare(entry=entry, referee="poetry export", mode=mode, target=target, wheelgap=ours, answer=answer):
+            if c.package in with_extra and c.answer == ABSENT and c.wheelgap != ABSENT:
+                # wheelgap's superset, by design: with no extra selected it keeps a package whose marker joins an
+                # extra to other conditions, which Poetry 2.0-2.2 install without the extra (2.3 and later don't).
+                c.verdict, c.why = NOT_COMPARED, POETRY_KEPT_FOR_EVERY_EXTRA
+            cells.append(c)
+    return cells
+
+
+POETRY_KEPT_FOR_EVERY_EXTRA = (
+    "wheelgap keeps this package for every extra, with a note: its marker joins an extra to other conditions, and "
+    "Poetry 2.0-2.2 install it without the extra (the pinned Poetry doesn't)"
+)
+
+
+def poetry_extra_marked(lock: Path) -> set[str]:
+    """The lock's packages (as cell keys) whose markers, for any group, name an extra alongside other conditions."""
+    try:
+        packages = tomllib.loads(lock.read_text(encoding="utf-8")).get("package", [])
+    except (OSError, ValueError):
+        return set()
+    found = set()
+    for p in packages if isinstance(packages, list) else []:
+        markers = p.get("markers") if isinstance(p, dict) else None
+        texts = [markers] if isinstance(markers, str) else list(markers.values()) if isinstance(markers, dict) else []
+        if any(isinstance(t, str) and _EXTRA_ATOM.search(t) and _EXTRA_ATOM.sub("", t).strip() for t in texts):
+            found.add(key(str(p.get("name", "")), str(p.get("version", ""))))
+    return found
 
 
 def totals(cells: Sequence[Cell]) -> dict[str, Any]:
@@ -1542,7 +1825,13 @@ def report(cells: Sequence[Cell], versions: dict[str, str], seconds: float, out=
     for c in cells:
         sets[f"{c.kind} vs {c.referee} ({c.mode})"].append(c)
     print(
-        f"Tools: {versions['uv']}; {versions['pip']}; wheelgap {versions['wheelgap']}, source last changed in "
+        f"Tools: {versions['uv']}; {versions['pip']}; "
+        + (
+            f"{versions['poetry']}; "
+            if any(c.referee == "poetry export" for c in cells) and "poetry" in versions
+            else ""
+        )
+        + f"wheelgap {versions['wheelgap']}, source last changed in "
         f"{versions['wheelgap_commit'][:12]} (checkout at {versions.get('checkout_head', '?')[:12]}). {seconds:.0f} s.",
         file=out,
     )
@@ -1811,7 +2100,7 @@ def main(argv: list[str] | None = None) -> int:
     repo_cmd.add_argument(
         "--no-own-python",
         action="store_true",
-        help="don't add the newest Python a uv.lock allows when it allows none of the targets' Pythons",
+        help="don't add the newest Python a uv.lock or poetry.lock allows when it allows none of the targets' Pythons",
     )
     check = sub.add_parser("run", help="check the manifest's inputs")
     check.add_argument("manifest", type=Path)
@@ -1827,7 +2116,7 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument(
         "--no-own-python",
         action="store_true",
-        help="don't add the newest Python a uv.lock allows when it allows none of the targets' Pythons",
+        help="don't add the newest Python a uv.lock or poetry.lock allows when it allows none of the targets' Pythons",
     )
     args = parser.parse_args(argv)
     if args.command == "manifest":

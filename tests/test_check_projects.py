@@ -1058,3 +1058,347 @@ wheels = [{ url = "https://files.pythonhosted.org/w/winthing-1.0-py3-none-any.wh
     assert "uv sync: source" in text
     assert "wheelgap command: uvx wheelgap uv.lock" in text
     assert "referee command: " in text and "uv sync" in text
+
+
+# --- poetry.lock: poetry export, then uv pip compile -------------------------------------------------------------
+
+POETRY_LOCK = """\
+[[package]]
+name = "a"
+version = "1.0"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [{file = "a-1.0-py3-none-any.whl", hash = "sha256:00"}]
+
+[[package]]
+name = "b"
+version = "1.0"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["dev"]
+files = [{file = "b-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "d"
+version = "1.0"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["docs"]
+files = [{file = "d-1.0-py3-none-any.whl", hash = "sha256:00"}]
+
+[[package]]
+name = "w"
+version = "1.0"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+markers = "sys_platform == \\"win32\\""
+files = [{file = "w-1.0-py3-none-win_amd64.whl", hash = "sha256:00"}]
+
+[metadata]
+lock-version = "2.1"
+python-versions = "^3.9"
+content-hash = "0"
+"""
+POETRY_PYPROJECT = """\
+[tool.poetry]
+name = "demo"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+a = "1.0"
+w = {version = "1.0", markers = "sys_platform == 'win32'"}
+
+[tool.poetry.group.dev.dependencies]
+b = "1.0"
+
+[tool.poetry.group.docs]
+optional = true
+
+[tool.poetry.group.docs.dependencies]
+d = "1.0"
+"""
+EXPORTED = {
+    "all": 'a==1.0 ; python_version >= "3.9" and python_version < "4.0"\n'
+    'b==1.0 ; python_version >= "3.9" and python_version < "4.0"\n'
+    'd==1.0 ; python_version >= "3.9" and python_version < "4.0"\n'
+    'w==1.0 ; python_version >= "3.9" and python_version < "4.0" and sys_platform == "win32"\n'
+    # wheelgap skips path, URL and git packages: left out of both sides, not a refused file
+    'local @ file:///src/local ; python_version >= "3.9" and python_version < "4.0"\n'
+    "-e file:///src/editable\n",
+}
+EXPORTED["default"] = "".join(line for line in EXPORTED["all"].splitlines(True) if not line.startswith("d=="))
+
+
+class FakePoetry:
+    """uvx's Poetry (its version, and export writing EXPORTED for the selection) and uv pip compile for the export,
+    with b==1.0 an sdist only and w only on Windows."""
+
+    def __init__(self, export=None):
+        self.calls: list[tuple[list[str], Path, dict]] = []
+        self.seen: list[list[str]] = []  # what each export saw in its folder (the staged copy, removed afterwards)
+        self.wrote: list[bool] = []  # whether each export's output was outside that folder
+        self.export = export  # (code, log, files to write into the project folder) instead of EXPORTED
+
+    def __call__(self, cmd, cwd, env):
+        self.calls.append((cmd, Path(cwd), env))
+        if cmd[0] == "uvx" and "export" in cmd:
+            self.seen.append(sorted(p.name for p in Path(cwd).iterdir()))
+            self.wrote.append(not Path(cmd[cmd.index("--output") + 1]).is_relative_to(cwd))
+        if cmd[0] == "uvx" and cmd[-1] == "--version":
+            return 0, "Poetry (version 2.5.2)\n"
+        if cmd[0] == "uvx":
+            output = Path(cmd[cmd.index("--output") + 1])
+            if self.export is not None:
+                code, log, files = self.export
+                for name in files:
+                    (Path(cwd) / name).write_text("", encoding="utf-8")
+                return code, log
+            output.write_text(EXPORTED["all" if "--all-groups" in cmd else "default"], encoding="utf-8")
+            return 0, ""
+        assert cmd[:3] == ["uv", "pip", "compile"]
+        text = Path(cmd[3]).read_text(encoding="utf-8")
+        if "b==1.0" in text:
+            return 1, (
+                "error: No solution found when resolving dependencies:\n  ╰─▶ Because b==1.0 has no wheels with a "
+                "matching platform tag (e.g., `manylinux_2_36_x86_64`) and you require b==1.0, we can conclude that "
+                "your requirements are unsatisfiable.\n"
+            )
+        return 0, "".join(f"{n}==1.0\n" for n in "ade" if f"{n}==1.0" in text)
+
+
+def _poetry_entry(tmp_path, lock=POETRY_LOCK, pyproject=POETRY_PYPROJECT):
+    src = tmp_path / "repo"
+    src.mkdir(exist_ok=True)
+    (src / "poetry.lock").write_text(lock, encoding="utf-8")
+    (src / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    files = ["poetry.lock", "pyproject.toml"]
+    return {"id": "o/p", "kind": "poetry.lock", "dir": str(src), "main": "poetry.lock", "files": files}
+
+
+VERSIONS = {"uv": "uv 0.13.1", "pip": "pip", "wheelgap": "0", "wheelgap_commit": "abc"}
+
+
+def test_poetry_lock_is_compared_through_poetry_export(tmp_path):
+    fake = FakePoetry()
+    cells = script.check_input(_poetry_entry(tmp_path), [LINUX], tmp_path / "out", VERSIONS, fake, workers=1)
+    got = {(c.mode, c.package): (c.wheelgap, c.answer, c.verdict) for c in cells}
+    assert got == {
+        ("all", "a==1.0"): ("wheel", "wheel", "agree"),
+        ("all", "b==1.0"): ("source", "no wheel", "agree"),
+        ("all", "d==1.0"): ("wheel", "wheel", "agree"),
+        ("default", "a==1.0"): ("wheel", "wheel", "agree"),
+        ("default", "b==1.0"): ("source", "no wheel", "agree"),  # dev isn't optional: plain poetry install has it
+    }  # w is Windows-only on both sides, and d's group is optional
+    assert {c.referee for c in cells} == {"poetry export"}
+    exports = [(cmd, cwd, env) for cmd, cwd, env in fake.calls if cmd[0] == "uvx" and "export" in cmd]
+    assert [cmd[cmd.index("--without-hashes") + 1 :][:2] for cmd, _, _ in exports] == [
+        ["--all-groups", "--all-extras"],
+        ["--with=dev", "--output"],
+    ]
+    assert fake.seen == [["poetry.lock", "pyproject.toml"]] * 2  # the staged copy only...
+    assert fake.wrote == [True, True]  # ...and the export is written outside it
+    for cmd, cwd, env in exports:
+        assert cmd[:6] == ["uvx", "--from", "poetry==2.5.2", "--with", "poetry-plugin-export==1.10.2", "poetry"]
+        assert not cwd.exists()  # removed afterwards
+        assert env["UV_OFFLINE"] == "1" and env["https_proxy"] == script.DEAD_PROXY
+        assert not any(k.startswith("POETRY_") and k not in script.poetry_env(tmp_path / "h") for k in env)
+    disagreeing = script.check_input(
+        _poetry_entry(tmp_path, pyproject=POETRY_PYPROJECT.replace("optional = true", "optional = false")),
+        [LINUX],
+        tmp_path / "out2",
+        VERSIONS,
+        FakePoetry(),
+        workers=1,
+    )
+    # d's group is no longer optional, so wheelgap's default lists it, but this fake export still leaves it out.
+    assert [(c.mode, c.package, c.verdict) for c in disagreeing if c.verdict != "agree"] == [
+        ("default", "d==1.0", "disagree")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("export", "why"),
+    [
+        (
+            (1, "pyproject.toml changed significantly since poetry.lock was last generated. Run `poetry lock`.\n", []),
+            "poetry export failed: pyproject.toml changed significantly",
+        ),
+        ((0, "Resolving dependencies...\n", []), "started to lock or build"),
+        ((0, "", [".poetry"]), "wrote into the project folder"),  # then the second export refuses to run
+        ((0, "", []), "poetry export failed"),  # no file written
+    ],
+)
+def test_poetry_export_failures_are_not_compared(tmp_path, export, why):
+    cells = script.check_input(_poetry_entry(tmp_path), [LINUX], tmp_path / "out", VERSIONS, FakePoetry(export), 1)
+    assert {(c.mode, c.package, c.verdict) for c in cells} == {
+        ("all", "*", "not compared"),
+        ("default", "*", "not compared"),
+    }
+    assert all(why in c.why for c in cells if c.mode == "all" or not export[2])
+    if export[2]:
+        assert all("poetry export would see ['.poetry', 'poetry.lock', 'pyproject.toml']" in c.why for c in cells[1:])
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        ["pyproject.toml"],  # Poetry would lock: resolve, and maybe build
+        ["poetry.lock"],  # Poetry would look for a pyproject.toml in the folders above
+    ],
+)
+def test_poetry_export_never_runs_without_both_files(tmp_path, files):
+    entry = _poetry_entry(tmp_path)
+    entry["files"] = files
+    fake = FakePoetry()
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, fake, workers=1)
+    assert fake.calls == [] and all(c.verdict == "not compared" for c in cells)
+    assert all("not just pyproject.toml and poetry.lock" in c.why for c in cells)
+
+
+def test_poetry_python_outside_the_project_is_not_compared(tmp_path):
+    lock = POETRY_LOCK.replace('python-versions = "^3.9"\ncontent', 'python-versions = ">=3.9,<3.13"\ncontent')
+    fake = FakePoetry()
+    entry = _poetry_entry(tmp_path, lock=lock)
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, fake, 1, own_python=False)
+    assert {(c.package, c.verdict) for c in cells} == {("*", "not compared")}
+    assert all("Poetry refuses a Python outside" in c.why for c in cells)
+    assert not any(cmd[:3] == ["uv", "pip", "compile"] for cmd, _, _ in fake.calls)
+    # As for a uv.lock, the newest Python the project allows is added, so the project is compared at all.
+    cells = script.check_input(entry, [LINUX], tmp_path / "out2", VERSIONS, FakePoetry(), 1)
+    assert {(c.target, c.verdict) for c in cells if c.package != "*"} == {("3.12 linux-x86_64", "agree")}
+    assert {c.target for c in cells if c.package == "*"} == {"3.13 linux-x86_64"}
+
+
+@pytest.mark.parametrize(
+    ("text", "contains", "excludes"),
+    [
+        ("^3.9", "3.13.0", "4.0.0"),
+        ("~3.10", "3.10.0", "3.11.0"),
+        (">=3.7, <4", "3.15.0", "3.6.0"),
+        ("^3", "3.15.0", "4.0.0"),
+        ("*", "3.15.0", None),
+        ("^3.9.1", "3.9.1", "3.9.0"),  # the patch release counts
+        ("~3.9.1", "3.9.5", "3.10.0"),
+        ("~3", "3.15.0", "4.0.0"),
+        ("~=3.9", "3.15.0", "4.0.0"),
+        (">= 3.10, < 4", "3.13.0", "3.9.0"),
+    ],
+)
+def test_poetry_python(tmp_path, text, contains, excludes):
+    (tmp_path / "poetry.lock").write_text(f'[metadata]\npython-versions = "{text}"\n', encoding="utf-8")
+    python = script.poetry_python(tmp_path / "poetry.lock")
+    assert python is not None and python.contains(contains)
+    assert excludes is None or not python.contains(excludes)
+
+
+@pytest.mark.parametrize("text", [">=3.8,<3.11 || >=3.12", ">=3.8 <4.0", "3.9", "^three"])
+def test_poetry_python_unreadable(tmp_path, text):
+    """Poetry's own syntax that a SpecifierSet can't hold for sure: no guess, so no comparison."""
+    (tmp_path / "poetry.lock").write_text(f'[metadata]\npython-versions = "{text}"\n', encoding="utf-8")
+    assert script.poetry_python(tmp_path / "poetry.lock") is None
+
+
+@pytest.mark.parametrize(
+    ("python_versions", "why"),
+    [
+        (">=3.13.2,<4", "takes only some 3.13 patch releases"),  # 3.13.0 is out, 3.13.99 in
+        (">=3.9 <4", "python-versions can't be read for sure"),
+    ],
+)
+def test_poetry_python_unsure_is_not_compared(tmp_path, python_versions, why):
+    lock = POETRY_LOCK.replace('python-versions = "^3.9"\ncontent', f'python-versions = "{python_versions}"\ncontent')
+    fake = FakePoetry()
+    cells = script.check_input(_poetry_entry(tmp_path, lock=lock), [LINUX], tmp_path / "out", VERSIONS, fake, 1)
+    assert {(c.package, c.verdict) for c in cells} == {("*", "not compared")}
+    assert all(why in c.why for c in cells)
+    assert not any(cmd[:3] == ["uv", "pip", "compile"] for cmd, _, _ in fake.calls)
+
+
+def test_poetry_groups(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poetry.dev-dependencies]\nx = '1'\n[tool.poetry.group.Lint.dependencies]\ny = '1'\n"
+        "[tool.poetry.group.docs]\noptional = true\n[dependency-groups]\ntest = ['z']\n",
+        encoding="utf-8",
+    )
+    assert script.poetry_groups(tmp_path / "pyproject.toml") == ["dev", "lint", "test"]
+    (tmp_path / "pyproject.toml").write_text("not toml [", encoding="utf-8")
+    assert script.poetry_groups(tmp_path / "pyproject.toml") is None
+
+
+def test_poetry_env_isolates_poetry(tmp_path, monkeypatch):
+    monkeypatch.setenv("POETRY_REPOSITORIES_X_URL", "https://x.test/simple")
+    monkeypatch.setenv("NO_PROXY", "*")
+    env = script.poetry_env(tmp_path)
+    assert "POETRY_REPOSITORIES_X_URL" not in env and "NO_PROXY" not in env
+    assert env["POETRY_CONFIG_DIR"] == str(tmp_path / "config") and (tmp_path / "config").is_dir()
+    assert env["PYTHON_KEYRING_BACKEND"] == "keyring.backends.null.Keyring"
+
+
+def test_poetry_lock_in_a_subfolder_is_exported_there(tmp_path):
+    src = tmp_path / "repo" / "app"
+    src.mkdir(parents=True)
+    (src / "poetry.lock").write_text(POETRY_LOCK, encoding="utf-8")
+    (src / "pyproject.toml").write_text(POETRY_PYPROJECT, encoding="utf-8")
+    files = ["app/poetry.lock", "app/pyproject.toml"]
+    entry = {
+        "id": "o/p",
+        "kind": "poetry.lock",
+        "dir": str(tmp_path / "repo"),
+        "main": "app/poetry.lock",
+        "files": files,
+    }
+    fake = FakePoetry()
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, fake, workers=1)
+    assert fake.seen == [["poetry.lock", "pyproject.toml"]] * 2
+    assert {c.verdict for c in cells} == {"agree"}
+
+
+def test_poetry_1x_lock_default_mode_is_not_compared(tmp_path):
+    """A Poetry 1.x lock has no per-package groups: wheelgap refuses a group selection (not a wrong answer), so only
+    the "all" comparison runs, and no export is made for "default"."""
+    lock = POETRY_LOCK.replace('groups = ["main"]\n', "").replace('groups = ["dev"]\n', "")
+    lock = lock.replace('groups = ["docs"]\n', "").replace('lock-version = "2.1"', 'lock-version = "2.0"')
+    fake = FakePoetry()
+    cells = script.check_input(_poetry_entry(tmp_path, lock=lock), [LINUX], tmp_path / "out", VERSIONS, fake, 1)
+    default = [c for c in cells if c.mode == "default"]
+    assert [(c.package, c.verdict) for c in default] == [("*", "not compared")]
+    assert "Poetry 1.x lock" in default[0].why
+    exports = [cmd for cmd, _, _ in fake.calls if cmd[0] == "uvx" and "export" in cmd]
+    assert len(exports) == 1 and "--all-groups" in exports[0]
+    assert any(c.mode == "all" and c.verdict == "agree" for c in cells)
+
+
+def test_poetry_extra_superset_is_not_compared(tmp_path, monkeypatch):
+    """With no extra selected, wheelgap keeps a package whose marker joins an extra to another condition (Poetry
+    2.0-2.2 install it without the extra) and says so; Poetry 2.5.2's export leaves it out. That is wheelgap's
+    superset by design, not compared; the same package with the extra selected ("all") is compared as usual."""
+    lock = POETRY_LOCK.replace(
+        "[metadata]",
+        '[[package]]\nname = "e"\nversion = "1.0"\ndescription = ""\noptional = true\npython-versions = ">=3.10"\n'
+        'groups = ["main"]\nmarkers = "python_version >= \\"3.10\\" and extra == \\"fancy\\""\n'
+        'files = [{file = "e-1.0-py3-none-any.whl", hash = "sha256:00"}]\n\n[extras]\nfancy = ["e"]\n\n[metadata]',
+    )
+    pyproject = POETRY_PYPROJECT.replace(
+        "\n[tool.poetry.group.dev",
+        '\ne = {version = "1.0", optional = true, python = ">=3.10"}\n\n[tool.poetry.extras]\nfancy = ["e"]\n'
+        "\n[tool.poetry.group.dev",
+    )
+    monkeypatch.setitem(EXPORTED, "all", EXPORTED["all"] + 'e==1.0 ; python_version >= "3.10" and extra == "fancy"\n')
+    entry = _poetry_entry(tmp_path, lock=lock, pyproject=pyproject)
+    cells = script.check_input(entry, [LINUX], tmp_path / "out", VERSIONS, FakePoetry(), workers=1)
+    got = {(c.mode, c.package): (c.wheelgap, c.answer, c.verdict) for c in cells if c.package == "e==1.0"}
+    assert got == {
+        ("all", "e==1.0"): ("wheel", "wheel", "agree"),
+        ("default", "e==1.0"): ("wheel", "absent", "not compared"),
+    }
+    assert [c.why for c in cells if c.mode == "default" and c.package == "e==1.0"] == [
+        script.POETRY_KEPT_FOR_EVERY_EXTRA
+    ]
+    assert {c.verdict for c in cells if c.package != "e==1.0"} == {"agree"}
