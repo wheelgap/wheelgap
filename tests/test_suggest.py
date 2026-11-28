@@ -31,7 +31,10 @@ def wheel(version, tag="py3-none-any", **metadata):
         ({"1.1": [wheel("1.1", "cp313-cp313-win_amd64", yanked=True), wheel("1.1")]}, "1.0", "1.1"),
         ({"1.1rc1": [wheel("1.1rc1")]}, "1.0", None),
         ({"1.1.dev1": [wheel("1.1.dev1")], "1.1": [wheel("1.1")]}, "1.0", "1.1"),
-        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [wheel("1.1")]}, "1.1rc1", "1.1rc2"),
+        # A pre-release pin: a final release first (#825), a pre-release only when no final release has the wheel.
+        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [wheel("1.1")]}, "1.1rc1", "1.1"),
+        ({"1.1rc2": [wheel("1.1rc2")], "1.1": [{"filename": "demo-1.1.tar.gz"}]}, "1.1rc1", "1.1rc2"),
+        ({"2.0a1": [wheel("2.0a1")], "2.0": [wheel("2.0")], "1.2": [{"filename": "demo-1.2.tar.gz"}]}, "1.1rc1", "2.0"),
         ({"1.1": [wheel("1.1")]}, "1.1rc1", "1.1"),
         ({"1.1.dev2": [wheel("1.1.dev2")]}, "1.1.dev1", "1.1.dev2"),
         ({"1.0": [wheel("1.0")], "0.9": [wheel("0.9")]}, "1.0", None),
@@ -153,6 +156,28 @@ def test_suggest_keeps_pre_releases_for_a_pre_release_pin():
     assert suggest.suggest({"2.0rc1": [wheel("2.0rc1")], "2.0rc2": [wheel("2.0rc2")]}, "2.0rc1", targets).found == {
         targets[0]: "2.0rc2"
     }
+
+
+def test_suggest_prefers_a_final_release_for_a_pre_release_pin():
+    # greenlet 2.0.0rc5 -> 3.0.0a1 although 3.0.0 has the wheel (#825): the lowest final release with it wins.
+    linux, riscv = build_targets(["3.12"], ["linux-x86_64", "linux-riscv64"])
+    lin = "cp312-cp312-manylinux_2_17_x86_64"
+    releases = {
+        "2.0.0rc5": [{"filename": "demo-2.0.0rc5.tar.gz"}],
+        "2.0.0": [{"filename": "demo-2.0.0.tar.gz"}],
+        "3.0.0a1": [wheel("3.0.0a1", lin), wheel("3.0.0a1", "cp312-cp312-linux_riscv64")],
+        "3.0.0rc1": [wheel("3.0.0rc1", lin)],
+        "3.0.0": [wheel("3.0.0", lin)],
+        "3.0.1": [wheel("3.0.1", lin)],
+    }
+    found = suggest.suggest(releases, "2.0.0rc5", [linux, riscv]).found
+    # Only a pre-release has the riscv64 wheel, so that target falls back to it; x86_64 gets the final 3.0.0.
+    assert found == {linux: "3.0.0", riscv: "3.0.0a1"}
+    assert suggest.suggest_lines("demo", "2.0.0rc5", [linux, riscv], suggest.Suggestion(found), False) == [
+        "demo 2.0.0rc5 -> 3.0.0a1 (a pre-release) has wheels for linux-riscv64",
+        "demo 2.0.0rc5 -> 3.0.0 has wheels for linux-x86_64",
+    ]
+    assert suggest.suggest(releases, "2.0.0", [linux]).found == {linux: "3.0.0"}  # a final pin, as before
 
 
 def test_a_release_must_keep_the_wheels_the_row_has():

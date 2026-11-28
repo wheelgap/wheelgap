@@ -2858,7 +2858,7 @@ def _assert_matches_output_schema(data):
             gap_labels = {k for k, v in pkg["results"].items() if v in ("source", "missing")}
             assert set(pkg["fix"]) <= gap_labels
             keys = {
-                "upgrade": {"version", "how", "constraint", "gap_wheel"},
+                "upgrade": {"version", "prerelease", "how", "constraint", "gap_wheel"},
                 "gap_wheel": {"wheel", "url", "sha256", "unofficial"},
                 "none": {"reason", "abi3_only"},
             }

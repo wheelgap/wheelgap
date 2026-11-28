@@ -379,7 +379,8 @@ def upgrade_sentence(cells: list[fix.Cell], multi_py: bool) -> str:
     """--fix: what a package's annotation says first when a newer official release has the wheel for some gaps."""
     by_version: dict[str, list[str]] = {}
     for c in cells:
-        by_version.setdefault(f"{c.row.package.name} {c.version}", []).append(c.target.label(multi_py))
+        pre = " (a pre-release)" if fix.prerelease(c.version) else ""
+        by_version.setdefault(f"{c.row.package.name} {c.version}{pre}", []).append(c.target.label(multi_py))
     has = "; ".join(f"{v} has the wheel for {', '.join(dict.fromkeys(labels))}" for v, labels in by_version.items())
     return f" Upgrade: {has} (an official release); the --fix section of the log says how."
 

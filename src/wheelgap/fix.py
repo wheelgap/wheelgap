@@ -153,6 +153,18 @@ def _uv_specifiers(source: Source, key: str) -> list[str] | None:
     return [e.get("specifier", "") for e in found]
 
 
+PRERELEASE_TEXT = "a pre-release: no newer final release has the wheel"
+
+
+def prerelease(version: str | None) -> bool:
+    """Whether an upgrade's release is a pre-release (suggest names one only for a pre-release pin, and only when no
+    final release fits)."""
+    try:
+        return version is not None and Version(version).is_prerelease
+    except InvalidVersion:
+        return False
+
+
 def _key(entry: dict) -> str | None:
     name = entry.get("name")
     return canonicalize_name(name) if isinstance(name, str) else None
@@ -414,7 +426,10 @@ def _lines(
     upgrades = [c for c in cells if c.kind == UPGRADE]
     up = []
     for (name, pinned, version), cs in _by_package(upgrades).items():
-        line = f"{item}{code(f'{name} {pinned} -> {version}')}: {_labels(cs, multi_py)}"
+        line = f"{item}{code(f'{name} {pinned} -> {version}')}"
+        if prerelease(version):  # only for a pre-release pin, and only when no final release has the wheel (#825)
+            line += f" ({PRERELEASE_TEXT})"
+        line += f": {_labels(cs, multi_py)}"
         if (own := constraint(cs[0])) is not None:
             line += f" ({constraint_text(own, code)})"
         up.append(line)
@@ -525,6 +540,7 @@ def to_json(cell: Cell) -> dict[str, object]:
         return {
             "kind": UPGRADE,
             "version": cell.version,
+            "prerelease": prerelease(cell.version),
             "how": " ".join(how(cell.source, [cell])),
             "constraint": None
             if c is None

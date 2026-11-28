@@ -33,8 +33,8 @@ _Seen = dict[tuple[str, str], tuple[list[str], list[frozenset[Tag]]] | None]
 
 
 def _candidates(releases: dict, pinned: str) -> list[str]:
-    """The releases newer than `pinned`, lowest first. Pre-releases only when `pinned` is one; invalid versions are
-    skipped, and an invalid pin raises InvalidVersion."""
+    """The releases newer than `pinned`, lowest first. Pre-releases only when `pinned` is one (see _finals_first);
+    invalid versions are skipped, and an invalid pin raises InvalidVersion."""
     current = Version(pinned)
     found = []
     for text in releases:
@@ -45,6 +45,12 @@ def _candidates(releases: dict, pinned: str) -> list[str]:
         if version > current and (current.is_prerelease or not version.is_prerelease):
             found.append((version, text))
     return [text for _, text in sorted(found)]
+
+
+def _finals(candidates: list[str]) -> list[str]:
+    """The final releases of _candidates' list: a pre-release pin is moved to a final release where one has the wheel
+    (#825), and to a pre-release only where none does."""
+    return [text for text in candidates if not Version(text).is_prerelease]
 
 
 def _older(releases: dict, pinned: str) -> list[str]:
@@ -90,13 +96,18 @@ def nearest_with_wheel(releases: dict, pinned: str, target: Target) -> str | Non
     """Return the lowest newer release with a non-yanked, compatible wheel.
 
     `releases` is the release-to-file-list mapping from the PyPI project JSON API.
-    Pre-releases are considered only when `pinned` is itself a pre-release. Invalid
+    Pre-releases are considered only when `pinned` is itself a pre-release, and then only
+    when no newer final release has the wheel. Invalid
     release versions are skipped; an invalid pin raises `InvalidVersion`.
     File Requires-Python metadata follows the same rules as range lookups, and a release
     whose file list is malformed is skipped, as range lookups skip it.
     """
     seen: _Seen = {}
-    return next((text for text in _candidates(releases, pinned) if _has_wheel(releases, text, target, seen)), None)
+    candidates = _candidates(releases, pinned)
+    for some in (_finals(candidates), candidates):  # a final release first, even for a pre-release pin (#825)
+        if (found := next((text for text in some if _has_wheel(releases, text, target, seen)), None)) is not None:
+            return found
+    return None
 
 
 @dataclass(frozen=True)
@@ -119,10 +130,27 @@ def suggest(releases: dict, pinned: str, targets: Iterable[Target], keep: Iterab
     target of `keep` count. A gap target that no such release has a wheel for is left out (in `loses` when some other
     newer release has one), and the others all get the lowest such release with a wheel for every one of them; when
     there is none, each gets its own nearest. A gap target no newer release has a wheel for gets the newest older
-    release with one in `last`, if one of the LOOKBACK newest has it. Keys keep the order of `targets`."""
+    release with one in `last`, if one of the LOOKBACK newest has it. Keys keep the order of `targets`.
+
+    For a pre-release pin, the final releases are searched first, and the pre-releases only for the gap targets no
+    final release fits (#825): a final release is never passed over for the next alpha or rc."""
     targets, keep = list(targets), list(keep)
     candidates = _candidates(releases, pinned)
     seen: _Seen = {}
+    if not Version(pinned).is_prerelease:
+        return _suggest(releases, pinned, targets, keep, candidates, seen)
+    final = _suggest(releases, pinned, targets, keep, _finals(candidates), seen)
+    if not (rest := [t for t in targets if t not in final.found]):
+        return final
+    pre = _suggest(releases, pinned, rest, keep, candidates, seen)
+    found = {t: v for t in targets if (v := final.found.get(t) or pre.found.get(t)) is not None}
+    return Suggestion(found, pre.loses, pre.last, pre.last_loses, pre.drops, pre.python_drops)
+
+
+def _suggest(
+    releases: dict, pinned: str, targets: list[Target], keep: list[Target], candidates: list[str], seen: _Seen
+) -> Suggestion:
+    """suggest, over `candidates` only."""
     kept: dict[str, bool] = {}
 
     def keeps(v: str) -> bool:
@@ -212,7 +240,7 @@ def suggest_lines(name: str, pinned: str, gaps: Sequence[Target], suggestion: Su
         if t in found:
             by_version.setdefault(found[t], []).append(t.label(multi_py))
     out = [
-        f"{name} {pinned} -> {v} has wheels for {', '.join(labels)}"
+        f"{name} {pinned} -> {v}{' (a pre-release)' * Version(v).is_prerelease} has wheels for {', '.join(labels)}"
         for v, labels in sorted(by_version.items(), key=lambda item: Version(item[0]))
     ]
     none = [t for t in gaps if t not in found and t not in loses]

@@ -1341,8 +1341,22 @@ def test_fix_json_has_each_cells_fix_and_a_summary(capsys, fake_pypi, gap_wheels
     fallback = {"wheel": FIXME_WHEEL, "url": DOWNLOAD + FIXME_WHEEL, "sha256": "ab" * 32, "unofficial": True}
     how = "In requirements.txt, change the pins to fixme==1.4."
     assert fixes["fixme"] == {
-        "win-arm64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": fallback},
-        "win-amd64": {"kind": "upgrade", "version": "1.4", "how": how, "constraint": None, "gap_wheel": None},
+        "win-arm64": {
+            "kind": "upgrade",
+            "version": "1.4",
+            "prerelease": False,
+            "how": how,
+            "constraint": None,
+            "gap_wheel": fallback,
+        },
+        "win-amd64": {
+            "kind": "upgrade",
+            "version": "1.4",
+            "prerelease": False,
+            "how": how,
+            "constraint": None,
+            "gap_wheel": None,
+        },
     }
     assert fixes["nowheels"] == {
         "win-arm64": {"kind": "gap_wheel", **fallback, "wheel": FT_WHEEL, "url": DOWNLOAD + FT_WHEEL},
@@ -1697,3 +1711,36 @@ def test_fix_uv_may_fork_names_the_script_for_a_script_lock(capsys, fake_pypi, g
     )
     _, out, _ = run(capsys, str(tmp_path / "tool.py.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
     assert f"try uv lock --script {tmp_path / 'tool.py'} --upgrade-package pyfork and run wheelgap again" in out
+
+
+def test_fix_moves_a_pre_release_pin_to_a_final_release(capsys, fake_pypi, gap_wheels, monkeypatch):
+    # grpcio 1.58.0rc1 got 1.59.0rc1 although 1.59.0 has the wheel (#825).
+    arm = "cp314-cp314t-win_arm64"
+    monkeypatch.setitem(
+        FAKE_INDEX,
+        "prepin",
+        {
+            "1.0rc1": ["prepin-1.0rc1.tar.gz"],
+            "1.1rc1": [f"prepin-1.1rc1-{arm}.whl"],
+            "1.1": [f"prepin-1.1-{arm}.whl"],
+            "1.2rc1": ["prepin-1.2rc1-cp314-cp314t-win_amd64.whl"],
+        },
+    )
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  prepin 1.0rc1 -> 1.1: win-arm64\nUse prepin==1.1 instead.\n" in out
+    _, data, _ = gap_wheels_json(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert data["packages"][0]["fix"]["win-arm64"]["prerelease"] is False
+    # No final release has the win-amd64 wheel: the pre-release is named, and said to be one.
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
+    assert f"  prepin 1.0rc1 -> 1.2rc1 ({fix.PRERELEASE_TEXT}): win-amd64\n" in out
+    _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix", "--markdown")
+    assert f"- `prepin 1.0rc1 -> 1.2rc1` ({fix.PRERELEASE_TEXT}): win-amd64\n" in out
+    _, data, _ = gap_wheels_json(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
+    assert data["packages"][0]["fix"]["win-amd64"] | {"how": None} == {
+        "kind": "upgrade",
+        "version": "1.2rc1",
+        "prerelease": True,
+        "how": None,
+        "constraint": None,
+        "gap_wheel": None,
+    }

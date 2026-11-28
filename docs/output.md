@@ -488,7 +488,8 @@ never changes a status, the summary or the exit code.
 With `--json --fix`, each package also gets `fix`: an object keyed by its gap target labels whose
 values have `kind` and that kind's keys:
 
-- `"upgrade"`: `version` (the release), `how` (what to run or change), `constraint` (`null`, or `file`,
+- `"upgrade"`: `version` (the release), `prerelease` (whether it's a pre-release, named only for a pre-release pin
+  that no newer final release fixes), `how` (what to run or change), `constraint` (`null`, or `file`,
   `requirements`, `allows` and `via`: your own requirement, or `-c` constraint, and whether the release fits it) and
   `gap_wheel` (the fallback:
   `null`, or `wheel`, `url`, `sha256` and `unofficial: true`);
