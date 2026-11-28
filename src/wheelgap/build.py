@@ -161,6 +161,55 @@ def describe(info: BuildInfo, targets: list[Target]) -> str | None:
     return f"at least {', '.join(items)}" if items else None
 
 
+@dataclass(frozen=True)
+class SystemPackages:
+    """--fix, for a gap with no fix on a Linux target: the distro packages that provide what the sdist's build
+    requirements prove the build needs (describe's needs: RUST, CMAKE, COMPILER). Only what's proven, so "at least":
+    a library the build links to (BLAS, OpenSSL) isn't in [build-system] requires, and isn't named."""
+
+    distro: str  # "Alpine" for musl targets, "Debian or Ubuntu" for glibc ones
+    command: str  # "apk add --no-cache build-base": it runs as it stands in a fresh image
+    packages: tuple[str, ...]
+    needs: tuple[str, ...]  # RUST, CMAKE, COMPILER, in that order
+    # Also needed with the distro's own Python (not with the python:* images, which have the headers): Python.h
+    distro_python: tuple[str, ...] = ()
+
+
+# By libc: (distro, install command, the packages for each need). build-base and build-essential are the
+# compiler, make and libc headers; the distros' cargo package depends on rustc. The commands work in a fresh image:
+# python:3.X-slim has no apt lists (so update first) and apt-get install asks before it installs (so -y).
+_SYSTEM = {
+    "musl": (
+        "Alpine",
+        "apk add --no-cache",
+        {COMPILER: ("build-base",), CMAKE: ("cmake", "build-base"), RUST: ("cargo",)},
+    ),
+    "glibc": (
+        "Debian or Ubuntu",
+        "apt-get update && apt-get install -y",
+        {COMPILER: ("build-essential",), CMAKE: ("cmake", "build-essential"), RUST: ("cargo",)},
+    ),
+}
+PYTHON_HEADERS = ("python3-dev",)  # the same name on Alpine, Debian and Ubuntu
+
+
+def system_packages(info: BuildInfo, target: Target) -> SystemPackages | None:
+    """What to install on `target`'s distro to build the release from source, or None: not a Linux target, or no
+    requirement (whose marker holds on the target) proves a need. A pure backend proves none."""
+    libc = "musl" if target.platform.startswith("musl-") else "glibc" if target.platform.startswith("linux-") else None
+    if libc is None:
+        return None
+    distro, command, by_need = _SYSTEM[libc]
+    found = {NEEDS.get(canonicalize_name(r.name)) for r in requires_for(info, [target])}
+    needs = tuple(need for need in (RUST, CMAKE, COMPILER) if need in found)
+    if not needs:
+        return None
+    packages = tuple(dict.fromkeys(p for need in needs for p in by_need[need]))
+    # Always the headers: a Rust build can compile C through cffi as well (cryptography requires maturin and cffi,
+    # and its install docs list python3-dev), and which ones don't isn't proven. Extra, but harmless, for PyO3 alone.
+    return SystemPackages(distro, f"{command} {' '.join(packages)}", packages, needs, PYTHON_HEADERS)
+
+
 def _sdist(pkg: Package) -> str | None:
     """The release's one sdist, if it's a .tar.gz named for this release: with several, which one pip picks isn't
     certain."""

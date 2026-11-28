@@ -1265,7 +1265,7 @@ def test_dockerfile_requirements_refuses_nested_includes(tmp_path):
     for text in (
         "-r base.txt\npurewheel==3.1\n",
         "\ufeff-r base.txt\n",
-        "purewheel==3.1\n--req base.txt\n",
+        "purewheel==3.1\n--requirem base.txt\n",  # pip refuses `--req`: --require-hashes or --requirement?
         "--pre -r base.txt\npurewheel==3.1\n",
         "--only-binary :all: --constraint=base.txt\n",
         "purewheel==3.1\n--pre \\\n-cbase.txt\n",
@@ -5135,6 +5135,69 @@ def test_dockerfile_requirements_warns_about_a_local_npm_install_with_a_package_
         dockerfile_requirements(path, constraints={}, dependencies=True)
 
 
+@pytest.mark.parametrize(
+    ("body", "warns"),
+    [
+        # A clone by an earlier RUN, then an npm install in the clone: its package.json is the project's own.
+        ("RUN git clone https://example.com/web.git /srv/web && cd /srv/web && npm install left-pad\n", True),
+        # A package.json written by an earlier RUN into the working folder.
+        ("RUN printf '{}' > /app/package.json\nRUN npm install left-pad\n", True),
+        # A package.json downloaded into the working folder: the URL names it.
+        ("RUN wget -q https://example.com/web/package.json && npm install left-pad\n", True),
+        # An empty package.json made by touch.
+        ("RUN touch /app/package.json\nRUN npm install left-pad\n", True),
+        # An archive unpacked into a parent of the install folder.
+        ("RUN tar xf /tmp/web.tar -C /srv && cd /srv/web && npm install left-pad\n", True),
+        # A glob that matches the install folder.
+        ("RUN cp -r /tmp/web/. /srv/w* && cd /srv/web && npm install left-pad\n", True),
+        # A clone with no folder named: git makes one from the repository's name.
+        ("RUN git clone --depth 1 https://example.com/web.git && cd web && npm install left-pad\n", True),
+        # A destination given as an option with the path attached.
+        ("RUN cp -r /tmp/web --target-directory=/srv && cd /srv/web && npm install left-pad\n", True),
+        ("RUN cp -r -t/srv /tmp/web && cd /srv/web && npm install left-pad\n", True),
+        # A relative one, read in the RUN's folder.
+        ("RUN cp -r /tmp/web -t. && cd web && npm install left-pad\n", True),
+        ("RUN cp -r /tmp/web -tdeps && cd deps/web && npm install left-pad\n", True),
+        # A clone whose option takes a value: the folder comes from the URL, not from the value.
+        ("RUN git clone --revision v1.2 https://example.com/web.git && cd web && npm install left-pad\n", True),
+        # An option wheelgap doesn't know may take a value, so the clone's folder isn't known.
+        ("RUN git clone --newopt x https://example.com/web.git /srv/other\nRUN npm install left-pad\n", True),
+        # A clone into an unrelated folder leaves the npm install a plain program.
+        ("RUN git clone --revision v1.2 https://example.com/web.git /srv/other\nRUN npm install left-pad\n", False),
+        # A folder with a variable wheelgap can't resolve in the middle of it.
+        ("ARG NAME\nRUN tar xf /tmp/web.tar -C /srv/$NAME && cd /srv/web && npm install left-pad\n", True),
+        # An earlier RUN in an unrelated folder leaves the npm install a plain program.
+        ("RUN mkdir -p /srv/other\nRUN npm install left-pad\n", False),
+        ("RUN cp /tmp/a /srv/other/\nRUN npm install left-pad\n", False),
+        # Options and URLs of a command run in a folder wheelgap doesn't know aren't paths in the image.
+        ("RUN cd /opt/tool-* && curl -fsSLO https://example.com/tool.tar.gz\nRUN npm install left-pad\n", False),
+        # So does a mkdir of the working folder itself: it adds no package.json.
+        ("RUN mkdir -p /app/cache /app\nRUN npm install left-pad\n", False),
+    ],
+)
+def test_dockerfile_requirements_checks_package_json_made_by_an_earlier_run(tmp_path, body, warns):
+    head = "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"
+    path = _context(tmp_path, head + body + _INSTALL, ("requirements.txt",))
+    report = InputsReport()
+    dockerfile_requirements(path, report=report, uv_installs=set(), constraints={})
+    assert bool(report.warnings) is warns
+    if warns:
+        with pytest.raises(DockerfileError, match="runs the project's own code"):
+            dockerfile_requirements(path, constraints={}, dependencies=True)
+
+
+def test_dockerfile_requirements_checks_npm_install_after_a_heredoc_package_json(tmp_path):
+    # A package.json written by a heredoc, whose script wheelgap doesn't read: the npm install after it isn't passed
+    # over. The pip install comes before the heredoc, since one after it would stop the answer (line 6199's rule).
+    head = "FROM python:3.13\nWORKDIR /app\nCOPY requirements.txt .\n"
+    body = _INSTALL + "RUN cat <<'EOF' > /app/package.json\n{}\nEOF\nRUN npm install left-pad\n"
+    path = _context(tmp_path, head + body, ("requirements.txt",))
+    report = InputsReport()
+    dockerfile_requirements(path, report=report, uv_installs=set(), constraints={})
+    assert report.warnings
+    assert [spelling for _, spelling, *_ in report.scripts] == ["npm install"]  # not passed over
+
+
 def test_dockerfile_requirements_warns_about_an_npm_install_below_a_package_json(tmp_path):
     # npm's project is the nearest folder up the tree with a package.json: one copied into /app counts for an
     # install run in /app/scripts, which has none itself.
@@ -5381,11 +5444,8 @@ def test_dockerfile_requirements_reads_a_file_no_unread_command_may_have_changed
 _SETTINGS = (
     "PIP_NO_CACHE_DIR PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK PIP_ROOT_USER_ACTION PIP_NO_INPUT PIP_PROGRESS_BAR "
     "PIP_NO_COLOR PIP_DEFAULT_TIMEOUT PIP_TIMEOUT PIP_RETRIES PIP_QUIET PIP_VERBOSE PIP_NO_WARN_SCRIPT_LOCATION "
-    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING UV_NO_CACHE UV_CACHE_DIR "
-    "UV_COMPILE_BYTECODE UV_LINK_MODE UV_NO_PROGRESS UV_HTTP_TIMEOUT UV_HTTP_RETRIES UV_CONCURRENT_DOWNLOADS "
-    "UV_CONCURRENT_BUILDS UV_CONCURRENT_INSTALLS UV_PYTHON_DOWNLOADS UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR UV_TOOL_DIR "
-    "UV_INSTALL_DIR UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT UV_NO_INSTALL_WORKSPACE UV_NO_INSTALL_LOCAL "
-    "UV_NO_EDITABLE UV_PROJECT_ENVIRONMENT UV_SYSTEM_PYTHON UV_SYSTEM_CERTS UV_VERSION "
+    "PIP_NO_COMPILE PIP_COMPILE PIP_BREAK_SYSTEM_PACKAGES PIP_NO_PYTHON_VERSION_WARNING UV_CACHE_DIR "
+    "UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR UV_TOOL_DIR UV_INSTALL_DIR UV_PROJECT_ENVIRONMENT UV_VERSION "
     "PYTHONUNBUFFERED "
     "pip_index_url NOTE"
 ).split()
@@ -5399,6 +5459,128 @@ def test_dockerfile_requirements_reads_settings_that_dont_change_what_is_install
     lines, report = _inputs(tmp_path, form.format(name) + "\n" + _INSTALL)
     assert lines == [5]
     assert report.notes == []
+
+
+# A UV_ setting with a fixed kind of value: one value uv takes, and one it refuses (it exits 2 on it).
+_UV_VALUE_CASES = [
+    ("UV_NO_CACHE", "yes", "maybe"),
+    ("UV_COMPILE_BYTECODE", "0", "2"),
+    ("UV_NO_PROGRESS", "off", "maybe"),
+    ("UV_BREAK_SYSTEM_PACKAGES", "TRUE", "maybe"),
+    ("UV_NO_INSTALL_PROJECT", "f", "x"),
+    ("UV_NO_INSTALL_WORKSPACE", "no", "x"),
+    ("UV_NO_INSTALL_LOCAL", "on", "x"),
+    ("UV_NO_EDITABLE", "t", "x"),
+    ("UV_SYSTEM_PYTHON", "1", "maybe"),
+    ("UV_SYSTEM_CERTS", "false", "2"),
+    ("UV_LINK_MODE", "copy", "bogus"),
+    ("UV_LINK_MODE", "hardlink", "Copy"),
+    ("UV_HTTP_TIMEOUT", "30", "abc"),
+    ("UV_HTTP_RETRIES", "0", "-1"),
+    ("UV_CONCURRENT_DOWNLOADS", "4", "0"),
+    ("UV_CONCURRENT_BUILDS", "4", "bogus"),
+    ("UV_CONCURRENT_INSTALLS", "1", "0"),
+    ("UV_PYTHON_DOWNLOADS", "never", "bogus"),
+    ("UV_PYTHON_DOWNLOADS", "1", "yes"),
+    ("UV_HTTP_TIMEOUT", "+5", "18446744073709551616"),
+    ("UV_HTTP_RETRIES", "4294967295", "4294967296"),
+    ("UV_CONCURRENT_DOWNLOADS", "007", "2305843009213693952"),
+    ("UV_CONCURRENT_BUILDS", "4", "+0"),
+]
+
+
+_UV = "COPY --from=ghcr.io/astral-sh/uv:0.9.1 /uv /uvx /bin/\n"
+_UV_PIP = "uv pip install --system -r requirements.txt"
+_UV_VALUE_FORMS = ["ENV {0}={1}", "ENV {0} {1}", "ARG {0}={1}", "ENV A=1 {0}={1} B=2"]
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+@pytest.mark.parametrize("form", _UV_VALUE_FORMS)
+def test_dockerfile_requirements_reads_uv_settings_with_a_value_uv_takes(tmp_path, name, good, bad, form):
+    lines, report = _inputs(tmp_path, _UV + form.format(name, good) + f"\nRUN {_UV_PIP}\n")
+    assert lines == [6]
+    assert report.notes == []
+    lines, report = _inputs(tmp_path, _UV + f"RUN {name}={good} {_UV_PIP}\n")
+    assert lines == [5]
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+@pytest.mark.parametrize(
+    ("body", "keyword"),
+    [*((form + f"\nRUN {_UV_PIP}\n", form[:4]) for form in _UV_VALUE_FORMS), ("RUN {0}={1} " + _UV_PIP + "\n", "")],
+)
+def test_dockerfile_requirements_refuses_uv_settings_with_a_value_uv_refuses(tmp_path, name, good, bad, body, keyword):
+    with pytest.raises(DockerfileError, match=f":5: {keyword}{re.escape(f'{name}={bad} is not a value uv takes: ')}"):
+        _inputs(tmp_path, _UV + body.format(name, bad))
+
+
+@pytest.mark.parametrize(("name", "good", "bad"), _UV_VALUE_CASES)
+def test_dockerfile_requirements_reads_pip_installs_whatever_the_uv_settings(tmp_path, name, good, bad):
+    # pip doesn't read UV_ variables: a value uv refuses doesn't stop a pip install.
+    assert _inputs(tmp_path, f"ENV {name}={bad}\n" + _INSTALL)[0] == [5]
+    assert _inputs(tmp_path, f"RUN {name}={bad} pip install -r requirements.txt\n")[0] == [4]
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        # A value wheelgap can't resolve isn't known to be one uv refuses.
+        (f"RUN UV_HTTP_TIMEOUT=$TIMEOUT {_UV_PIP}\n", None),
+        (f"ENV UV_LINK_MODE=$MODE\nRUN {_UV_PIP}\n", None),
+        # uv reads an empty number setting as unset, but refuses an empty switch.
+        (f"ENV UV_HTTP_TIMEOUT=\nRUN {_UV_PIP}\n", None),
+        (f"ENV UV_NO_CACHE=\nRUN {_UV_PIP}\n", ":5: ENV UV_NO_CACHE= is not a value uv takes"),
+        # A later value uv takes replaces the refused one.
+        (f"ENV UV_LINK_MODE=bogus\nENV UV_LINK_MODE=copy\nRUN {_UV_PIP}\n", None),
+        # Too many digits for int() is still a refusal, not a crash.
+        (f"ENV UV_HTTP_TIMEOUT={'9' * 5000}\nRUN {_UV_PIP}\n", ":5: ENV UV_HTTP_TIMEOUT=9+ is not a value uv takes"),
+        (f"ENV UV_HTTP_TIMEOUT=+{'0' * 5000}30\nRUN {_UV_PIP}\n", None),
+        # An ENV that passes a known value on is checked on the value it expands to.
+        (
+            f"ARG UV_LINK_MODE=bogus\nENV UV_LINK_MODE=$UV_LINK_MODE\nRUN {_UV_PIP}\n",
+            ":6: ENV UV_LINK_MODE=bogus is not a value uv takes",
+        ),
+        (
+            f"ENV UV_HTTP_TIMEOUT=abc\nENV UV_HTTP_TIMEOUT=${{UV_HTTP_TIMEOUT}}\nRUN {_UV_PIP}\n",
+            ":6: ENV UV_HTTP_TIMEOUT=abc is not a value uv takes",
+        ),
+        (f"ARG UV_LINK_MODE=copy\nENV UV_LINK_MODE=$UV_LINK_MODE\nRUN {_UV_PIP}\n", None),
+        # A value wheelgap can't resolve keeps an earlier refusal: it may be that value passed on.
+        (f"ENV UV_LINK_MODE=bogus\nENV UV_LINK_MODE=$MODE\nRUN {_UV_PIP}\n", ":5: ENV UV_LINK_MODE=bogus is not"),
+        # An ARG after an ENV of the same name: either value may be the one uv reads, so either refused refuses.
+        (f"ENV UV_LINK_MODE=copy\nARG UV_LINK_MODE=bogus\nRUN {_UV_PIP}\n", ":6: ARG UV_LINK_MODE=bogus is not"),
+        (f"ENV UV_LINK_MODE=bogus\nARG UV_LINK_MODE=copy\nRUN {_UV_PIP}\n", ":5: ENV UV_LINK_MODE=bogus is not"),
+        # uv lowercases ASCII letters only: a long s (U+017F) isn't an s to it.
+        (f"ENV UV_NO_CACHE=ye\u017f\nRUN {_UV_PIP}\n", ":5: ENV UV_NO_CACHE=ye\u017f is not a value uv takes"),
+        (f"ENV UV_PYTHON_DOWNLOADS=fal\u017fe\nRUN {_UV_PIP}\n", ":5: ENV UV_PYTHON_DOWNLOADS=fal\u017fe is not"),
+    ],
+)
+def test_dockerfile_requirements_reads_uv_setting_values_edges(tmp_path, body, error):
+    if error is None:
+        assert _inputs(tmp_path, _UV + body)[0] == [3 + (_UV + body).count("\n")]
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            _inputs(tmp_path, _UV + body)
+
+
+@pytest.mark.parametrize(
+    ("setting", "error"),
+    [
+        ("UV_SYSTEM_PYTHON=maybe", None),  # a `uv pip` flag: uv sync doesn't read it
+        ("UV_BREAK_SYSTEM_PACKAGES=maybe", None),
+        ("UV_LINK_MODE=bogus", ":3: ENV UV_LINK_MODE=bogus is not a value uv takes"),
+        ("UV_NO_EDITABLE=x", ":3: ENV UV_NO_EDITABLE=x is not a value uv takes"),
+    ],
+)
+def test_dockerfile_inputs_uv_sync_refuses_only_uv_settings_it_reads(tmp_path, setting, error):
+    dockerfile = (
+        f"FROM python:3.13\nWORKDIR /app\nENV {setting}\nCOPY uv.lock pyproject.toml ./\nRUN uv sync --locked\n"
+    )
+    if error is None:
+        assert _sync_inputs(tmp_path, dockerfile)[0] == [(5, tmp_path / "uv.lock")]
+    else:
+        with pytest.raises(DockerfileError, match=error):
+            _sync_inputs(tmp_path, dockerfile)
 
 
 _RISKY = (
@@ -5466,6 +5648,8 @@ def test_env_pairs_follow_buildkit():
     [
         ("ENV UV_SYSTEM_PYTHON=1", "uv pip install -r requirements.txt", None),
         ("ENV UV_SYSTEM_PYTHON=true", "uv pip install --no-cache -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=yes", "uv pip install -r requirements.txt", None),
+        ("ENV UV_SYSTEM_PYTHON=On", "uv pip install -r requirements.txt", None),
         ("ENV UV_SYSTEM_PYTHON=0", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
         ("ENV UV_SYSTEM_PYTHON=$X", "uv pip install -r requirements.txt", ":6: uv pip install needs --system"),
         (

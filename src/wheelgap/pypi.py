@@ -894,7 +894,11 @@ def _fill_simple_data(pkg: Package, data: dict, python: str | None) -> Package:
         if chosen is None:
             final = " final" if pkg.prereleases is False else ""
             if pkg.spec:
-                pkg.error = f"no{final} release matches {pkg.spec}" + (f" for Python {python}" if python else "")
+                pkg.error = (
+                    f"no{final} release matches {pkg.spec}"
+                    + (f" for Python {python}" if python else "")
+                    + _MERGED_REFUSAL * pkg.merged_ranges
+                )
             elif pkg.prereleases is not None and grouped:
                 pkg.error = f"no{final} release" + (f" for Python {python}" if python else "")
             else:
@@ -1124,6 +1128,10 @@ def _sha256(entry: dict) -> str | None:
     return sha256.lower() if isinstance(sha256, str) else None
 
 
+# Said of a range made from two or more lines for one name (numpy>=2 and numpy<2) that no release matches.
+_MERGED_REFUSAL = " (the requirements for it allow no release together, so pip and uv refuse them)"
+
+
 def _filter_hashes(pkg: Package, urls: list[dict]) -> list[dict] | None:
     """The files a requirement's `--hash` options let pip install, as pip's filter_unallowed_hashes picks them: when
     some file's sha256 is listed, those files and any the index gives no sha256 for (pip checks those after the
@@ -1134,6 +1142,14 @@ def _filter_hashes(pkg: Package, urls: list[dict]) -> list[dict] | None:
         return urls
     origin = pkg.origin or "requirements.txt"
     if not any(_sha256(u) in pkg.hashes for u in urls):
+        if pkg.other_hashes:
+            # pip then checks the file it picks against the sha384/sha512 ones too, which wheelgap can't match.
+            pkg.error = (
+                f"none of the sha256 hashes in {origin} matches a file of {pkg.name} {pkg.version}, and its other "
+                "hashes (sha384, sha512) can't be matched against the index, so wheelgap can't tell which file pip "
+                "accepts"
+            )
+            return None
         if urls and all(_sha256(u) is not None for u in urls):
             pkg.error = f"none of the hashes in {origin} matches a file of {pkg.name} {pkg.version}"
             return None
@@ -1142,6 +1158,10 @@ def _filter_hashes(pkg: Package, urls: list[dict]) -> list[dict] | None:
     kept = {id(u) for u in allowed}
     pkg.hash_rejected = {
         u["filename"]: f"its hash isn't listed in {origin}"
+        + (
+            " (pip may still accept it by a sha384 or sha512 hash there, where no listed file fits)"
+            * bool(pkg.other_hashes)
+        )
         for u in urls
         if id(u) not in kept and u["filename"].endswith(".whl")
     }
@@ -1173,6 +1193,7 @@ def _fill_json_data(pkg: Package, data: dict, python: str | None, base: str) -> 
                     (f"no{final} release matches {pkg.spec}" if pkg.spec else f"no{final} release")
                     + (f" uploaded before exclude-newer ({describe(pkg.exclude_newer)})" if pkg.exclude_newer else "")
                     + (f" for Python {python}" if python else "")
+                    + _MERGED_REFUSAL * pkg.merged_ranges
                 )
                 return pkg
             pkg.version, urls = found

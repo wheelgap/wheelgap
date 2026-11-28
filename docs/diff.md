@@ -85,6 +85,10 @@ Both lockfiles are checked and packages are matched by name. Per target:
   exit code 1, which only `worse` and `new` do.
 - When only the OLD lockfile leaves a Python out (the range widened), the new lockfile's gaps on that Python aren't
   shown. Check it with `wheelgap NEW -p 3.13` to see them.
+- A `pdm.lock` whose [`[[metadata.targets]]`](inputs.md#pdmlock) take no patch release of a target's Python is
+  treated the same way (`pdm install` refuses it there), with the targets' `requires_python` in the reason, though the
+  main command refuses such a target. Their platforms narrow the default targets as a `uv.lock`'s
+  `[tool.uv] environments` do: a platform both locks leave out goes, one only one side leaves out is refused.
 
 With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source, is
 missing or couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
@@ -132,8 +136,8 @@ it at that ref, if any), so its format is detected and read as usual. `PATH` is 
   package in; absent for a direct dependency or an input without a dependency graph;
 - `unchecked`: the names of packages that were `unknown` on both sides of a target at the same version, so neither
   side could be checked there;
-- `not_compared` (**after 0.14.0**): the targets left out because either lockfile's `requires-python` leaves out
-  their Python ([above](#what-counts-as-worse)), each with its `target` label, its `python`, the `sides` that leave
+- `not_compared` (**after 0.14.0**): the targets left out because either lockfile's `requires-python` (or a
+  `pdm.lock`'s targets) leaves out their Python ([above](#what-counts-as-worse)), each with its `target` label, its `python`, the `sides` that leave
   it out (`old`, `new` or both; `["new"]` alone means the change dropped that Python) and a `reason`;
 - `summary`: the `worse` and `new` counts;
 - `fix` (on each target of `worse` and `new`, with `--fix`, **after 0.14.0**): that gap's way out, as `fix` in the
