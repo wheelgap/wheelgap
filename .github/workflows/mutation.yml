@@ -46,18 +46,18 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - name: Run mutmut on src/wheelgap/${{ matrix.module }}.py
-        # mutmut's exit code is a bit field: 1 a fatal error, 2 survivors, 4 timeouts, 8 suspicious. Only the 1 bit is
-        # a failure of the run itself; the others are its findings, shown in the summary.
+        # --CI makes mutmut exit 0 unless the run itself failed (its findings are in the summary, not the exit code);
+        # anything else non-zero, from mutmut or from uv, fails the job.
         env:
           MODULE: ${{ matrix.module }}
           TESTS: ${{ matrix.tests }}
         run: |
           rc=0
-          uv run --python 3.12 --group dev --with mutmut==2.5.1 mutmut run --no-progress \
+          uv run --python 3.12 --group dev --with mutmut==2.5.1 mutmut run --no-progress --CI \
             --paths-to-mutate "src/wheelgap/${MODULE}.py" \
             --runner "python -m pytest -x -q -p no:cacheprovider ${TESTS}" || rc=$?
           echo "mutmut exited with $rc"
-          [ $((rc & 1)) -eq 0 ]
+          [ "$rc" -eq 0 ]
       - name: Summarise
         if: always()
         env:
@@ -85,7 +85,7 @@ jobs:
             echo '````text'
             head -n 40 survivors.txt | while read -r id; do
               echo "# mutant $id"
-              uv run -q --python 3.12 --group dev --with mutmut==2.5.1 mutmut show "$id" 2>/dev/null | grep -E '^[-+][^-+]'
+              uv run -q --python 3.12 --group dev --with mutmut==2.5.1 mutmut show "$id" 2>/dev/null | grep -E '^[-+][^-+]' || true
               echo
             done
             echo '````'

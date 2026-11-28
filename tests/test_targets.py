@@ -576,7 +576,7 @@ def test_libc_versions_require_minor_and_valid_major():
 def test_legacy_manylinux_aliases_start_at_their_exact_glibc():
     # manylinux2010 is glibc 2.12 and manylinux1 is 2.5 (PEP 571, PEP 513): a target at exactly that glibc takes
     # them, one release lower doesn't.
-    mp = target_module.manylinux_platforms
+    mp = manylinux_platforms
     assert "manylinux2010_x86_64" in mp("x86_64", (2, 12))
     assert "manylinux2010_x86_64" not in mp("x86_64", (2, 11))
     assert mp("x86_64", (2, 5)) == ["manylinux_2_5_x86_64", "manylinux1_x86_64"]
