@@ -64,7 +64,7 @@ from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
 from .install_log import FIND_LINKS, LATEST_NOTE, NO_FAILURE, OTHER_INDEX, LogError, failed_builds, ran_on_pypy
 from .pyodide import PyodideLockError, load_pyodide_lock
-from .sources import SourceError
+from .sources import Source, SourceError
 from .suggest_targets import suggest, to_json
 from .targets import (
     ALIASES,
@@ -968,13 +968,24 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
             raise ToolError(_translate_cli_message(str(e))) from e
     if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
         targets = diff.lock_default_targets(paths, targets)[0]
-    sides = []
+    sides: list[dict[str, diff.Package]] = []
     sources = []
+    # As `wheelgap diff`: a Python a pdm.lock side's targets leave out isn't checked or compared.
+    pdm_skip = diff.pdm_not_covered(
+        [diff._pdm_lock_targets(Path(path)) for path in paths],
+        targets,
+        [diff._lock_python_range(Path(path)) for path in paths],
+    )
+    checked = [t for t in targets if t not in pdm_skip]
     for path in paths:
+        if not checked:
+            sides.append({})
+            sources.append(Source(str(path)))
+            continue
         try:
             # As in `wheelgap diff`: no offline mode, so a lock made for other Pythons is re-checked on the index
             # rather than compared on files it may be missing (which could cancel out and pass on a guess).
-            results, source, _ = check_with_source(path, targets, online=False, offline=False)
+            results, source, _ = check_with_source(path, checked, online=False, offline=False)
         except OSError as e:  # a lockfile that can't be read
             raise ToolError(f"{path}: {e.strerror or e}") from e
         except SourceError as e:
@@ -986,7 +997,7 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         sides.append(packages)
         sources.append(source)
     # As `wheelgap diff` (#807): a target whose Python either lock's requires-python leaves out isn't compared.
-    report = diff.compare(sides[0], sides[1], targets, diff.not_covered(sources, targets))
+    report = diff.compare(sides[0], sides[1], targets, {**pdm_skip, **diff.not_covered(sources, targets)})
     data: dict[str, Any] = json.loads(diff.json_report(report, targets))
     del data["version"]  # the server's version is in its serverInfo (initialize's, or the result's _meta)
     data["ok"] = not report.worse and not report.new

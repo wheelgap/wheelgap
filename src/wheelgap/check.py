@@ -6,7 +6,7 @@ import itertools
 import re
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 
@@ -34,7 +34,15 @@ from .sources import (
     uv_group_names,
     uv_selected_roots,
 )
-from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
+from .targets import (
+    ANDROID_FLOOR,
+    IOS_FLOOR,
+    MANYLINUX_FLOOR,
+    MANYLINUX_X86_ARCHES,
+    NEWEST_PYTHON,
+    PLATFORMS,
+    Target,
+)
 
 
 class Status(StrEnum):
@@ -85,6 +93,9 @@ class Row:
     input_package: Package | None = field(default=None, repr=False, compare=False)
     # Direct dependencies that reach a transitive package on a target, for concise text/Markdown hints.
     direct_via: dict[Target, tuple[str, ...]] = field(default_factory=dict, repr=False, compare=False)
+    # Why a target is UNKNOWN when the lookup didn't fail: a Poetry 1.x lock checked without its project's dependencies
+    # (#815), where no dependency needs the package there but the project may require it directly.
+    unknown_reasons: dict[Target, str] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def counted(self) -> list[Status]:
@@ -625,73 +636,233 @@ def marker_holds(
     return marker_value(marker, target, extras=extras, groups=groups, conflicts=conflicts) is not False
 
 
-def lock_environment_targets(source: Source, targets: Iterable[Target]) -> tuple[list[Target], list[Target]]:
-    """The targets a uv.lock's supported-markers leave out, and those they can't be decided for.
+# How dep_logic 0.8 (PDM 2.29's) names an architecture in a platform string, as wheelgap's targets.py does.
+_PDM_ARCHES = {"i386": "x86", "i686": "x86", "amd64": "x86_64", "arm64": "aarch64"}
+_PDM_KNOWN_ARCHES = frozenset(
+    {"aarch64", "armv6l", "armv7l", "ppc64le", "ppc64", "x86", "x86_64", "s390x", "riscv64", "loongarch64"}
+)
+_PDM_PLATFORM = re.compile(r"(?P<os>manylinux|macos|musllinux)_(?P<major>\d+?)_(?P<minor>\d+?)_(?P<arch>[a-z0-9_]+)$")
+_PDM_ALIASES = {
+    "linux": ("manylinux", (2, 40), "x86_64"),
+    "windows": ("windows", None, "x86_64"),
+    "macos": ("macos", (14, 0), "aarch64"),
+    "alpine": ("musllinux", (1, 2), "x86_64"),
+    "macos_arm64": ("macos", (14, 0), "aarch64"),
+    "macos_x86_64": ("macos", (14, 0), "x86_64"),
+}
+_PDM_RELEASE_OSES = frozenset({"freebsd", "netbsd", "openbsd", "dragonfly", "illumos", "haiku"})
 
-    The markers are the project's `[tool.uv] environments`. `uv sync` installs the lock only where one of them
-    holds, and fails anywhere else ("The current Python platform is not compatible with the lockfile's supported
-    environments"):
+
+def _pdm_platform(text: str) -> tuple[str, tuple[int, int] | None, str] | None:
+    """A pdm.lock target's platform as (os, version, arch), the way PDM reads it (dep_logic's Platform.parse:
+    https://github.com/pdm-project/dep-logic/blob/0.8.0/src/dep_logic/tags/platform.py), or None where PDM
+    can't read it. A system other than manylinux, musllinux, macOS and Windows (freebsd_..., emscripten_...) is
+    "other"."""
+    if text in _PDM_ALIASES:
+        return _PDM_ALIASES[text]
+    if text.startswith("windows_"):
+        os_name, version, arch = "windows", None, text.split("_", 1)[1]
+    elif m := _PDM_PLATFORM.match(text):
+        os_name, version, arch = m["os"], (int(m["major"]), int(m["minor"])), m["arch"]
+    elif "_" in text:
+        os_name, version, arch = "other", None, text.split("_", 1)[1]
+        if text.split("_", 1)[0] in _PDM_RELEASE_OSES:
+            arch = arch.partition("_")[2]
+    else:
+        return None
+    arch = _PDM_ARCHES.get(arch, arch)
+    return (os_name, version, arch) if arch in _PDM_KNOWN_ARCHES else None
+
+
+def _pdm_target_platform(target: Target) -> tuple[str, tuple[int, int] | None, str] | None:
+    """A wheelgap target as (os, version, arch) in _pdm_platform's terms; None for Pyodide, iOS and Android."""
+    family, arch = PLATFORMS[target.platform]
+    if family == "windows":
+        return "windows", None, {"win_amd64": "x86_64", "win_arm64": "aarch64", "win32": "x86"}[arch]
+    version = {"manylinux": target.glibc, "musllinux": target.musl, "macos": target.macos}.get(family)
+    return None if version is None else (family, version, _PDM_ARCHES.get(arch, arch))
+
+
+def pdm_python_value(requires: str, target: Target) -> bool | None:
+    """Whether a lock target's requires_python takes the target's Python, at every patch release (True), at none
+    (False), or at some only (None), probing as _evaluate_atom does for python_full_version."""
+    if not requires.strip():
+        return True
+    try:
+        spec = SpecifierSet(requires)
+    except InvalidSpecifier:
+        return None
+    probes = [Version(f"{target.major}.{target.minor}.0"), Version(f"{target.major}.{target.minor}.999999")]
+    for s in spec:
+        try:
+            release = Version(s.version.removesuffix(".*")).release
+        except InvalidVersion:
+            return None
+        if release[:2] == (target.major, target.minor) and len(release) >= 3:
+            patch = release[2]
+            probes += [Version(f"{target.major}.{target.minor}.{p}") for p in (patch - 1, patch, patch + 1) if p >= 0]
+    outcomes = {spec.contains(v, prereleases=True) for v in probes}
+    return outcomes.pop() if len(outcomes) == 1 else None
+
+
+def pdm_target_value(entry: dict, target: Target) -> bool | None:
+    """Whether `pdm install` takes one of a pdm.lock's `[[metadata.targets]]` on `target`: True, False, or None
+    when it can't be told (a patch-level requires_python, a platform or key PDM 2.29 doesn't know).
+
+    PDM installs where a lock target compares as LOWER_OR_EQUAL or HIGHER, and fails with "No compatible lock target
+    found" where every one is INCOMPATIBLE (dep_logic's EnvSpec.compare, called from pdm/cli/actions.py
+    resolve_from_lockfile): the Pythons must overlap, an implementation the target names must be the same one with
+    the same gil_disabled, and a platform must have the same operating system and architecture. A platform's glibc,
+    musl or macOS version doesn't matter: PDM installs a manylinux_2_40 lock on glibc 2.36, with a warning, and the
+    lock keeps every file an older version would take.
+    """
+    if set(entry) - {"requires_python", "platform", "implementation", "gil_disabled"} or "requires_python" not in entry:
+        return None  # PDM 2.29 can't read it either (EnvSpec.from_spec(**entry))
+    values = {pdm_python_value(entry["requires_python"], target)}
+    implementation, gil_disabled = entry.get("implementation"), entry.get("gil_disabled", False)
+    if implementation:  # wheelgap's targets are CPython
+        if implementation not in ("cpython", "pypy", "pyston") or (gil_disabled and implementation != "cpython"):
+            values.add(None)
+        else:
+            values.add(implementation == "cpython" and gil_disabled == target.freethreaded)
+    if platform := entry.get("platform"):
+        locked, wanted = _pdm_platform(platform), _pdm_target_platform(target)
+        if locked is None or (wanted is None and locked[0] == "other"):
+            values.add(None)
+        else:
+            values.add(wanted is not None and locked[0] == wanted[0] and locked[2] == wanted[2])
+    return False if False in values else None if None in values else True
+
+
+def _pdm_target_text(entry: dict) -> str:
+    parts = [f"requires_python {entry.get('requires_python') or 'any'}"]
+    parts += [f"{key} {entry[key]}" for key in ("platform", "implementation") if entry.get(key)]
+    if entry.get("implementation"):  # only with an implementation does PDM compare it (EnvSpec.from_spec)
+        parts.append(f"gil_disabled {'true' if entry.get('gil_disabled') else 'false'}")
+    return ", ".join(parts)
+
+
+def _locks_environments(source: Source) -> bool:
+    return bool(source.supported_markers or source.pdm_targets)
+
+
+def _locked_for(source: Source) -> tuple[str, str, str, str]:
+    """For messages: what the lock was locked for, those environments as written, the command that fails outside
+    them, and how to lock for more."""
+    if source.pdm_targets and not source.supported_markers:
+        return (
+            "`pdm lock` targets",
+            "; ".join(_pdm_target_text(entry) for entry in source.pdm_targets),
+            "`pdm install`",
+            "lock for them too with `pdm lock --append --platform ... --python ...`",
+        )
+    return (
+        "`[tool.uv] environments`",
+        "; ".join(source.supported_markers),
+        "`uv sync`",
+        "add them to environments and run `uv lock`",
+    )
+
+
+def lock_environment_targets(source: Source, targets: Iterable[Target]) -> tuple[list[Target], list[Target]]:
+    """The targets a lock's environments leave out, and those they can't be decided for.
+
+    For a uv.lock, the environments are its supported-markers, the project's `[tool.uv] environments`. `uv sync`
+    installs the lock only where one of them holds, and fails anywhere else ("The current Python platform is not
+    compatible with the lockfile's supported environments"):
     https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-environment-operations/src/sync.rs#L174-L196
     A target is undecided when no marker holds for sure and one depends on something the target doesn't fix
     (platform_release, platform_machine on win32, a patch release of Python) or doesn't parse.
+
+    For a pdm.lock, they are its `[[metadata.targets]]`, as pdm_target_value reads them.
     """
     outside: list[Target] = []
     undecided: list[Target] = []
-    if source.supported_markers:
+    if _locks_environments(source):
         for target in targets:
-            values = {marker_value(marker, target) for marker in source.supported_markers}
+            values = {marker_value(marker, target) for marker in source.supported_markers} | {
+                pdm_target_value(entry, target) for entry in source.pdm_targets
+            }
             if True not in values:
                 (undecided if None in values else outside).append(target)
     return outside, undecided
 
 
-def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
-    """SourceError unless every target is in the environments a uv.lock was locked for.
+def _pdm_covered_python(source: Source, targets: list[Target]) -> str | None:
+    """The newest Python, X.Y, that a pdm.lock's targets take on one of `targets`' platforms, for a hint."""
+    for minor in range(NEWEST_PYTHON[1], 7, -1):
+        for target in targets:
+            candidate = replace(target, major=3, minor=minor, freethreaded=False)
+            if any(pdm_target_value(entry, candidate) for entry in source.pdm_targets):
+                return f"3.{minor}"
+    return None
+
+
+def check_lock_environments(source: Source, targets: Iterable[Target], *, default_python: bool = False) -> None:
+    """SourceError unless every target is in the environments a uv.lock or pdm.lock was locked for.
 
     uv resolves such a lock for its environments only: it drops the packages only other environments need (a
     Windows-only dependency in a Linux-only lock) and the wheels for other platforms, so reading it for another
     target would report gaps that aren't there and miss packages that are. `uv sync` refuses to install it there.
+    PDM does the same for a lock made with `pdm lock --platform` (or `--python`), and `pdm install` refuses it.
     """
     targets = list(targets)
     outside, undecided = lock_environment_targets(source, targets)
     if not outside and not undecided:
         return
-    with_python = len({t.python for t in targets}) > 1
+    # A pdm.lock's targets name Pythons too, so its message always does (the running one may be the cause).
+    with_python = len({t.python for t in targets}) > 1 or bool(source.pdm_targets)
 
     def names(some: list[Target]) -> str:
         return ", ".join(t.label(with_python) for t in some)
 
-    markers = "; ".join(source.supported_markers)
+    what, environments, installer, more = _locked_for(source)
     if not outside:
         raise SourceError(
             f"{source.label}: can't tell whether this lock covers {names(undecided)}: it was locked for "
-            f"`[tool.uv] environments` only ({markers}), which those targets don't decide, and `uv sync` fails "
-            "outside them; check targets the markers decide"
+            f"{what} only ({environments}), which those targets don't decide, and {installer} fails "
+            f"outside them; check targets the {'markers' if source.supported_markers else 'lock targets'} decide"
         )
     covered = [t for t in targets if t not in outside and t not in undecided]
     raise SourceError(
-        f"{source.label}: this lock doesn't cover {names(outside)}: it was locked for `[tool.uv] environments` "
-        f"only ({markers}), so `uv sync` fails there and the lock leaves out the packages and wheels other "
+        f"{source.label}: this lock doesn't cover {names(outside)}: it was locked for {what} "
+        f"only ({environments}), so {installer} fails there and the lock leaves out the packages and wheels other "
         "environments need; "
         + (
             f"of the targets asked for it covers {names(covered)}"
             if covered
             else "it covers none of the targets asked for"
         )
-        + " (to check the others, add them to environments and run `uv lock`)"
+        + f" (to check the others, {more})"
+        + _default_python_hint(source, outside, default_python)
+    )
+
+
+def _default_python_hint(source: Source, outside: list[Target], default_python: bool) -> str:
+    """For a pdm.lock checked on the running Python (no -p, `python` setting or .python-version): say so, and which
+    Python the lock covers."""
+    if not default_python or not source.pdm_targets:
+        return ""
+    pythons = ", ".join(dict.fromkeys(t.python for t in outside))
+    covered = _pdm_covered_python(source, outside)
+    return (
+        f"; Python {pythons} is the default, the one wheelgap runs on (no -p, `python` setting or .python-version): "
+        + (f"pass -p {covered} for a Python the lock covers, or " if covered else "")
+        + f"run `pdm lock --append --python {outside[0].major}.{outside[0].minor}` to lock for it"
     )
 
 
 def narrow_to_lock_environments(
     sources: Iterable[Source], targets: list[Target], *, every: bool = False
 ) -> tuple[list[Target], list[str]]:
-    """Targets nobody named (the default platforms, or --advisory ones) without the platforms a uv.lock made with
-    `[tool.uv] environments` leaves out for every Python asked for, and those platforms. With several locks a
-    platform goes when one of them leaves it out; with every=True (`wheelgap diff`) only when all of them do, so a
-    platform one side gives up stays and check_lock_environments refuses it. A platform covered for some of the
-    Pythons only stays, and is refused there too. Nothing goes when no target would be left."""
+    """Targets nobody named (the default platforms, or --advisory ones) without the platforms a lock made for some
+    environments only (a uv.lock's `[tool.uv] environments`, a pdm.lock's targets) leaves out for every Python asked
+    for, and those platforms. With several locks a platform goes when one of them leaves it out; with every=True
+    (`wheelgap diff`) only when all of them do, so a platform one side gives up stays and check_lock_environments
+    refuses it. A platform covered for some of the Pythons only stays, and is refused there too. Nothing goes when no
+    target would be left."""
     sources = list(sources)
-    if not any(source.supported_markers for source in sources):
+    if not any(_locks_environments(source) for source in sources):
         return targets, []
     # A lock without environments leaves nothing out, so with every=True it keeps every platform.
     outside = [set(lock_environment_targets(source, targets)[0]) for source in sources]
@@ -703,12 +874,24 @@ def narrow_to_lock_environments(
     return [t for t in targets if t.platform in locked], left_out
 
 
+def lock_environments_label(sources: Iterable[Source]) -> str:
+    """For notes: the locks made for some environments only, and what they were locked for ("uv.lock is locked for
+    `[tool.uv] environments` only")."""
+    limited = [source for source in sources if _locks_environments(source)]
+    labels = list(dict.fromkeys(source.label for source in limited))
+    whats = list(dict.fromkeys(_locked_for(source)[0] for source in limited))
+    if len(labels) == 1:
+        return f"{labels[0]} is locked for {whats[0]} only"
+    return f"{', '.join(labels[:-1])} and {labels[-1]} are each locked for {' or '.join(whats)} only"
+
+
 def lock_environments_note(sources: Iterable[Source], left_out: list[str], kept: list[Target], what: str) -> str:
-    labels = ", ".join(dict.fromkeys(source.label for source in sources if source.supported_markers))
+    sources = list(sources)
     checked = ", ".join(dict.fromkeys(t.platform for t in kept))
+    several = len({source.label for source in sources if _locks_environments(source)}) > 1
     return (
-        f"{labels} is locked for `[tool.uv] environments` only, which leave out {', '.join(left_out)}: "
-        f"checking the {what} it covers ({checked})"
+        f"{lock_environments_label(sources)}, which leave out {', '.join(left_out)}: "
+        f"checking the {what} {'they all cover' if several else 'it covers'} ({checked})"
     )
 
 
@@ -1305,6 +1488,8 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
         # The (via ...) hint, per target, worked out only when a gap needs it, so gap-free runs never pay. Text and
         # Markdown tables show it, and `--json --explain` writes it as `direct`.
         hints: dict[Target, dict[int, tuple[str, ...]]] = {}
+        # Poetry 1.x without its project's dependencies (#815): the names each target installs, for left-out packages.
+        installed_keys: dict[Target, set[str]] = {}
         for i, pkg in enumerate(source.packages):
             if pkg.skip:
                 continue
@@ -1320,7 +1505,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                 row = resolved_rows[id(resolved)]
                 files = None if resolved.error else resolved.files
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
-                row.results[t] = (
+                status = (
                     status_for(
                         files,
                         t,
@@ -1329,9 +1514,19 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                         no_binary=resolved.no_binary,
                         only_binary=resolved.only_binary,
                     )
-                    if needed
+                    if needed or source.poetry_roots_unknown
                     else Status.NOT_NEEDED
                 )
+                if not needed and status not in (Status.WHEEL, Status.NOT_NEEDED) and installed is not None:
+                    # No dependency installs it here, but Poetry installs a direct dependency everywhere, and only the
+                    # pyproject.toml can say whether it is one. Another version of the name installed here settles it.
+                    if t not in installed_keys:
+                        installed_keys[t] = {source.packages[j].key for j in installed[t]}
+                    if pkg.key not in installed_keys[t]:
+                        row.results[t] = Status.UNKNOWN
+                        row.unknown_reasons[t] = poetry_roots_reason(source)
+                        continue
+                row.results[t] = status if needed else Status.NOT_NEEDED
                 if needed and installed is not None:
                     row.via[t] = (
                         paths[t][i]
@@ -1351,3 +1546,27 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
                             row.direct_via[t] = direct
             rows.extend(resolved_rows.values())
     return rows
+
+
+def poetry_roots_reason(source: Source) -> str:
+    """Why a package a Poetry 1.x lock's walk leaves out is UNKNOWN on a target (#815)."""
+    return (
+        "no dependency installs it here, but Poetry installs it on every target if the project requires it directly, "
+        "and a Poetry 1.x lock doesn't record that: the pyproject.toml beside the lock is needed to tell "
+        f"({source.poetry_roots_unknown})"
+    )
+
+
+def poetry_roots_note(sources: list[Source], rows: list[Row]) -> str | None:
+    """The run's note for the packages poetry_roots_reason made UNKNOWN, naming at most five."""
+    names = list(dict.fromkeys(r.package.name for r in rows if any(t not in r.ignored for t in r.unknown_reasons)))
+    why = "; ".join(source.poetry_roots_unknown for source in sources if source.poetry_roots_unknown)
+    if not names or not why:
+        return None
+    shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    return (
+        f"a Poetry 1.x lock doesn't record the project's own dependencies, and {why}: {shown} "
+        f"{'is' if len(names) == 1 else 'are'} `unknown` where no dependency installs "
+        f"{'it' if len(names) == 1 else 'them'} and there's no wheel, since Poetry installs a direct dependency "
+        "there too; check the lock beside its pyproject.toml"
+    )

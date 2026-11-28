@@ -112,7 +112,12 @@ def test_real_lockfile_offline_has_no_unknowns(file, fake_pypi):
         with pytest.raises(SourceError, match="needs the index for 85 packages"):
             wheelgap.check_lockfile(REAL / file, script.TARGETS, offline=True)
     else:
-        results = wheelgap.check_lockfile(REAL / file, script.TARGETS, offline=True)
+        targets = script.TARGETS
+        if file == "webcolors/pdm.lock":  # its [[metadata.targets]] say >=3.10, and `pdm install` refuses older ones
+            with pytest.raises(SourceError, match="this lock doesn't cover 3.8 linux-x86_64, .*`pdm install` fails"):
+                wheelgap.check_lockfile(REAL / file, targets, offline=True)
+            targets = [t for t in targets if (t.major, t.minor) >= (3, 10)]
+        results = wheelgap.check_lockfile(REAL / file, targets, offline=True)
         assert results
         assert not [r.name for r in results if Status.UNKNOWN in r.statuses.values()]
     assert fake_pypi == []

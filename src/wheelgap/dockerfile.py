@@ -31,6 +31,7 @@ from .sources import (
     _line_include,
     parse_requirements,
     requirement_to_package,
+    uv_lock_settings_above,
 )
 from .targets import ALPINE_MUSL, DEBIAN_GLIBC
 
@@ -4247,6 +4248,19 @@ def _dockerfile_requirements(
                 f"line {number}: {beside.relative_to(context).as_posix()} sits beside the lock in the build context "
                 "but no COPY brings it beside the lock in the image, so `uv sync` there doesn't read it, and "
                 "wheelgap's lock check would apply its settings"
+            )
+        # With no uv settings beside the lock, the lock check applies the nearest ones above its folder on disk, as uv
+        # does (sources._find_uv_settings). A COPY that brings uv settings was refused above, so the image has none
+        # of them above the project, and checking with them would answer for settings `uv sync` there doesn't read.
+        if (above := uv_lock_settings_above(uv_lock)) is not None:
+            config, keys = above
+            try:
+                shown = Path(os.path.relpath(config, context.absolute())).as_posix()
+            except ValueError:  # another drive on Windows
+                shown = str(config)
+            raise DockerfileError(
+                f"line {number}: {shown} sets {', '.join(keys)} in a folder above the lock on disk, which wheelgap's "
+                "lock check would apply, but no COPY brings it into the image, so `uv sync` there doesn't read it"
             )
         # uv 0.13.9 reads the .python-version in the project's folder, and with none there one in a folder above it
         # only up to the workspace root (one above a plain project is ignored), so a pin in the sync's folder is

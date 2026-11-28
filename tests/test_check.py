@@ -1,6 +1,15 @@
 import pytest
 
-from wheelgap.check import ConflictWorld, Status, check, marker_holds, status_for
+from wheelgap.check import (
+    ConflictWorld,
+    Status,
+    check,
+    lock_environments_label,
+    lock_environments_note,
+    marker_holds,
+    pdm_target_value,
+    status_for,
+)
 from wheelgap.pypi import fill_all
 from wheelgap.sources import Package, Source, load_inputs
 from wheelgap.targets import build_targets
@@ -492,3 +501,66 @@ def test_status_for_and_explain_with_format_control():
     ]
     lines_only_bin = explain_lines(files, win, only_binary=True)
     assert any("--only-binary forbids building from source" in line for line in lines_only_bin)
+
+
+@pytest.mark.parametrize(
+    "entry,python,platform,expected",
+    [
+        ({"requires_python": "==3.13.*", "platform": "manylinux_2_40_x86_64"}, "3.13", "linux-x86_64", True),
+        ({"requires_python": "==3.13.*", "platform": "manylinux_2_40_x86_64"}, "3.14", "linux-x86_64", False),
+        ({"requires_python": "==3.13.*", "platform": "manylinux_2_40_x86_64"}, "3.13", "linux-aarch64", False),
+        ({"requires_python": "==3.13.*", "platform": "manylinux_2_40_x86_64"}, "3.13", "musl-x86_64", False),
+        ({"requires_python": ">=3.10", "platform": "manylinux_2_17_x86_64"}, "3.13", "linux-x86_64", True),
+        ({"requires_python": ">=3.10", "platform": "manylinux_2_17_i686"}, "3.13", "linux-i686", True),
+        ({"requires_python": ">=3.10", "platform": "alpine"}, "3.13", "musl-x86_64", True),
+        ({"requires_python": ">=3.10", "platform": "musllinux_1_2_aarch64"}, "3.13", "musl-aarch64", True),
+        ({"requires_python": ">=3.10", "platform": "windows"}, "3.13", "win-amd64", True),
+        ({"requires_python": ">=3.10", "platform": "windows"}, "3.13", "win32", False),
+        ({"requires_python": ">=3.10", "platform": "windows_x86"}, "3.13", "win32", True),
+        ({"requires_python": ">=3.10", "platform": "windows_arm64"}, "3.13", "win-arm64", True),
+        ({"requires_python": ">=3.10", "platform": "macos"}, "3.13", "macos-arm64", True),
+        ({"requires_python": ">=3.10", "platform": "macos_26_0_arm64"}, "3.13", "macos-arm64", True),  # HIGHER
+        ({"requires_python": ">=3.10", "platform": "macos_x86_64"}, "3.13", "macos-arm64", False),
+        ({"requires_python": ">=3.10", "platform": "freebsd_14_x86_64"}, "3.13", "linux-x86_64", False),
+        ({"requires_python": ">=3.10", "platform": "linux"}, "3.13", "pyodide", False),
+        ({"requires_python": ">=3.10", "platform": "emscripten_wasm32"}, "3.13", "pyodide", None),
+        ({"requires_python": ">=3.10", "platform": "nonsense"}, "3.13", "linux-x86_64", None),
+        ({"requires_python": ">=3.10", "platform": "linux_sparc"}, "3.13", "linux-x86_64", None),
+        ({"requires_python": ">=3.10", "implementation": "cpython"}, "3.14", "linux-x86_64", True),
+        ({"requires_python": ">=3.10", "implementation": "cpython"}, "3.14t", "linux-x86_64", False),
+        (
+            {"requires_python": ">=3.10", "implementation": "cpython", "gil_disabled": True},
+            "3.14t",
+            "macos-arm64",
+            True,
+        ),
+        ({"requires_python": ">=3.10", "implementation": "pypy"}, "3.13", "linux-x86_64", False),
+        ({"requires_python": ">=3.10", "implementation": "jython"}, "3.13", "linux-x86_64", None),
+        ({"requires_python": ">=3.10", "gil_disabled": True}, "3.13", "linux-x86_64", True),  # needs implementation
+        ({"requires_python": ">=3.10", "platform": "linux"}, "3.14t", "linux-x86_64", True),
+        ({"requires_python": ">=3.13.2"}, "3.13", "linux-x86_64", None),  # 3.13.0 no, 3.13.5 yes
+        ({"requires_python": "!=3.13.2"}, "3.13", "linux-x86_64", None),
+        ({"requires_python": ">=3.13.2"}, "3.14", "linux-x86_64", True),
+        ({"requires_python": "<3.13"}, "3.13", "linux-x86_64", False),
+        ({"requires_python": ""}, "3.9", "linux-x86_64", True),
+        ({"requires_python": "not a specifier"}, "3.13", "linux-x86_64", None),
+        ({"platform": "linux"}, "3.13", "linux-x86_64", None),  # PDM can't read it without requires_python
+        ({"requires_python": ">=3.10", "libc": "glibc"}, "3.13", "linux-x86_64", None),  # a key PDM 2.29 lacks
+    ],
+)
+def test_pdm_target_value(entry, python, platform, expected):
+    (target,) = build_targets([python], [platform])
+    assert pdm_target_value(entry, target) is expected
+
+
+def test_lock_environments_label_names_several_locks():
+    uv = Source("uv.lock", supported_markers=["sys_platform == 'linux'"])
+    pdm = Source("pdm.lock", pdm_targets=[{"requires_python": ">=3.10", "platform": "linux"}])
+    assert lock_environments_label([uv]) == "uv.lock is locked for `[tool.uv] environments` only"
+    assert lock_environments_label([uv, pdm, Source("pylock.toml")]) == (
+        "uv.lock and pdm.lock are each locked for `[tool.uv] environments` or `pdm lock` targets only"
+    )
+    (lin,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert lock_environments_note([uv, pdm], ["win-amd64"], [lin], "default targets").endswith(
+        "which leave out win-amd64: checking the default targets they all cover (linux-x86_64)"
+    )

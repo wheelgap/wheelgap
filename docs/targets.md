@@ -169,7 +169,8 @@ targets are not inferred.
 
 `[tool.uv] environments` doesn't pick targets, but it limits them: a `uv.lock` made with it covers
 those environments only, so the built-in defaults are narrowed to the ones it covers and a target you ask for outside
-them is an error. See [uv.lock](inputs.md#uvlock).
+them is an error. See [uv.lock](inputs.md#uvlock). A `pdm.lock` made with `pdm lock --platform` or `--python` is limited
+the same way by its `[[metadata.targets]]`; see [pdm.lock](inputs.md#pdmlock).
 
 ### From a Dockerfile
 
