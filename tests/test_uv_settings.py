@@ -452,3 +452,47 @@ def test_sources_naming_one_package_twice_are_an_error(tmp_path):
     )
     with pytest.raises(SourceError, match="names 'fastlib' twice once normalized"):
         load_inputs([str(tmp_path / "pyproject.toml")])
+
+
+# How uv combines a blanket setting with the other kind's package list (BuildOptions.no_build_package and
+# no_binary_package), each checked with uv 0.13.1 sync or run on six and markupsafe.
+_PRECEDENCE = [
+    # six's wheel installs: no-build-package exempts it from no-binary.
+    ('no-binary = true\nno-build-package = ["fastlib"]', {"fastlib": "wheel", "nowheels": "source"}),
+    # markupsafe builds: no-binary-package exempts it from no-build.
+    ('no-build = true\nno-binary-package = ["fastlib"]', {"fastlib": "source", "nowheels": "missing"}),
+    # markupsafe's wheel installs: an explicit `no-binary = false` turns no-binary-package off.
+    ('no-binary = false\nno-binary-package = ["fastlib"]', {"fastlib": "wheel", "nowheels": "source"}),
+]
+
+
+@pytest.mark.parametrize(("settings", "expected"), _PRECEDENCE)
+def test_pyproject_package_lists_override_blanket_settings(tmp_path, capsys, fake_pypi, settings, expected):
+    (tmp_path / "pyproject.toml").write_text(
+        _pyproject(["fastlib==2.0.0", "nowheels==0.9"], f"[tool.uv]\n{settings}\n"), encoding="utf-8"
+    )
+    assert _results(capsys, tmp_path / "pyproject.toml")[1] == expected
+
+
+@pytest.mark.parametrize(("settings", "expected"), _PRECEDENCE)
+def test_uv_lock_package_lists_override_blanket_settings(tmp_path, capsys, fake_pypi, settings, expected):
+    (tmp_path / "uv.toml").write_text(settings + "\n", encoding="utf-8")
+    assert _results(capsys, _lock(tmp_path, tmp_path / "proj"))[1] == {"fastlib": expected["fastlib"]}
+
+
+@pytest.mark.parametrize(
+    ("block", "above", "expected"),
+    [
+        # uv run: the block's no-binary, the uv.toml's no-build-package for six, which installs its wheel.
+        ("no-binary = true", 'no-build-package = ["fastlib"]', "wheel"),
+        # The block's `no-binary = false` turns the uv.toml's no-binary-package off: six's wheel installs.
+        ("no-binary = false", 'no-binary-package = ["fastlib"]', "wheel"),
+    ],
+)
+def test_script_block_and_settings_above_combine_as_uv_run_does(tmp_path, capsys, fake_pypi, block, above, expected):
+    (tmp_path / "uv.toml").write_text(above + "\n", encoding="utf-8")
+    (tmp_path / "s").mkdir()
+    (tmp_path / "s" / "demo.py").write_text(
+        f'# /// script\n# dependencies = ["fastlib==2.0.0"]\n# [tool.uv]\n# {block}\n# ///\n', encoding="utf-8"
+    )
+    assert _results(capsys, tmp_path / "s" / "demo.py")[1] == {"fastlib": expected}

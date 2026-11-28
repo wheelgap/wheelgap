@@ -698,36 +698,55 @@ def uv_lock_settings_above(path: Path) -> tuple[Path, list[str]] | None:
 
 @dataclass
 class _BuildPolicy:
-    """The build and wheel restrictions uv applies to index packages, each as the setting that turns it on is named
-    in an install policy (`[tool.uv] no-binary-package`), and whether no-sources turns [tool.uv.sources] off."""
+    """The build and wheel restrictions uv applies to index packages, and whether no-sources turns
+    [tool.uv.sources] off. `no_build` and `no_binary` are the setting that turns one on for every package, as an
+    install policy names it (`[tool.uv] no-build`), False when a setting turns it off, or None when none sets it;
+    the package lists map each name to the setting that names it (`[tool.uv] no-binary-package`)."""
 
-    no_build: str | None = None
-    no_binary: str | None = None
+    no_build: str | bool | None = None
+    no_binary: str | bool | None = None
     no_build_package: dict[str, str] = field(default_factory=dict)
     no_binary_package: dict[str, str] = field(default_factory=dict)
     no_sources: bool = False
 
+    def _lists(self) -> tuple[dict[str, str], dict[str, str]]:
+        """The package lists uv reads: a list counts only while its blanket setting is unset (uv's NoBuild and
+        NoBinary from_args: `no-binary = false` makes no-binary-package do nothing, checked with uv 0.13.1)."""
+        return (
+            self.no_build_package if self.no_build is None else {},
+            self.no_binary_package if self.no_binary is None else {},
+        )
+
     def settings_on(self) -> list[str]:
-        package_lists = (self.no_build_package, self.no_binary_package)
-        firsts = [next(iter(names.values())) for names in package_lists if names]
-        return [setting for setting in (self.no_build, self.no_binary, *firsts) if setting]
+        firsts = [next(iter(names.values())) for names in self._lists() if names]
+        return [setting for setting in (self.no_build, self.no_binary, *firsts) if isinstance(setting, str)]
 
     def apply(self, pkg: Package) -> None:
+        """As uv's BuildOptions.no_build_package and no_binary_package: a blanket setting gives way to the other
+        kind's list, so with no-binary a package in no-build-package still takes a wheel, and with no-build a
+        package in no-binary-package still builds (uv 0.13.1 does both)."""
+        build_list, binary_list = self._lists()
         restrictions = []
-        if self.no_build or pkg.key in self.no_build_package:
+        if isinstance(self.no_build, str) and pkg.key not in binary_list:
             pkg.only_binary = True
-            restrictions.append(self.no_build or self.no_build_package[pkg.key])
-        if self.no_binary or pkg.key in self.no_binary_package:
+            restrictions.append(self.no_build)
+        elif pkg.key in build_list:
+            pkg.only_binary = True
+            restrictions.append(build_list[pkg.key])
+        if isinstance(self.no_binary, str) and pkg.key not in build_list:
             pkg.no_binary = True
-            restrictions.append(self.no_binary or self.no_binary_package[pkg.key])
+            restrictions.append(self.no_binary)
+        elif pkg.key in binary_list:
+            pkg.no_binary = True
+            restrictions.append(binary_list[pkg.key])
         pkg.install_policy = ", ".join(restrictions) or None
 
 
 def _uv_build_policy(layers: list[_UvLayer]) -> _BuildPolicy:
     """The restrictions in `layers`, highest precedence first, combined as uv combines a script's [tool.uv] with
     the settings found for it: the first layer that sets no-build, no-binary or no-sources decides it, and the
-    package lists are joined (uv 0.13.1 builds a package either names). uv's pip-only [tool.uv.pip] options don't
-    apply to uv sync or uv run."""
+    package lists are joined (uv 0.13.1 builds a package either names; _BuildPolicy.apply has how the settings
+    combine). uv's pip-only [tool.uv.pip] options don't apply to uv sync or uv run."""
     policy = _BuildPolicy()
     decided: set[str] = set()
     for layer in layers:
@@ -742,8 +761,8 @@ def _uv_build_policy(layers: list[_UvLayer]) -> _BuildPolicy:
             decided.add(key)
             if key == "no-sources":
                 policy.no_sources = value
-            elif value:
-                setattr(policy, key.replace("-", "_"), f"{layer.shown} {key}")
+            else:
+                setattr(policy, key.replace("-", "_"), f"{layer.shown} {key}" if value else False)
         for key in ("no-build-package", "no-binary-package"):
             values = layer.settings.get(key, [])
             if not isinstance(values, list) or not all(isinstance(name, str) for name in values):

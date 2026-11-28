@@ -155,7 +155,10 @@ root to the top of the filesystem, as uv 0.13.1 does. For a script's lock, the s
 is combined with the nearest settings from the script's folder up, as `uv run` combines them: the script's
 `no-build` and `no-binary` win, and the package lists are joined. These settings affect
 index packages (not local, Git or editable packages that wheelgap skips). `no-build` forbids
-source builds; `no-binary` excludes wheels. `--explain` identifies the applicable settings, with the file's path when
+source builds; `no-binary` excludes wheels. As in uv, a package list overrides the other kind's blanket setting: with
+`no-binary = true`, a package in `no-build-package` still takes a wheel, and with `no-build = true`, one in
+`no-binary-package` still builds; `no-binary = false` (or `no-build = false`) turns its package list off.
+`--explain` identifies the applicable settings, with the file's path when
 it's in a folder above (`../uv.toml no-binary-package`). Invalid setting types, and a `uv.toml` that can't be read, are
 input errors. Settings in your user-level uv config or in `UV_NO_BUILD`-style environment variables aren't read.
 `--dockerfile-inputs` refuses a `uv sync` line when settings above the lock's folder set a build restriction, since
