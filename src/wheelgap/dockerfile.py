@@ -2460,6 +2460,7 @@ _GIT_CLONE_SWITCHES = frozenset(
 _UV_BOOLISH = "(?ai:y|yes|t|true|on|1|n|no|f|false|off|0)"
 _UV_NUMBER = r"\+?[0-9]+"
 _UV_TRUE = ("y", "yes", "t", "true", "on", "1")  # the boolish values uv reads as true
+_UV_DOWNLOADS_ON = ("auto", "automatic", "true", "1")  # the UV_PYTHON_DOWNLOADS values that let uv fetch a Python
 _UV_VALUES: dict[str, tuple[str, str, int | None]] = {
     **dict.fromkeys(
         "UV_NO_CACHE UV_COMPILE_BYTECODE UV_NO_PROGRESS UV_BREAK_SYSTEM_PACKAGES UV_NO_INSTALL_PROJECT "
@@ -2904,6 +2905,7 @@ class _RunReader:
         risky_values: dict[str, str] = {}  # UV_ settings on this RUN whose values uv refuses, by name
         uv_installs: list[_Install] = []  # the uv installs of this RUN, which read those settings
         project_environment = False  # UV_PROJECT_ENVIRONMENT set on this RUN, which a read `uv sync` refuses
+        no_downloads = False  # UV_PYTHON_DOWNLOADS set on this RUN to a value that turns Python downloads off
         names_installer = False  # a pip or uv command, read or not
         exited: str | None = None  # an `exit` or `return` before the command: it may never run
         image_path = self.path  # a RUN is a shell of its own: what it does to PATH ends with it
@@ -2979,6 +2981,8 @@ class _RunReader:
                     risky_values[name] = problem
                 if name == "UV_PROJECT_ENVIRONMENT":
                     project_environment = True
+                if name == "UV_PYTHON_DOWNLOADS" and (not value.exact or value.text.lower() not in _UV_DOWNLOADS_ON):
+                    no_downloads = True
                 if name == "PATH":
                     self.path = self._path_entry(value.text, f"line {number}")
             if first in ("exit", "return") and not command.nested and not command.subshell:
@@ -3002,6 +3006,8 @@ class _RunReader:
             if isinstance(detail, _Install):
                 if detail.uv:
                     uv_installs.append(detail)
+                if detail.sync and no_downloads:
+                    detail.no_python_downloads = True
                 if detail.sync and project_environment:
                     stop(
                         "UV_PROJECT_ENVIRONMENT is set on this RUN, and `uv sync` may then install into an "
@@ -4271,6 +4277,9 @@ def _dockerfile_requirements(
     python_dirs: dict[str, tuple[int, list[str]]] = {}  # ENV PYTHONPATH and the others: (line, their folders)
     reader = _RunReader(report, pythons, image_read, copies, dirs)
     env: dict[str, str] = {}  # the ENV and ARG values wheelgap knows, as the shell of a RUN sees them
+    # UV_PYTHON_DOWNLOADS set by an ENV or ARG to a value that turns Python downloads off, or to one wheelgap can't
+    # tell (`ENV UV_PYTHON_DOWNLOADS=$DL` with DL unknown). Kept apart from env, which forgets a value it can't read.
+    downloads_off_env = False
     uv_system = False  # ENV UV_SYSTEM_PYTHON=1: uv reads it as --system
     uv_value_errors: dict[str, str] = {}  # ENV and ARG UV_ settings whose values uv refuses, for a uv install
     arg_values: dict[str, bool] = {}  # the names in env that an ARG set, and whether --build-arg gave the value
@@ -4486,16 +4495,11 @@ def _dockerfile_requirements(
                     "CPython version (X.Y, X.Y.Z or X.Yt) --dockerfile-inputs can check"
                 )
             pin = written
-        # uv fetches a Python the pin names only when downloads are on: UV_PYTHON_DOWNLOADS is auto, automatic or
-        # true by default. With them off (the flag, or an ENV that says otherwise) uv can only use the image's own
-        # Python, so a pin for another one makes the sync fail where wheelgap answered for it.
-        downloads_off = (
-            install.no_python_downloads
-            or "UV_PYTHON_DOWNLOADS" in reader.ambiguous
-            or (
-                "UV_PYTHON_DOWNLOADS" in env and env["UV_PYTHON_DOWNLOADS"].lower() not in ("auto", "automatic", "true")
-            )
-        )
+        # uv fetches a Python the pin names only when downloads are on: UV_PYTHON_DOWNLOADS is auto, automatic,
+        # true or 1 (auto by default). With them off (the flag, or an ENV, ARG or RUN-line setting that says
+        # otherwise) uv can only use the image's own Python, so a pin for another one makes the sync fail where
+        # wheelgap answered for it.
+        downloads_off = install.no_python_downloads or "UV_PYTHON_DOWNLOADS" in reader.ambiguous or downloads_off_env
         if pin is not None and downloads_off:
             pin_xy = re.fullmatch(r"(\d+\.\d+)(\.\d+)?(t?)", pin)
             assert pin_xy is not None  # checked above
@@ -4503,7 +4507,7 @@ def _dockerfile_requirements(
             if image_python is None or pin_xy[2] or pin_xy[1] + pin_xy[3] != image_python:
                 raise DockerfileError(
                     f"line {number}: `uv sync` gets Python {pin} from its .python-version, but downloads are off "
-                    "here (--no-python-downloads, or UV_PYTHON_DOWNLOADS other than auto, automatic or true), and "
+                    "here (--no-python-downloads, or UV_PYTHON_DOWNLOADS other than auto, automatic, true or 1), and "
                     f"the image's own Python is {image_python or 'not known'}, so uv may not get Python {pin}"
                 )
         try:
@@ -4776,6 +4780,8 @@ def _dockerfile_requirements(
             # so their values are forgotten: an install that needs one is an error, not a guess.
             for name in arg_values:
                 env.pop(name, None)
+            if "UV_PYTHON_DOWNLOADS" in arg_values:
+                downloads_off_env = True  # its value is forgotten: it may be off
             arg_values.clear()
             continue
         number, instruction = item
@@ -4877,6 +4883,13 @@ def _dockerfile_requirements(
                     env.pop(name, None)
                 else:
                     env[name] = value
+                if name == "UV_PYTHON_DOWNLOADS":
+                    downloads = value
+                    if downloads is None and keyword == "ENV" and name not in reader.ambiguous:
+                        written = _written_value(args, name)
+                        expanded = _expand_known(written, before) if written is not None else None
+                        downloads = None if expanded is None or "$" in expanded else expanded
+                    downloads_off_env = downloads is None or downloads.lower() not in _UV_DOWNLOADS_ON
                 if name == "PATH":
                     written = _written_value(args, name) if keyword == "ENV" else None
                     reader.path = (

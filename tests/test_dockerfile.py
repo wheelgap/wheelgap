@@ -3135,6 +3135,17 @@ def test_cli_dockerfile_inputs_uv_sync_pin_must_be_checked(
         ("3.12", "ENV UV_PYTHON_DOWNLOADS=never", True),
         ("3.12", "ENV UV_PYTHON_DOWNLOADS=manual", True),
         ("3.12", "ENV UV_PYTHON_DOWNLOADS=auto", False),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=1", False),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=0", True),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=NEVER", True),
+        ("3.12", "ARG UV_PYTHON_DOWNLOADS=never", True),
+        ("3.12", "ARG DL=never\nENV UV_PYTHON_DOWNLOADS=$DL", True),
+        ("3.12", "ARG DL\nENV UV_PYTHON_DOWNLOADS=${DL:-never}", True),
+        ("3.12", "ENV UV_PYTHON_DOWNLOADS=never\nENV MSG=hello\\ world", True),
+        ("3.13t", "--no-python-downloads", True),
+        ("3.12", "RUN UV_PYTHON_DOWNLOADS=never", True),
+        ("3.12", "RUN export UV_PYTHON_DOWNLOADS=never &&", True),
+        ("3.12", "RUN env UV_PYTHON_DOWNLOADS=0", True),
         ("3.13", "--no-python-downloads", False),
         ("3.13.2", "--no-python-downloads", True),
     ],
@@ -3146,8 +3157,10 @@ def test_cli_dockerfile_inputs_uv_sync_pin_needs_downloads_unless_image(
     (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj/uv.lock").read_bytes())
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
     (tmp_path / ".python-version").write_text(f"{pin}\n", encoding="utf-8")
-    if setting.startswith("ENV"):
+    if setting.startswith(("ENV", "ARG")):
         setup, sync = f"{setting}\n", "RUN uv sync --locked\n"
+    elif setting.startswith("RUN"):
+        setup, sync = "", f"{setting} uv sync --locked\n"
     else:
         setup, sync = "", f"RUN uv sync --locked {setting}\n"
     path = _context(
