@@ -1782,13 +1782,17 @@ def check_repo(
             entries[(entry["id"], entry["kind"])] = entry
             cells += check_input(entry, targets, out_dir, versions, run, workers, own_python)
         summary = totals(package_cells(cells))
+        level = target_cells(cells)
+        level_note = ""
+        if level:  # e.g. poetry.lock, whose cells are all target-level (no referee)
+            level_not_compared = sum(c.verdict == NOT_COMPARED for c in level)
+            level_note = f"; {len(level)} target-level cells outside the rate ({level_not_compared} not compared)"
         print(f"Repo: {repo} @ {sha}", file=out)
         print(
             f"Summary: {summary['compared']} compared, {summary['agree']} agreed, "
-            f"{summary['disagree']} disagreed, {summary['not_compared']} not compared.",
+            f"{summary['disagree']} disagreed, {summary['not_compared']} not compared{level_note}.",
             file=out,
         )
-        level = target_cells(cells)
         for cell in level:
             if cell.verdict != AGREE:
                 print(f"Target-level ({cell.kind}, {cell.mode}, {cell.target}): {cell.verdict}: {cell.why}", file=out)
