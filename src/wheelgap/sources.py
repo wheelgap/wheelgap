@@ -2858,38 +2858,47 @@ def _read_requirements(
                 _apply_release_options(line, format_control, where, handled=False)
             if include and include[0]:
                 target = include[1]
-                # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
-                # Unread, it may name an index, so the input isn't PyPI-only.
-                if "://" not in target and "${" not in target:
-                    # The include is read from the including file's folder as named, and that named
-                    # path is what the cycle check compares, as pip does.
-                    target_path = Path(os.path.abspath(path.parent / target))
-                    if target_path in stack:
-                        # An include naming a file already being read is an error, as pip refuses it:
-                        # the chain is one chain for -r and -c together, so a loop through a
-                        # constraints file is refused too.
-                        raise _cycle_error(path, line, target_path, stack)
-                    # A -r inside the constraints file is requirements, not more constraints (pip's rule),
-                    # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
-                    # are passed through for that -r file only: the constraints file's own lines add to neither.
-                    try:
-                        included = _read_requirements(
-                            path.parent / target,
-                            seen,
-                            constraints,
-                            True,
-                            index_options,
-                            format_control,
-                            req_lines,
-                            compiler_signs,
-                            stack=stack,
-                            ignored_options=ignored_options,
-                        )
-                    except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
-                        raise _include_error(path, number, line, e, stack) from e
-                    pkgs.extend(included)
-                elif not already_seen and index_options is not None:
-                    index_options.append(line)
+                if "://" in target or "${" in target:
+                    # pip reads a constraints file by URL (-c https://releases.openstack.org/...) and fills in
+                    # ${VAR} from its environment; wheelgap does neither. Unread, the file may pin any requirement
+                    # to another release (or make pip refuse it), so no answer for this input can be trusted.
+                    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                    how = (
+                        "a constraints file by URL, which wheelgap doesn't download"
+                        if "://" in target
+                        else "a constraints file through an environment variable, which wheelgap doesn't fill in"
+                    )
+                    raise SourceError(
+                        f"{where}: {line}: pip reads {how}, and its pins would change which releases pip installs; "
+                        "save the file and name it by its path instead"
+                    )
+                # The include is read from the including file's folder as named, and that named
+                # path is what the cycle check compares, as pip does.
+                target_path = Path(os.path.abspath(path.parent / target))
+                if target_path in stack:
+                    # An include naming a file already being read is an error, as pip refuses it:
+                    # the chain is one chain for -r and -c together, so a loop through a
+                    # constraints file is refused too.
+                    raise _cycle_error(path, line, target_path, stack)
+                # A -r inside the constraints file is requirements, not more constraints (pip's rule),
+                # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
+                # are passed through for that -r file only: the constraints file's own lines add to neither.
+                try:
+                    included = _read_requirements(
+                        path.parent / target,
+                        seen,
+                        constraints,
+                        True,
+                        index_options,
+                        format_control,
+                        req_lines,
+                        compiler_signs,
+                        stack=stack,
+                        ignored_options=ignored_options,
+                    )
+                except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
+                    raise _include_error(path, number, line, e, stack) from e
+                pkgs.extend(included)
                 continue
             if include:  # -r file, -rfile, --requirement file, --requirement=file, after other options too
                 target_path = Path(os.path.abspath(path.parent / include[1]))

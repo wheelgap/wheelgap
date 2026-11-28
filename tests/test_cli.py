@@ -4276,12 +4276,13 @@ def test_github_annotations_deps_inside_constraints(index, capsys, tmp_path, mon
 
 
 @pytest.mark.parametrize("target", ["https://example.invalid/cons.txt", "${CONSTRAINTS}"])
-def test_github_annotations_requirements_unread_constraints(capsys, fake_pypi, tmp_path, monkeypatch, target):
-    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+def test_requirements_unread_constraints_are_refused(capsys, fake_pypi, tmp_path, target):
     req = tmp_path / "a.txt"
-    req.write_text(f"-c {target}\nnowheels==0.9\n", encoding="utf-8")
-    # The parser leaves remote/environment-based constraints unread, so the scanner must too.
-    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,line=2,"]
+    req.write_text(f"-c {target}\nnumpy\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and out == ""
+    assert f"a.txt:1: -c {target}: pip reads a constraints file" in err
+    assert fake_pypi == []  # nothing is checked at its newest release
 
 
 @pytest.mark.parametrize("lines", [None, ["purewheel==3.1", "nowheels==0.9"]])

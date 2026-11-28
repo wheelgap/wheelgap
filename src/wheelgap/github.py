@@ -241,7 +241,7 @@ def _requirement_lines(
                 if include:
                     is_constraint, target = include
                     if is_constraint and ("://" in target or "${" in target):
-                        continue  # the parser leaves these constraints unread
+                        return None  # the parser refuses these constraints
                     # -r means requirements even inside a constraints file; track each file in both roles.
                     included = _requirement_lines(path.parent / target, seen, is_constraint, stack)
                     if included is None:

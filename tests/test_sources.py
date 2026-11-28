@@ -687,14 +687,34 @@ def test_requirements_marker_constraint_is_an_error(tmp_path):
     assert pkg.error is not None and "marker" in pkg.error
 
 
-def test_requirements_url_and_env_var_constraints_are_skipped(tmp_path):
+@pytest.mark.parametrize(
+    "line,why",
+    [
+        ("-c https://releases.openstack.org/constraints/upper/2023.1", "by URL"),
+        ("--constraint=https://example.com/upper.txt", "by URL"),
+        ("--pre -c https://example.com/upper.txt", "by URL"),
+        ("-c ${CDIR}/c.txt", "environment variable"),
+        ("--constraint=${PIP_CONSTRAINT}", "environment variable"),
+        ("-c c-${PY}.txt", "environment variable"),
+    ],
+)
+def test_requirements_url_and_env_var_constraints_are_refused(tmp_path, monkeypatch, line, why):
+    # pip reads these (pip 26.3 pins numpy===1.23.3 from the openstack file, which has no cp313 wheel), so checking
+    # numpy at its newest release would be a guess. Refused like an unread -r, with the line named.
+    monkeypatch.setenv("CDIR", str(tmp_path))
+    (tmp_path / "c.txt").write_text("ranged==1.0\n", encoding="utf-8")
     path = tmp_path / "requirements.txt"
-    path.write_text(
-        "ranged\n-c https://example.com/upper.txt\n--constraint=${PIP_CONSTRAINT}\n-c c-${PY}.txt\n", encoding="utf-8"
-    )
-    assert [(p.name, p.version, p.spec, p.error) for p in parse_requirements(path).packages] == [
-        ("ranged", None, None, None)
-    ]
+    path.write_text(f"ranged\n{line}\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape(f"requirements.txt:2: {line}: ") + f".*{why}"):
+        parse_requirements(path)
+
+
+def test_requirements_url_constraint_in_an_included_file_is_refused(tmp_path):
+    (tmp_path / "base.txt").write_text("-c https://example.com/upper.txt\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r base.txt\nranged\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape("base.txt:1: -c https://example.com/upper.txt: ")):
+        parse_requirements(path)
 
 
 @pytest.mark.parametrize(

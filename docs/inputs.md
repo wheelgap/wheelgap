@@ -470,8 +470,9 @@ range leaves out, or an exact constraint that the requirement's range or another
 reported `unknown` and the run fails. Versions match as pip matches them: `==1.9` and `==1.9.0` agree, and `==1.0`
 with `==1.0+cpu` is `1.0+cpu`. A constraint wheelgap can't apply leaves the package `unknown` rather than guessed: one
 with an environment marker (unless the requirement is pinned to a version it allows), a URL or path, or two exact
-versions that disagree. Constraint files given as a URL or an environment variable (`-c https://…`,
-`-c ${PIP_CONSTRAINT}`) are skipped.
+versions that disagree. A constraints file given as a URL or through an environment variable (`-c https://…`,
+`-c ${PIP_CONSTRAINT}`) is an input error naming the file and line: pip reads it, and its pins could change any
+requirement's release, but wheelgap doesn't download it or fill in the variable. Save the file and name it by its path.
 
 A `-r FILE` line inside a constraints file is read as pip reads it: `FILE` is a requirements file, so its packages
 are checked, while the constraints file's own lines stay constraints. A `-c` inside any file is a constraints file.

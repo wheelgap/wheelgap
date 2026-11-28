@@ -125,11 +125,9 @@ def package(tmp_path, files, name="nowheels"):
         ),
         ({"pyproject.toml": PYPROJECT + "\n[tool.pixi.pypi-options]\nfind-links = [{path = './wheels'}]\n"}, False),
         ({"pyproject.toml": PYPROJECT, "pdm.toml": "[pypi.corp]\nurl = 'https://x.example/simple'\n"}, False),
-        # Requirements files: a byte order mark, includes that aren't read, abbreviated include options.
+        # Requirements files: a byte order mark, abbreviated include options.
         ({"requirements.txt": b"\xef\xbb\xbf--index-url https://x.example/simple\nnowheels==0.9\n"}, False),
         ({"requirements.txt": b"\xef\xbb\xbfnowheels==0.9\n"}, True),
-        ({"requirements.txt": "-c https://x.example/constraints.txt\nnowheels==0.9\n"}, False),
-        ({"requirements.txt": "-c ${CONSTRAINTS}\nnowheels==0.9\n"}, False),
         ({"requirements.txt": "--requirem more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
         ({"requirements.txt": "--cons=more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
         ({"requirements.txt": "--pre --req more.txt\nnowheels==0.9\n", "more.txt": ""}, False),
