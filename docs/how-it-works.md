@@ -76,7 +76,8 @@ still checked, so a possible gap is reported rather than hidden. See
 - A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with
   `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without
   `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails,
-  and prints a note (with `-q`, only when some packages couldn't be re-checked).
+  and prints a note (with `-q`, only when some packages couldn't be re-checked). `wheelgap diff` doesn't compare such
+  a target at all (**after 0.14.0**; see [what counts as worse](diff.md#what-counts-as-worse)).
 - `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup make it
   exit 2 with an error naming the packages. The `requires-python` re-check above is skipped, with a note that those
   Pythons may show false gaps. `offline = true` in `[tool.wheelgap]` makes it the project default.

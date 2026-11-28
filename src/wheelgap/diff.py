@@ -24,6 +24,9 @@ How statuses rank, per target:
   a package name: `ranged==1.5` → `./ranged` shows `./ranged` as a new gap (still exit 1), not as `ranged`.
 - A package listed more than once (a uv.lock fork) takes its worst status on each target, with `unknown`
   beating `missing`, and ignoring `n/a` unless every entry is `n/a`.
+- A target whose Python either lockfile's requires-python leaves out isn't compared, and a note says so: the lock
+  isn't made for that Python (uv keeps only the wheels its range can use, and packages from another index can't be
+  looked up again), so its gaps there aren't the change's, and nothing there counts as worse.
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ from .cli import (
 )
 from .logsafe import guarded_output
 from .pypi import check_index_url
-from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock, tool_table
+from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock, pythons_outside_lock, tool_table
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -184,6 +187,84 @@ class Report:
     worse: list[dict] = field(default_factory=list)
     new: list[dict] = field(default_factory=list)
     unchecked: list[str] = field(default_factory=list)
+    # The targets left out of the comparison (see not_covered): each one's `target` label, `sides` and `reason`.
+    not_compared: list[dict] = field(default_factory=list)
+
+
+SIDES = ("old", "new")
+
+
+def not_covered(sources: list[Source], targets: list[Target]) -> dict[Target, dict]:
+    """The targets whose Python either side's requires-python leaves out, as the main command finds them
+    (pythons_outside_lock), each with the sides that leave it out and why, for compare()'s `skip`.
+
+    A lock isn't made for those Pythons: uv keeps only the wheels its range can use, so the locked files may lack the
+    wheels a Python outside it needs. The main command looks the PyPI packages up again and notes that the others (from
+    another index, or whose lookup failed) may show false gaps; diff would compare those as if they were real, and a
+    lock that moves its packages to a mirror would then lose every wheel at once (#807). uv sync refuses a lock on a
+    Python outside its requires-python, so what such a target means depends on the sides:
+
+    - both leave it out: neither lock installs there, so no gap there is the change's;
+    - only the new one: the change itself dropped that Python (`uv sync` there now fails). That's said as the change's
+      doing (not_compared_note, and the Action's warning), but it stays a note: exit 1 means `worse` or `new` lists
+      something, and a lock's own range isn't a wheel gap;
+    - only the old one: the range widened, and the new lock's gaps on that Python aren't shown."""
+    left_out: dict[Target, list[int]] = {}
+    for i, source in enumerate(sources):
+        outside = set(pythons_outside_lock(source, targets))
+        for t in targets:
+            if t.python in outside:
+                left_out.setdefault(t, []).append(i)
+    out = {}
+    for t, sides in left_out.items():
+        specs = {sources[i].requires_python for i in sides}
+        if sides == [1]:  # the change dropped this Python: say it as the change's doing
+            old = sources[0].requires_python or "any"
+            reason = (
+                f"the new lockfile no longer supports Python {t.python} (old: {old}, new: {sources[1].requires_python})"
+            )
+            out[t] = {"sides": ["new"], "python": t.python, "reason": reason}
+            continue
+        if len(sides) == 2 and len(specs) == 1:
+            locked = f"both lockfiles are locked for Python {specs.pop()}"
+        else:
+            locked = " and ".join(
+                f"the {SIDES[i]} lockfile is locked for Python {sources[i].requires_python}" for i in sides
+            )
+        reason = f"{locked}, which leaves out Python {t.python}"
+        out[t] = {"sides": [SIDES[i] for i in sides], "python": t.python, "reason": reason}
+    return out
+
+
+def not_compared_notes(report: Report) -> list[str]:
+    """The stderr notes for the targets compare() left out, grouped by reason: first each Python the change dropped
+    (only the new lock leaves it out), said as the change's doing, then the others."""
+    dropped: dict[tuple[str, str], list[str]] = {}
+    other: dict[str, list[str]] = {}
+    for entry in report.not_compared:
+        if entry["sides"] == ["new"]:
+            dropped.setdefault((entry["python"], entry["reason"]), []).append(entry["target"])
+        else:
+            other.setdefault(entry["reason"], []).append(entry["target"])
+    notes = [
+        f"this change drops Python {python} support: {reason}, so installing the new lock there now fails (uv sync "
+        f"refuses a lock on a Python outside its requires-python). Not compared: {', '.join(labels)}; the drop "
+        "doesn't count as worse"
+        for (python, reason), labels in dropped.items()
+    ]
+    if other:
+        reasons = "; ".join(f"{', '.join(labels)}: {reason}" for reason, labels in other.items())
+        notes.append(
+            f"didn't compare {reasons}. A lock isn't made for a Python outside its requires-python (it may lack the "
+            "wheels that Python needs, and packages from other indexes can't be looked up again), so nothing there "
+            "counts as worse"
+            + (
+                "; where only the old lockfile leaves a Python out, the new one's gaps there aren't shown"
+                if any(entry["sides"] == ["old"] for entry in report.not_compared)
+                else ""
+            )
+        )
+    return notes
 
 
 def _side(pkg: Package, t: Target, prefix: str = "") -> dict[str, str]:
@@ -211,11 +292,17 @@ def _with_direct(pkg: Package, targets: list[Target]) -> str:
     return f"{pkg.name} (via {first}{extra})"
 
 
-def compare(before: dict[str, Package], after: dict[str, Package], targets: list[Target]) -> Report:
+def compare(
+    before: dict[str, Package], after: dict[str, Package], targets: list[Target], skip: dict[Target, dict] | None = None
+) -> Report:
     """Packages that got worse and new packages with gaps, with the names that couldn't be checked at the
-    same version on either side."""
+    same version on either side. The targets in `skip` (see not_covered) aren't compared; they're listed in
+    `not_compared` instead. Labels are the same as for every target, compared or not."""
     multi_py = len({t.python for t in targets}) > 1
     report = Report()
+    skip = skip or {}
+    report.not_compared = [{"target": t.label(multi_py), **skip[t]} for t in targets if t in skip]
+    targets = [t for t in targets if t not in skip]
     for key, pkg in after.items():
         if key not in before:
             gaps = [t for t in targets if new_gap(pkg, t)]
@@ -266,6 +353,7 @@ def json_report(report: Report, targets: list[Target], fixes: Fixes | None = Non
         "worse": report.worse,
         "new": report.new,
         "unchecked": report.unchecked,
+        "not_compared": report.not_compared,
         "summary": {"worse": len(report.worse), "new": len(report.new)},
     }
     if fixes is not None:
@@ -368,9 +456,12 @@ def fix_text(fixes: Fixes, targets: list[Target]) -> list[str]:
     ]
 
 
-def summary(n_worse: int, n_new: int) -> str:
+def summary(n_worse: int, n_new: int, compared: bool = True, partial: bool = False) -> str:
+    """The last line. `compared` False: every target was left out (not_covered); `partial`: some were."""
+    if not compared:  # "nothing got worse" would claim a comparison
+        return "Nothing was compared."
     if not n_worse and not n_new:
-        return "Nothing got worse."
+        return "Nothing got worse on the compared targets." if partial else "Nothing got worse."
     parts = []
     if n_worse:
         parts.append(f"{n_worse} package{'s' * (n_worse != 1)} got worse")
@@ -691,7 +782,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
             print(json.dumps({"error": {"message": str(e), "type": type(e).__name__}}))
         return 2
 
-    report = compare(sides[0], sides[1], targets)
+    report = compare(sides[0], sides[1], targets, not_covered(sources, targets))
     fixes = None
     if args.fix:
         try:
@@ -712,9 +803,12 @@ def _main(argv: list[str] | None, prog: str) -> int:
     else:
         for line in report.lines:
             print(line)
-        print(summary(len(report.worse), len(report.new)))
+        left_out = len(report.not_compared)
+        print(summary(len(report.worse), len(report.new), left_out < len(targets), partial=left_out > 0))
         for line in fix_text(fixes, targets) if fixes is not None else []:
             print(line)
+    for note in not_compared_notes(report):
+        print(f"wheelgap: note: {note}", file=sys.stderr)
     if report.unchecked:
         print(f"wheelgap: note: couldn't check {', '.join(report.unchecked)} in either lockfile", file=sys.stderr)
     return 1 if report.worse or report.new else 0
