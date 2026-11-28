@@ -1941,6 +1941,7 @@ def _add_extras(source: Source, wanted: list[str]) -> None:
                 source.specs.append(line)
             if pkg not in source.packages:  # also in another extra or in dependencies: one row
                 source.packages.append(pkg)
+    source.packages[:] = _merge_requirements(source.packages)  # numpy>=1.20 and numpy==1.26.4: one row, as installed
 
     for pkg in source.packages:  # pinned or not: uv leaves out a pinned release's later files too
         pkg.exclude_newer = source.cutoff_for(pkg.key)
@@ -2429,6 +2430,126 @@ def _constraint_conflict(pkg: Package, entries: list[Package]) -> str | None:
     return f"{first} conflicts with the constraint {blamed.name}{_specifier(blamed)}"
 
 
+def _merge_requirements(pkgs: list[Package]) -> list[Package]:
+    """One package per name and marker, as pip and uv read a name required twice (`-r base.txt` pins numpy==1.26.4,
+    the file asks numpy>=1.20): the resolver takes one release that every requirement for the name allows (pip's
+    Factory._iter_found_candidates intersects their specifiers), so pip 26.3 installs only numpy 1.26.4, and refuses
+    numpy==2.3.0 with numpy<2. Requirements under different markers apply together only where both markers hold, which
+    each target decides: they stay apart when no target wheelgap knows holds both (`python_version < "3.13"` and
+    `>= "3.13"`), and are left `unknown` when one can (numpy>=1.20 with `numpy<2; sys_platform == "win32"`), unless an
+    unmarked pin already meets the others. conda packages (skip="conda") are another installer's, so never merged."""
+    groups: dict[str, list[int]] = {}
+    for i, pkg in enumerate(pkgs):
+        if pkg.skip != "conda":
+            groups.setdefault(pkg.key, []).append(i)
+    out: dict[int, Package | None] = {}
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        by_marker: dict[tuple[str, ...] | None, list[int]] = {}
+        for i in indices:
+            markers = pkgs[i].markers
+            by_marker.setdefault(None if markers is None else tuple(sorted(set(markers))), []).append(i)
+        merged = []
+        for members in by_marker.values():
+            out.update(dict.fromkeys(members[1:]))
+            out[members[0]] = _merge_same_marker([pkgs[i] for i in members])
+            merged.append(members[0])
+        if len(merged) < 2:
+            continue
+        unmarked = next((i for i in merged if pkgs[i].markers is None), None)
+        if unmarked is not None and _covers(out[unmarked], [out[i] for i in merged if i != unmarked], unmarked, merged):
+            # Every other requirement applies only where the pin does, and the pin meets it: the pin is the answer.
+            out.update(dict.fromkeys(i for i in merged if i != unmarked))
+            continue
+        rows = [p for i in merged if (p := out[i]) is not None]
+        if any(_can_both_hold(a.markers, b.markers) for k, a in enumerate(rows) for b in rows[k + 1 :]):
+            shown = " and ".join(
+                f"{p.name}{_specifier(p) or ''}" + (f"; {' or '.join(p.markers)}" if p.markers else "") for p in rows
+            )
+            for p in rows:
+                p.error = p.error or (
+                    f"{p.origin} requires {p.name} more than once under different markers ({shown}); where they hold "
+                    "together pip takes a release both allow, and wheelgap doesn't combine them per target"
+                )
+    return [kept for i, pkg in enumerate(pkgs) if (kept := out.get(i, pkg)) is not None]
+
+
+def _merge_same_marker(entries: list[Package]) -> Package:
+    """The requirements for one name under one marker as pip reads them together (see _merge_requirements)."""
+    first = entries[0]
+    if len(entries) == 1:
+        return first
+    if skipped := next((entry for entry in entries if entry.skip), None):
+        return skipped  # `name @ URL` beside `name>=1`: pip installs the URL's file, never an index release
+    error = next((entry.error for entry in entries if entry.error), None)
+    # pip filters the files by the hashes every line lists (Hashes.__and__, where a line with none allows all) and
+    # checks the download against the first line's: pip 26.3 installs markupsafe for `--hash=<mac wheel>` then
+    # `--hash=<linux wheel>` on macOS, and refuses it in the other order. Only one set of hashes, on the first line,
+    # reads as that line alone does.
+    if any(entry.hashes and entry.hashes != first.hashes for entry in entries[1:]):
+        error = error or (
+            f"the requirements for {first.name} list different --hash options; pip filters the files by the hashes "
+            "they all list and checks the download against the first one's, which wheelgap doesn't follow"
+        )
+    specifiers = [specifier for entry in entries if (specifier := _specifier(entry))]
+    if pins := [entry for entry in entries if entry.version]:
+        chosen = next((entry for entry in pins if entry.version and _allows(entry.version, specifiers)), None)
+        if chosen is None:
+            pin = pins[0]
+            other = next(e for e in entries if (s := _specifier(e)) and pin.version and not _allows(pin.version, [s]))
+            both = f"{pin.name}{_specifier(pin)} and {other.name}{_specifier(other)}"
+            if pin.origin != other.origin:
+                both = (
+                    f"{pin.name}{_specifier(pin)} ({pin.origin}) and {other.name}{_specifier(other)} ({other.origin})"
+                )
+            error = error or f"the requirements {both} conflict: no release satisfies both (pip and uv refuse this)"
+            chosen = pin
+        return replace(chosen, error=error, hashes=first.hashes)
+    spec = SpecifierSet()
+    for specifier in specifiers:
+        spec &= SpecifierSet(specifier)
+    ranged = [entry for entry in entries if entry.spec]
+    base = ranged[0] if len(ranged) == 1 else first
+    written = base.written_spec if len(ranged) == 1 else None
+    return replace(base, spec=str(spec) or None, written_spec=written, error=error, hashes=first.hashes)
+
+
+def _covers(pin: Package | None, others: list[Package | None], at: int, order: list[int]) -> bool:
+    """Whether an unmarked requirement's pin is what pip installs wherever the marked `others` apply too: it meets each
+    of them, and they list no other hashes (one listing none may follow the pin's line, which pip checks against)."""
+    if pin is None or pin.skip or pin.error or not pin.version:
+        return False
+    for other, index in zip(others, [i for i in order if i != at], strict=True):
+        if other is None or other.skip or other.error:
+            return False
+        specifier = _specifier(other)
+        if specifier and not _allows(pin.version, [specifier]):
+            return False
+        if other.hashes != pin.hashes and (other.hashes or index < at):
+            return False
+    return True
+
+
+_MARKER_TARGETS: list[Target] = []
+
+
+def _can_both_hold(a: list[str] | None, b: list[str] | None) -> bool:
+    """Whether a target wheelgap can check (any platform, Python 2.7 or 3.0 to the next 3.x) may install both of two
+    requirements, by their markers (None: always). A marker the target can't decide may hold."""
+    from .check import marker_value  # check imports this module
+    from .targets import NEWEST_PYTHON, Target
+
+    if not _MARKER_TARGETS:
+        pythons = [(2, 7)] + [(3, minor) for minor in range(NEWEST_PYTHON[1] + 2)]
+        _MARKER_TARGETS.extend(Target(major, minor, False, name) for name in PLATFORMS for major, minor in pythons)
+
+    def holds(markers: list[str] | None, target: Target) -> bool:
+        return markers is None or any(marker_value(marker, target) is not False for marker in markers)
+
+    return any(holds(a, target) and holds(b, target) for target in _MARKER_TARGETS)
+
+
 def parse_requirements(
     path: Path, constraint_paths: tuple[Path, ...] = (), line_files: tuple[Path, ...] = ()
 ) -> Source:
@@ -2544,6 +2665,7 @@ def _finalize_requirements(
     req_lines: list[str],
     compiler_signs: list[str],
 ) -> Source:
+    pkgs = _merge_requirements(pkgs)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)

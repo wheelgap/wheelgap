@@ -679,6 +679,171 @@ def test_requirements_file_read_as_constraint_and_requirement_gives_both(tmp_pat
     ]
 
 
+def test_requirements_name_required_twice_is_one_package(tmp_path):
+    # pip 26.3 (pip install --dry-run --report) installs only numpy 1.26.4 for `-r base.txt` (numpy==1.26.4) and
+    # numpy>=1.20: one candidate meets every requirement for a name. Before, numpy>=1.20 was a second row, at a
+    # release pip never installs.
+    (tmp_path / "base.txt").write_text("numpy==1.26.4\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r base.txt\nnumpy>=1.20\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert (pkg.name, pkg.version, pkg.spec, pkg.origin, pkg.error) == ("numpy", "1.26.4", None, "base.txt", None)
+
+
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        # Ranges are intersected, as pip's resolver does (specifier &= ...); the written spec only stays for one.
+        (["ranged>=1", "Ranged<2"], [("ranged", None, "<2,>=1", None)]),
+        (["ranged>=1", "ranged"], [("ranged", None, ">=1", ">=1")]),
+        (["numpy==1.26.4", "numpy==1.26.4"], [("numpy", "1.26.4", None, None)]),
+        (["numpy==1.26", "numpy==1.26.0"], [("numpy", "1.26", None, None)]),  # one version, as pip matches it
+        # The same marker, written twice, is one marker.
+        (
+            ['numpy>=1.20 ; sys_platform == "win32"', 'numpy==1.26.4; sys_platform=="win32"'],
+            [("numpy", "1.26.4", None, None)],
+        ),
+        # Markers no target holds together stay two packages: uv pip compile --universal writes these.
+        (
+            ['numpy==1.26.4 ; python_version < "3.13"', 'numpy==2.3.0 ; python_version >= "3.13"'],
+            [("numpy", "1.26.4", None, None), ("numpy", "2.3.0", None, None)],
+        ),
+        (
+            ['numpy==1.26.4 ; sys_platform == "win32"', 'numpy==2.3.0 ; sys_platform != "win32"'],
+            [("numpy", "1.26.4", None, None), ("numpy", "2.3.0", None, None)],
+        ),
+        # An unmarked pin that meets a marked requirement is what pip installs wherever that one applies too.
+        (["numpy==1.26.4", 'numpy<2 ; sys_platform == "win32"'], [("numpy", "1.26.4", None, None)]),
+    ],
+)
+def test_requirements_name_required_twice_merges_as_pip_does(tmp_path, lines, expected):
+    path = tmp_path / "requirements.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    packages = parse_requirements(path).packages
+    assert [(p.name.lower(), p.version, p.spec, p.written_spec) for p in packages] == expected
+    assert [p.error for p in packages] == [None] * len(expected)
+
+
+@pytest.mark.parametrize(
+    "lines, error",
+    [
+        # pip 26.3 and uv 0.13: ResolutionImpossible / "your requirements are unsatisfiable".
+        (
+            ["numpy==2.3.0", "numpy<2"],
+            "the requirements numpy==2.3.0 and numpy<2 conflict: no release satisfies both (pip and uv refuse this)",
+        ),
+        (
+            ["numpy==2.3.0", "numpy==1.26.4"],
+            "the requirements numpy==2.3.0 and numpy==1.26.4 conflict: no release satisfies both (pip and uv refuse "
+            "this)",
+        ),
+        # Where both markers hold (win32 here), pip takes a release both allow, so neither row alone is the answer.
+        (
+            ["numpy>=1.20", 'numpy<2 ; sys_platform == "win32"'],
+            "requirements.txt requires numpy more than once under different markers (numpy>=1.20 and numpy<2; "
+            'sys_platform == "win32"); where they hold together pip takes a release both allow, and wheelgap doesn\'t '
+            "combine them per target",
+        ),
+        (
+            ["numpy==2.3.0", 'numpy<2 ; sys_platform == "win32"'],
+            "requirements.txt requires numpy more than once under different markers (numpy==2.3.0 and numpy<2; "
+            'sys_platform == "win32"); where they hold together pip takes a release both allow, and wheelgap doesn\'t '
+            "combine them per target",
+        ),
+        (
+            ['numpy==1.26.4 ; python_version < "3.13"', 'numpy==2.3.0 ; platform_release >= "6"'],
+            "requirements.txt requires numpy more than once under different markers (numpy==1.26.4; python_version "
+            '< "3.13" and numpy==2.3.0; platform_release >= "6"); where they hold together pip takes a release both '
+            "allow, and wheelgap doesn't combine them per target",
+        ),
+    ],
+)
+def test_requirements_name_required_twice_unknown_where_pip_refuses_or_combines(tmp_path, lines, error):
+    path = tmp_path / "requirements.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert {p.error for p in parse_requirements(path).packages} == {error}
+
+
+def test_requirements_name_required_twice_conflict_across_files_names_both(tmp_path):
+    (tmp_path / "base.txt").write_text("numpy==2.3.0\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r base.txt\nnumpy<2\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.error == (
+        "the requirements numpy==2.3.0 (base.txt) and numpy<2 (requirements.txt) conflict: no release satisfies both "
+        "(pip and uv refuse this)"
+    )
+
+
+def test_requirements_name_required_twice_with_a_url_is_the_url(tmp_path):
+    # pip 26.3 installs six from the URL for `six>=1.10` and `six @ <url>`: never an index release.
+    path = tmp_path / "requirements.txt"
+    path.write_text("six>=1.10\nsix @ https://example.com/six-1.16.0-py2.py3-none-any.whl\n", encoding="utf-8")
+    assert [(p.name, p.skip) for p in parse_requirements(path).packages] == [("six", "url")]
+
+
+@pytest.mark.parametrize(
+    "lines, hashes, error",
+    [
+        # pip 26.3 checks the download against the first line's hashes, after filtering by those every line lists
+        # (a line with none allows all): hashes then none reads as the hashed line alone.
+        ([f"markupsafe==3.0.2 --hash=sha256:{'aa' * 32}", "markupsafe>=3"], {"aa" * 32}, False),
+        ([f"markupsafe==3.0.2 --hash=sha256:{'aa' * 32}"] * 2, {"aa" * 32}, False),
+        # pip installs markupsafe for <mac wheel> then <linux wheel> on macOS, and refuses it in the other order;
+        # with none first, pip refuses `markupsafe>=3` in hash mode.
+        ([f"markupsafe==3.0.2 --hash=sha256:{'aa' * 32}", f"markupsafe==3.0.2 --hash=sha256:{'bb' * 32}"], None, True),
+        (["markupsafe==3.0.2", f"markupsafe==3.0.2 --hash=sha256:{'aa' * 32}"], None, True),
+    ],
+)
+def test_requirements_name_required_twice_hashes(tmp_path, lines, hashes, error):
+    path = tmp_path / "requirements.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    if error:
+        assert pkg.error is not None and "list different --hash options" in pkg.error
+    else:
+        assert pkg.error is None and pkg.hashes == hashes
+
+
+def test_requirements_name_required_twice_then_constrained(tmp_path):
+    (tmp_path / "c.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    path = tmp_path / "requirements.txt"
+    path.write_text("-c c.txt\nranged>=1.5\nranged<2\n", encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert (pkg.version, pkg.spec, pkg.error) == ("1.9", None, None)
+
+
+@pytest.mark.parametrize(
+    "dependencies, extras, expected",
+    [
+        (["numpy>=1.20", "numpy==1.26.4"], [], [("numpy", "1.26.4", None, None)]),
+        (["numpy>=1.20"], ["test"], [("numpy", None, "<2,>=1.20", None)]),  # the extra's numpy<2 applies too
+        (
+            ["numpy==2.3.0", "numpy<2"],
+            [],
+            [
+                (
+                    "numpy",
+                    "2.3.0",
+                    None,
+                    "the requirements numpy==2.3.0 and numpy<2 conflict: no release satisfies both (pip and uv refuse "
+                    "this)",
+                )
+            ],
+        ),
+    ],
+)
+def test_pyproject_name_required_twice_is_one_package(tmp_path, dependencies, extras, expected):
+    (tmp_path / "pyproject.toml").write_text(
+        f"[project]\nname = 'demo'\nversion = '0'\ndependencies = {json.dumps(dependencies)}\n"
+        "[project.optional-dependencies]\ntest = ['numpy<2']\n",
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path / "pyproject.toml")])
+    select_pyproject_extras(src, extras, False)
+    assert [(p.name, p.version, p.spec, p.error) for p in src.packages] == expected
+
+
 def test_requirements_marker_constraint_is_an_error(tmp_path):
     path = tmp_path / "requirements.txt"
     path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")

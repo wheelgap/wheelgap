@@ -410,6 +410,19 @@ def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, t
     assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
 
 
+def test_requirements_name_required_twice_is_checked_once(capsys, fake_pypi, tmp_path):
+    # pip installs the one release both requirements allow (pip 26.3: only numpy 1.26.4 for numpy==1.26.4 in a -r
+    # file and numpy>=1.20), not the pin and the newest release side by side.
+    (tmp_path / "base.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-r base.txt\nranged>=1.5\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert [(p["name"], p["version"], p["results"]["linux-x86_64"]) for p in json.loads(out)["packages"]] == [
+        ("ranged", "1.9", "source")
+    ]
+    assert code == 1
+
+
 def test_requirements_sha512_hashes_are_unknown_not_unhashed(capsys, fake_pypi, tmp_path):
     # pip 26.3 picks the wheel, checks it against the sha512 and refuses it; before, wheelgap dropped the hash and said
     # `wheel`.
@@ -3584,11 +3597,9 @@ def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatc
         "nowheels 0.9 builds from source on linux-x86_64.",
         "::error file=requirements.txt,line=6,title=nowheels 0.9%3A builds from source::"
         "nowheels 0.9 builds from source on win-amd64.",
-        *[  # one per line: requirements.txt line 7 and more/extra.txt line 3
-            "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
-            "ranged 1.9 builds from source on linux-x86_64, win-amd64."
-        ]
-        * 2,
+        # requirements.txt line 7 and more/extra.txt line 3 are one package, as pip installs one ranged 1.9 for both
+        "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
+        "ranged 1.9 builds from source on linux-x86_64, win-amd64.",
         "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
         "winonly 311 can't install on linux-x86_64.",
     ]

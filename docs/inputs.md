@@ -412,6 +412,17 @@ carry no platform markers.
 (`numpy==2.3.4`) is checked at that version; a range or a bare name uses the newest matching release (see
 [How it works](how-it-works.md#version-ranges)).
 
+**A name required twice** (on two lines, or in the file and a `-r` file) is one package, as pip and uv install one
+release for it: with `numpy==1.26.4` in `base.txt` and `numpy>=1.20` in the file, only numpy 1.26.4 is checked.
+Ranges are intersected, and a pin is kept when every other line allows it. Lines that no release can satisfy together
+(`numpy==2.3.0` and `numpy<2`) are `unknown`, since pip and uv refuse them. Lines under different markers stay apart
+when no target can hold both (`python_version < "3.13"` and `python_version >= "3.13"`, as `uv pip compile
+--universal` writes them). When one can (`numpy>=1.20` and `numpy<2; sys_platform == "win32"`), pip takes a release
+both allow on that target, which wheelgap doesn't work out per target, so the package is `unknown`, unless an unmarked
+pin meets the marked line. A name both on an index line and as `name @ URL` is the URL's, skipped. Two lines with
+different `--hash` options are `unknown` too: pip filters the files by the hashes they all list and checks the download
+against the first line's, so the line order decides.
+
 **`--no-binary` and `--only-binary`** lines (`:all:`, `:none:` or package names) apply as pip applies them, in order
 and to every requirement, including those in `-r` and `-c` files: with `--no-binary` a package's wheels are ignored
 (`source` if it has an sdist), and with `--only-binary` a package with no fitting wheel is `missing`, since pip won't
@@ -550,7 +561,8 @@ wheelgap pyproject.toml --extra test --deps -t win-arm64 --explain
 ```
 
 Each requirement is read like a line of a requirements file, so ranges and bare names use the newest matching release
-and markers are respected. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
+and markers are respected. A name required twice, in `dependencies` or in it and a selected extra or group, is one
+package, as in a requirements file: `numpy>=1.20` and `numpy==1.26.4` check numpy 1.26.4 only. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
 several it can pick a different release per Python ([how it works](how-it-works.md)). A bare name always checks the
 latest release, even for a `-p` version that can't install it, so it can show false gaps. Only direct
 dependencies are checked by default and wheelgap prints a note saying so. Add [`--deps`](cli.md#deps) to resolve them
