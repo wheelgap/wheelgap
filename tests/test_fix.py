@@ -1409,6 +1409,15 @@ def test_fix_says_whether_a_ranged_requirement_allows_the_upgrade(capsys, fake_p
     assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
 
 
+def test_fix_upgrade_for_a_name_required_under_two_markers(capsys, fake_pypi, gap_wheels, tmp_path):
+    # Its `unknown` stand-in is never looked up; the name is still pypi.org's, so --fix suggests the upgrade as it
+    # does for one line (#835 review).
+    path = _fixme_requirements(tmp_path, "fixme>=1.0\nfixme<1.3 ; sys_platform == 'win32'\n")
+    _, out, err = run(capsys, path, "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert "  fixme 1.2 -> 1.3: win-arm64 (needs requirements.txt's fixme<1.3 relaxed)\n" in out
+    assert "come from PyPI" not in out + err
+
+
 def fixme_uv_lock(specifier):
     return (
         'version = 1\nrequires-python = ">=3.12"\n\n'

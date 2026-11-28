@@ -100,4 +100,11 @@ def known_pypi(
         return False
     if isinstance(pkg.registry, str) and pkg.registry.rstrip("/") == pypi.PYPI_SIMPLE:
         return True
-    return pkg.found_on_pypi and source.pypi_only and index_env(env) is None
+    found = pkg.found_on_pypi
+    if pkg.marker_group is not None and not found:
+        # A name required under several markers (sources.MarkerGroup): its `unknown` stand-in and a merge that
+        # conflicts are never looked up, so the name is placed by the group's other packages, which are.
+        found = any(
+            p.found_on_pypi for m in pkg.marker_group.members for p in (m, *m.resolutions.values()) if not p.skip
+        )
+    return found and source.pypi_only and index_env(env) is None

@@ -471,6 +471,43 @@ def test_requirements_name_required_under_markers_checked_per_target(
     assert _cells(out) == expected
 
 
+@pytest.mark.parametrize(
+    "lines, args, expected",
+    [
+        # A line naming a pre-release lets pip take pre-releases for the lines together: pip 26.3 installs
+        # tensorflow 2.22.0rc1 for tensorflow>=2.15 with tensorflow>=2.16.0rc0 on Linux (and grpcio 1.86.0rc1 for
+        # grpcio>=1.80 with grpcio>=1.85.0rc1 on macOS), not the newest final release.
+        (
+            ["prelib>=0.5", 'prelib>=1.0rc1 ; sys_platform == "linux"'],
+            ["-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64"],
+            {("prelib", "2.0rc1"): {"linux-x86_64": "source"}, ("prelib", "1.0"): {"win-amd64": "wheel"}},
+        ),
+        # Where that line may hold (a patch release on 3.13), pip may take 2.0rc1 or 1.0: unknown.
+        (
+            ["prelib>=0.5", 'prelib>=1.0rc1 ; python_full_version >= "3.13.1"'],
+            ["-p", "3.13", "-t", "linux-x86_64"],
+            {("prelib", None): {"linux-x86_64": "unknown"}},
+        ),
+    ],
+)
+def test_requirements_merged_lines_naming_a_pre_release_are_looked_up(
+    capsys, fake_pypi, tmp_path, lines, args, expected
+):
+    req = tmp_path / "requirements.txt"
+    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), *args, "--json")
+    assert _cells(out) == expected
+
+
+def test_requirements_header_counts_a_name_required_under_markers_once(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged==1.5 ; sys_platform == 'win32'\nranged==2.0 ; sys_platform != 'win32'\n", encoding="utf-8")
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--all")
+    assert "· requirements.txt · 1 package · Python 3.13" in out
+    _, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json")
+    assert json.loads(out)["summary"]["packages"] == 1
+
+
 def test_requirements_identical_line_under_a_marker_stays_checked_on_undecided_targets(capsys, fake_pypi, tmp_path):
     # vllm cpu.txt's `py-cpuinfo; platform_machine == "aarch64"` with common.txt's `py-cpuinfo` (#835 review): one
     # row, confident on linux-armv7l too, where platform_machine can't be decided.
@@ -4994,7 +5031,7 @@ def test_range_split_one_clean_one_gap_counts_as_one_package(capsys, fake_pypi, 
     assert code == 0
     assert "The 1 package has a wheel for every one of 2 targets, apart from 1 ignored gap." in out
 
-    # Two distinct requirements entries for the same package name still count separately (2), unlike a split range (1).
+    # Two requirements for one name under different markers are one package too, though each keeps its row.
     req = tmp_path / "requirements.txt"
     req.write_text(
         "splitgap==1.0; python_version < '3.10'\nsplitgap==2.0; python_version >= '3.10'\n", encoding="utf-8"
@@ -5003,7 +5040,7 @@ def test_range_split_one_clean_one_gap_counts_as_one_package(capsys, fake_pypi, 
     assert code == 1
     data = json.loads(out)
     assert len(data["packages"]) == 2
-    assert data["summary"]["packages"] == 2
+    assert data["summary"]["packages"] == 1
     assert data["summary"]["with_gaps"] == 1
 
 

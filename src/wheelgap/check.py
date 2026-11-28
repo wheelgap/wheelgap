@@ -1131,17 +1131,25 @@ def group_answer(group: MarkerGroup, target: Target) -> Package | None:
         version = resolved.version
         if pkg.skip or resolved.error or version is None:
             return False
-        for i in lines:
-            line = group.lines[i]
-            if line.skip or line.error or (line.hashes, line.other_hashes) != (pkg.hashes, pkg.other_hashes):
-                return False
-            specifier = _pin(line.version) if line.version else line.spec
-            try:
-                if specifier and not SpecifierSet(specifier).contains(version, prereleases=True):
+        try:
+            own = SpecifierSet(pkg.spec or "")
+            together = own
+            for i in lines:
+                line = group.lines[i]
+                if line.skip or line.error or (line.hashes, line.other_hashes) != (pkg.hashes, pkg.other_hashes):
                     return False
-            except (InvalidSpecifier, InvalidVersion):
-                return False
-        return True
+                specifier = _pin(line.version) if line.version else line.spec
+                if specifier:
+                    if not SpecifierSet(specifier).contains(version, prereleases=True):
+                        return False
+                    together &= SpecifierSet(specifier)
+        except (InvalidSpecifier, InvalidVersion):
+            return False
+        # A release the index picked for `pkg`'s own range: if a line names a pre-release (tensorflow>=2.16.0rc0),
+        # pip takes pre-releases for the lines together, so a newer one may win (pip 26.3 installs
+        # tensorflow 2.22.0rc1 for that with tensorflow>=2.15). Then only the merged lines' own lookup can say.
+        picked = resolved.version_from_index or pkg.version_from_index
+        return not (picked and pkg.prereleases is None and together.prereleases and not own.prereleases)
 
     # A line that may hold but asks exactly what one that holds asks (`py-cpuinfo; platform_machine == "aarch64"`
     # beside `py-cpuinfo`, on linux-armv7l) changes nothing either way.

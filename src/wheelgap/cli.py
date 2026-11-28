@@ -631,7 +631,10 @@ def apart_from_ignored(rows: list[Row]) -> str:
 
 
 def _input_key(row: Row, index: int) -> tuple[int, int]:
-    """Identity of the input requirement a row came from (ranges resolved per Python share one)."""
+    """Identity of the input requirement a row came from (ranges resolved per Python share one, and so do the
+    packages of a name required under several markers, sources.MarkerGroup)."""
+    if row.input_package is not None and row.input_package.marker_group is not None:
+        return (2, id(row.input_package.marker_group))
     return (0, id(row.input_package)) if row.input_package is not None else (1, index)
 
 
