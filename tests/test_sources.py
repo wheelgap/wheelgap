@@ -128,6 +128,35 @@ def test_uv_lock_manifest_that_is_not_a_table_raises(tmp_path):
         load_inputs([str(tmp_path)])
 
 
+@pytest.mark.parametrize(
+    ("filename", "content", "expected"),
+    [
+        ("uv.lock", "package = 1\n", "uv.lock: `package` isn't a list of tables"),
+        ("uv.lock", 'package = "x"\n', "uv.lock: `package` isn't a list of tables"),
+        ("uv.lock", "[manifest]\nmembers = 1\n", "uv.lock: the manifest has a `members` that isn't a list of strings"),
+        (
+            "uv.lock",
+            '[[package]]\nname = "a"\nversion = "1.0"\nwheels = ["x"]\n',
+            "uv.lock: package a: `wheels` entry isn't a table",
+        ),
+        ("uv.lock", "not = valid = toml\n", "uv.lock:"),
+        ("pylock.toml", "packages = -1\n", "pylock.toml: `packages` isn't a list of tables"),
+        ("pylock.toml", "packages = [1]\n", "pylock.toml: `packages` isn't a list of tables"),
+        (
+            "pylock.toml",
+            '[[packages]]\nname = "a"\nversion = "1.0"\nwheels = [true]\n',
+            "pylock.toml: package a: `wheels` entry isn't a table",
+        ),
+        ("pylock.toml", "not = valid = toml\n", "pylock.toml:"),
+    ],
+)
+def test_uv_lock_and_pylock_reject_wrong_types_and_invalid_toml(tmp_path, filename, content, expected):
+    path = tmp_path / filename
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape(expected)):
+        load_inputs([str(path)])
+
+
 def test_uv_lock_dependency_extra_may_be_a_list(tmp_path):
     (tmp_path / "uv.lock").write_text(
         'version = 1\n\n[manifest]\nrequirements = [{ name = "a" }]\n\n[[package]]\nname = "a"\nversion = "1.0"\n'

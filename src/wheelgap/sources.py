@@ -429,7 +429,16 @@ def restore_uv_python_files(packages: Iterable[Package], pythons: Iterable[str])
             pkg.resolutions[python] = variant
 
 
-def _filename(entry: dict, origin: str, package: str) -> str | None:
+def _loads_toml(path: Path) -> dict:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise SourceError(f"{path.name}: {e}") from e
+
+
+def _filename(entry: object, origin: str, package: str) -> str | None:
+    if not isinstance(entry, dict):
+        raise SourceError(f"{origin}: package {package}: `wheels` entry isn't a table")
     url = entry.get("url")
     parts: ParseResult | None = None
     if isinstance(url, str):
@@ -679,7 +688,7 @@ def _uv_build_restrictions(path: Path, source: Source) -> None:
 
 
 def parse_uv_lock(path: Path) -> Source:
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    data = _loads_toml(path)
     manifest = data.get("manifest", {})
     if not isinstance(manifest, dict):
         raise SourceError(f"{path.name}: `manifest` isn't a table")
@@ -691,22 +700,33 @@ def parse_uv_lock(path: Path) -> Source:
         raise SourceError(f"{path.name}: the manifest has a group of dependencies that isn't a list")
     if not isinstance(manifest.get("requirements", []), list):
         raise SourceError(f"{path.name}: the manifest has a `requirements` that isn't a list")
-    members = {canonicalize_name(m) for m in manifest.get("members", [])}
+    members_raw = manifest.get("members", [])
+    if not isinstance(members_raw, list) or not all(isinstance(m, str) for m in members_raw):
+        raise SourceError(f"{path.name}: the manifest has a `members` that isn't a list of strings")
+    members = {canonicalize_name(m) for m in members_raw}
+    uv_packages = data.get("package", [])
+    if not isinstance(uv_packages, list) or not all(isinstance(p, dict) for p in uv_packages):
+        raise SourceError(f"{path.name}: `package` isn't a list of tables")
     edges: dict[int, list[Edge]] = {}
-    source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
+    source = Source(path.name, edges=edges, uv_packages=uv_packages, uv_manifest=manifest)
     if path.name.endswith(".py.lock"):
         source.uv_script = str(path).removesuffix(".lock")  # as given, so --fix's `uv lock --script` runs from here
     else:
         source.uv_pyproject = path.with_name("pyproject.toml")
-    for p in data.get("package", []):
+    for p in uv_packages:
         src = p.get("source", {})
+        if not isinstance(src, dict):
+            raise SourceError(f"{path.name}: package {p.get('name', '?')}: `source` isn't a table")
         pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         kind = next((k for k in ("editable", "virtual", "git", "path", "directory", "url") if k in src), None)
         if kind and "registry" not in src:
             pkg.skip = kind
         else:
             pkg.registry = src.get("registry")
-            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
+            wheels = p.get("wheels", [])
+            if not isinstance(wheels, list):
+                raise SourceError(f"{path.name}: package {pkg.name}: `wheels` isn't a list")
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in wheels) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hash")
@@ -1109,16 +1129,22 @@ def _select_pdm_groups(source: Source, selection: UvSelection) -> None:
 
 
 def parse_pylock(path: Path) -> Source:
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    data = _loads_toml(path)
+    packages = data.get("packages", [])
+    if not isinstance(packages, list) or not all(isinstance(p, dict) for p in packages):
+        raise SourceError(f"{path.name}: `packages` isn't a list of tables")
     pkgs = []
-    for p in data.get("packages", []):
+    for p in packages:
         pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
             pkg.skip = next(k for k in ("vcs", "directory", "archive") if k in p)
         else:
-            files = [f for f in (_filename(w, path.name, pkg.name) for w in p.get("wheels", [])) if f]
+            wheels = p.get("wheels", [])
+            if not isinstance(wheels, list):
+                raise SourceError(f"{path.name}: package {pkg.name}: `wheels` isn't a list")
+            files = [f for f in (_filename(w, path.name, pkg.name) for w in wheels) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"], path.name, pkg.name) or f"{p['name']}-{p.get('version')}.tar.gz")
                 pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
