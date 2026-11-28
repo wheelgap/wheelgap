@@ -1744,3 +1744,51 @@ def test_fix_moves_a_pre_release_pin_to_a_final_release(capsys, fake_pypi, gap_w
         "constraint": None,
         "gap_wheel": None,
     }
+
+
+@pytest.mark.parametrize(
+    "requires,said",
+    [
+        # #823: numpy<2 for Python < 3.13 and numpy>=1.26 for 3.13: only the second applies to a 3.13 target.
+        (
+            [("<1.3", "python_full_version < '3.14'"), (">=1.0", "python_full_version >= '3.14'")],
+            " (within your pyproject.toml constraint fixme>=1.0)",
+        ),
+        ([("<1.3", "python_full_version >= '3.14'")], " (needs pyproject.toml's fixme<1.3 relaxed)"),
+        ([("<1.3", "sys_platform == 'win32'"), (">=1.0", None)], " (needs pyproject.toml's fixme<1.3 relaxed)"),
+        ([("<1.3", "extra == 'old'")], " (needs pyproject.toml's fixme<1.3 relaxed)"),  # uv locks every extra
+        ([("<1.3", "sys_platform == 'linux'")], ""),  # no requirement applies on Windows: nothing to go by
+        ([("<1.3", "platform_release == '6.1'")], ""),  # a marker the target can't decide: no answer
+        ([("<1.3", "platform_release == '6.1'"), (">=1.0", None)], ""),
+    ],
+)
+def test_fix_uv_lock_constraint_applies_only_where_its_marker_holds(
+    capsys, fake_pypi, gap_wheels, tmp_path, requires, said
+):
+    dist = ", ".join(
+        '{ name = "fixme"' + f', specifier = "{spec}"' + (f', marker = "{marker}"' if marker else "") + " }"
+        for spec, marker in requires
+    )
+    lock = fixme_uv_lock(">=1.0").replace(
+        'requires-dist = [{ name = "fixme", specifier = ">=1.0" }]', f"requires-dist = [{dist}]"
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert f"  fixme 1.0 -> 1.3: win-arm64{said}\n" in out
+    _, data, _ = gap_wheels_json(capsys, str(tmp_path / "uv.lock"), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    constraint = data["packages"][0]["fix"]["win-arm64"]["constraint"]
+    assert (constraint is None) == (not said)
+    if constraint is not None:
+        assert constraint["allows"] == ("within" in said)
+
+
+def test_fix_uv_may_fork_when_the_blocking_requirement_doesnt_apply(capsys, fake_pypi, gap_wheels, tmp_path):
+    # pyfork<2 only below Python 3.14: it doesn't hold 2.0 back on 3.14, so uv may still fork (#823).
+    lock = pyfork_uv_lock().replace(
+        'dependencies = [{ name = "pyfork" }]\n',
+        'dependencies = [{ name = "pyfork" }]\n\n[package.metadata]\n'
+        'requires-dist = [{ name = "pyfork", specifier = "<2", marker = "python_full_version < \'3.14\'" }]\n',
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13,3.14", "-t", "linux-x86_64", "--fix")
+    assert "Maybe, with uv:\n  pyfork 1.0: " in out and "leaves out" not in out

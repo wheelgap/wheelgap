@@ -13,6 +13,7 @@ are looked up. Like the rest of --fix, nothing here changes a status, the summar
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from . import gapwheels
-from .check import ABI3_ON_FREETHREADED, Row, Status, rejection
+from .check import ABI3_ON_FREETHREADED, Row, Status, marker_value, rejection
 from .sources import Source
 from .suggest import Suggestion
 from .targets import Target
@@ -130,10 +131,11 @@ def plan(
     return cells
 
 
-def _uv_specifiers(source: Source, key: str) -> list[str] | None:
+def _uv_specifiers(source: Source, key: str, target: Target) -> list[str] | None:
     """The specifiers a uv.lock's own projects (workspace members: editable or virtual) write for `key` in their
-    dependencies and dependency groups, plus the lock's [manifest] constraints; None when there are none to go by, or
-    when an override replaces them (uv then ignores them)."""
+    dependencies and dependency groups, plus the lock's [manifest] constraints, that apply on `target` by their
+    markers (#823); None when there are none to go by, when a marker can't be decided there, or when an override
+    replaces them (uv then ignores them). An `extra == ...` marker counts as holding: uv locks every extra."""
     manifest = source.uv_manifest if isinstance(source.uv_manifest, dict) else {}
     if any(isinstance(o, dict) and _key(o) == key for o in manifest.get("overrides", [])):
         return None
@@ -147,10 +149,24 @@ def _uv_specifiers(source: Source, key: str) -> list[str] | None:
         for group in groups.values() if isinstance(groups, dict) else []:
             entries += [d for d in group if isinstance(d, dict)] if isinstance(group, list) else []
     entries += [c for c in manifest.get("constraints", []) if isinstance(c, dict)]
-    found = [e for e in entries if _key(e) == key]
+    found = []
+    for e in (e for e in entries if _key(e) == key):
+        marker = e.get("marker")
+        if marker is not None and not isinstance(marker, str):
+            return None
+        # Each extra the marker names counts as selected (uv locks them all); any other unknown leaves it undecided.
+        extras = frozenset(_EXTRA_RE.findall(marker)) if marker else None
+        holds = marker_value(marker, target, extras=extras or None)
+        if holds is None:
+            return None
+        if holds:
+            found.append(e)
     if not found or any(not isinstance(e.get("specifier", ""), str) for e in found):
         return None
     return [e.get("specifier", "") for e in found]
+
+
+_EXTRA_RE = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
 
 
 PRERELEASE_TEXT = "a pre-release: no newer final release has the wheel"
@@ -178,7 +194,7 @@ def constraint(cell: Cell) -> Constraint | None:
     if cell.version is None:
         return None
     if source.kind == "uv" and source.uv_script is None:
-        specs = _uv_specifiers(source, pkg.key)
+        specs = _uv_specifiers(source, pkg.key, cell.target)
         file = source.uv_pyproject.name if source.uv_pyproject is not None else "pyproject.toml"
     elif source.kind == "requirements" and (pinned := source.constraint_specs.get(pkg.key)):
         # pip applies the file's -c constraints too: one there holds the package back whatever its line says.

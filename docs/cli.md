@@ -806,7 +806,8 @@ Following the usual output, say how to fix each gap cell (a package on a target,
    NAME==VERSION` to regenerate it), `poetry update NAME` or
    `pdm update NAME` for those locks (they stay within `pyproject.toml`'s constraints, so check the release they pick),
    and "upgrade NAME to VERSION" for the other lockfiles. Where wheelgap reads your own requirement for the package (a
-   uv.lock project's dependencies, dependency groups and `[manifest]` constraints, or a ranged requirement in a
+   uv.lock project's dependencies, dependency groups and `[manifest]` constraints whose markers hold on the target,
+   with any `extra == ...` counted as holding since uv locks every extra, or a ranged requirement in a
    requirements file, `pyproject.toml`, script or the command line, as written, or a requirements file's `-c`
    constraints), it says whether the release is within it or the requirement needs relaxing; otherwise it says
    nothing. A package whose targets need different releases (no one release has wheels for all of them) gets no pin:
