@@ -1734,9 +1734,9 @@ def test_fix_moves_a_pre_release_pin_to_a_final_release(capsys, fake_pypi, gap_w
     assert data["packages"][0]["fix"]["win-arm64"]["prerelease"] is False
     # No final release has the win-amd64 wheel: the pre-release is named, and said to be one.
     _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
-    assert f"  prepin 1.0rc1 -> 1.2rc1 ({fix.PRERELEASE_TEXT}): win-amd64\n" in out
+    assert "  prepin 1.0rc1 -> 1.2rc1 (a pre-release): win-amd64\n" in out
     _, out, _ = run(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix", "--markdown")
-    assert f"- `prepin 1.0rc1 -> 1.2rc1` ({fix.PRERELEASE_TEXT}): win-amd64\n" in out
+    assert "- `prepin 1.0rc1 -> 1.2rc1` (a pre-release): win-amd64\n" in out
     _, data, _ = gap_wheels_json(capsys, "prepin==1.0rc1", "-p", "3.14t", "-t", "win-amd64", "--fix")
     assert data["packages"][0]["fix"]["win-amd64"] | {"how": None} == {
         "kind": "upgrade",

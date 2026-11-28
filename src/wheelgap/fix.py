@@ -235,12 +235,12 @@ def _uv_specifiers(source: Source, key: str, target: Target) -> list[str] | None
 _EXTRA_RE = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
 
 
-PRERELEASE_TEXT = "a pre-release: no newer final release has the wheel"
+PRERELEASE_TEXT = "a pre-release"
 
 
 def prerelease(version: str | None) -> bool:
-    """Whether an upgrade's release is a pre-release (suggest names one only for a pre-release pin, and only when no
-    final release fits)."""
+    """Whether an upgrade's release is a pre-release (suggest names one only for a pre-release pin: one final release
+    for every target comes first, then one pre-release for every target, then a split)."""
     try:
         return version is not None and Version(version).is_prerelease
     except InvalidVersion:
@@ -549,7 +549,7 @@ def _lines(
     up = []
     for (name, pinned, version), cs in _by_package(upgrades).items():
         line = f"{item}{code(f'{name} {pinned} -> {version}')}"
-        if prerelease(version):  # only for a pre-release pin, and only when no final release has the wheel (#825)
+        if prerelease(version):  # only for a pre-release pin, when no one final release fits every target (#825)
             line += f" ({PRERELEASE_TEXT})"
         line += f": {_labels(cs, multi_py)}"
         notes = [constraint_text(own, code)] if (own := constraint(cs[0])) is not None else []

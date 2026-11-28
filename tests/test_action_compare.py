@@ -583,6 +583,7 @@ def armlib_how(data):
             "upgrade to 2.0 (needs a==1 in the -c constraints of r.txt relaxed)",
         ),
         ({"kind": "upgrade", "version": "2.0", "constraint": {"allows": True}}, "upgrade to 2.0"),
+        ({"kind": "upgrade", "version": "2.0rc1", "prerelease": True}, "upgrade to 2.0rc1 (a pre-release)"),
         ({"kind": "none", "reason": "loses_wheel"}, "no fix yet: every newer release with a wheel drops one"),
         ({"kind": "none", "reason": "no_newer_release", "abi3_only": True}, "; only abi3 wheels, which free-threaded"),
         ({"kind": "none", "reason": "not_looked_up"}, "newer releases weren't looked up (the log says why)"),

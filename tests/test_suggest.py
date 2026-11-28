@@ -158,25 +158,42 @@ def test_suggest_keeps_pre_releases_for_a_pre_release_pin():
     }
 
 
-def test_suggest_prefers_a_final_release_for_a_pre_release_pin():
-    # greenlet 2.0.0rc5 -> 3.0.0a1 although 3.0.0 has the wheel (#825): the lowest final release with it wins.
+LIN312 = "cp312-cp312-manylinux_2_17_x86_64"
+RISCV312 = "cp312-cp312-linux_riscv64"
+
+
+@pytest.mark.parametrize(
+    "releases,expected",
+    [
+        # greenlet 2.0.0rc5 -> 3.0.0a1 although 3.0.0 has the wheel (#825): one final release for every target wins.
+        (
+            {"3.0.0a1": [LIN312, RISCV312], "3.0.0": [LIN312, RISCV312], "3.0.1": [LIN312, RISCV312]},
+            {"linux-x86_64": "3.0.0", "linux-riscv64": "3.0.0"},
+        ),
+        # No final release has the riscv64 wheel, but 3.0.0a1 has both: one pin, the pre-release, not a split.
+        ({"3.0.0a1": [LIN312, RISCV312], "3.0.0": [LIN312]}, {"linux-x86_64": "3.0.0a1", "linux-riscv64": "3.0.0a1"}),
+        # No one release has both: a final release where one fits, and a pre-release for the rest.
+        ({"3.0.0a1": [RISCV312], "3.0.0": [LIN312]}, {"linux-x86_64": "3.0.0", "linux-riscv64": "3.0.0a1"}),
+        # Only a pre-release fits one target, and nothing fits the other: that pre-release alone.
+        ({"3.0.0a1": [LIN312], "3.0.0": []}, {"linux-x86_64": "3.0.0a1"}),
+    ],
+)
+def test_suggest_prefers_one_final_release_then_one_pre_release_then_a_split(releases, expected):
     linux, riscv = build_targets(["3.12"], ["linux-x86_64", "linux-riscv64"])
-    lin = "cp312-cp312-manylinux_2_17_x86_64"
-    releases = {
-        "2.0.0rc5": [{"filename": "demo-2.0.0rc5.tar.gz"}],
-        "2.0.0": [{"filename": "demo-2.0.0.tar.gz"}],
-        "3.0.0a1": [wheel("3.0.0a1", lin), wheel("3.0.0a1", "cp312-cp312-linux_riscv64")],
-        "3.0.0rc1": [wheel("3.0.0rc1", lin)],
-        "3.0.0": [wheel("3.0.0", lin)],
-        "3.0.1": [wheel("3.0.1", lin)],
-    }
+    releases = {v: [wheel(v, tag) for tag in tags] for v, tags in releases.items()}
+    releases["2.0.0rc5"] = releases["2.0.0"] = [{"filename": "demo-2.0.0.tar.gz"}]
     found = suggest.suggest(releases, "2.0.0rc5", [linux, riscv]).found
-    # Only a pre-release has the riscv64 wheel, so that target falls back to it; x86_64 gets the final 3.0.0.
-    assert found == {linux: "3.0.0", riscv: "3.0.0a1"}
+    assert {t.platform: v for t, v in found.items()} == expected
+
+
+def test_suggest_labels_a_pre_release():
+    linux, riscv = build_targets(["3.12"], ["linux-x86_64", "linux-riscv64"])
+    found = {linux: "3.0.0", riscv: "3.0.0a1"}
     assert suggest.suggest_lines("demo", "2.0.0rc5", [linux, riscv], suggest.Suggestion(found), False) == [
         "demo 2.0.0rc5 -> 3.0.0a1 (a pre-release) has wheels for linux-riscv64",
         "demo 2.0.0rc5 -> 3.0.0 has wheels for linux-x86_64",
     ]
+    releases = {"3.0.0a1": [wheel("3.0.0a1", LIN312)], "3.0.0": [wheel("3.0.0", LIN312)]}
     assert suggest.suggest(releases, "2.0.0", [linux]).found == {linux: "3.0.0"}  # a final pin, as before
 
 

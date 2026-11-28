@@ -125,6 +125,8 @@ def fix_cell(fix: object) -> str:
     kind = fix.get("kind")
     if kind == "upgrade":
         text = f"upgrade to {code(fix.get('version'))}"
+        if fix.get("prerelease") is True:
+            text += " (a pre-release)"
         c = fix.get("constraint")
         if isinstance(c, dict) and c.get("allows") is False and isinstance(c.get("requirements"), list):
             reqs = ", ".join(code(r) for r in c["requirements"])

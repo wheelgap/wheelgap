@@ -173,12 +173,23 @@ def _uploaded(releases: dict, text: str) -> datetime | None:
 def _pick(
     releases: dict, pinned: str, targets: list[Target], keep: list[Target], cutoff: datetime | None
 ) -> Suggestion:
-    """suggest within `cutoff`: a final release first for a pre-release pin."""
+    """suggest within `cutoff`. For a pre-release pin, one final release for every target that any release fits, else
+    one pre-release for them all (a single pin beats a split), else a final release where one fits and a pre-release
+    for the rest."""
     candidates = _candidates(releases, pinned)
     seen: _Seen = {}
+    everything = _suggest(releases, pinned, targets, keep, candidates, seen, cutoff)
     if not Version(pinned).is_prerelease:
-        return _suggest(releases, pinned, targets, keep, candidates, seen, cutoff)
+        return everything
     final = _suggest(releases, pinned, targets, keep, _finals(candidates), seen, cutoff)
+
+    def single(s: Suggestion) -> bool:
+        return bool(s.found) and set(s.found) >= set(everything.found) and len(set(s.found.values())) == 1
+
+    if single(final):
+        return final
+    if single(everything):
+        return everything
     if not (rest := [t for t in targets if t not in final.found]):
         return final
     pre = _suggest(releases, pinned, rest, keep, candidates, seen, cutoff)

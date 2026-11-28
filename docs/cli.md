@@ -760,8 +760,8 @@ opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#p
 
 With `--explain`, also name the lowest newer release with a wheel for a pinned package's gap targets
 (`fastlib 2.0.0 -> 2.1.0 has wheels for musl-aarch64, win-amd64`) that keeps the wheels the package has on its other
-targets, or each target's nearest when no one release has them all. For a pre-release pin, a final release comes
-first: a pre-release is named only when no newer final release has the wheel, and is labelled `(a pre-release)`. It
+targets, or each target's nearest when no one release has them all. For a pre-release pin, final releases come
+first: one final release for every target, else one pre-release for every target, else a final release where one fits and a pre-release for the rest; a pre-release is labelled `(a pre-release)`. It
 looks each package with a gap up on pypi.org
 once, only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin), and never changes a status, the
 summary or the exit code. A run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the
@@ -798,7 +798,8 @@ Following the usual output, say how to fix each gap cell (a package on a target,
 
 1. **Upgrade** to an official release: the nearest newer release with a wheel for that target, as
    [`--suggest`](#suggest) names it (not yanked, `Requires-Python` admitting the target's Python, no pre-release unless
-   the pin is one and no newer final release has the wheel, in which case the line says it's a pre-release, and keeping a wheel on every target the package has one on now), with what to run or change for the
+   the pin is one, and then only when no one final release fits every target, in which case the line says it's a
+   pre-release, and keeping a wheel on every target the package has one on now), with what to run or change for the
    input: `uv lock --upgrade-package NAME` for a uv.lock (`uv lock --script SCRIPT --upgrade-package NAME` for a
    script's lock; a bare name, since uv applies `NAME==VERSION` to every Python the lock covers, then check it reached
    VERSION), the new pins for a requirements file, in the file whose line pins the package (a `-r` include's own file;
