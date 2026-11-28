@@ -2692,14 +2692,14 @@ _SHORT_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for na
 
 def _requirement_options(
     text: str, where: str
-) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str]]:
+) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], frozenset[str], list[str]]:
     """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
     by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash; each --no-binary,
     --only-binary, --all-releases or --only-final as (long name, value) in order, for the install's format and release
     control; what pip ignores there, for a note: each option as (the name it was written with, its long name), and
-    words that aren't options, which optparse sets aside, as one entry; and the frozenset of sha256 digests from
-    --hash options. SourceError where pip refuses the line, or where it applies an option that wheelgap doesn't read
-    (-e)."""
+    words that aren't options, which optparse sets aside, as one entry; the frozenset of sha256 digests from
+    --hash options; and the other algorithms the --hash options use (sha384, sha512), once each. SourceError where
+    pip refuses the line, or where it applies an option that wheelgap doesn't read (-e)."""
     try:
         tokens = shlex.split(text)
     except ValueError:
@@ -2709,6 +2709,7 @@ def _requirement_options(
     formats: list[tuple[str, str]] = []
     ignored: list[tuple[str, str]] = []
     sha256_hashes: set[str] = set()
+    other_algorithms: list[str] = []
     k = 0
     while k < len(tokens):
         token = tokens[k]
@@ -2763,6 +2764,8 @@ def _requirement_options(
                 raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
             if algo == "sha256":
                 sha256_hashes.add(digest.lower())
+            elif algo not in other_algorithms:
+                other_algorithms.append(algo)
         if kind == "requirement" and "=" not in given_value:
             raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
         if kind == "feature" and value not in _USE_FEATURE_CHOICES:
@@ -2779,7 +2782,7 @@ def _requirement_options(
             # The value pip's callback reads, never a word after another option; the callback applies it to the whole
             # install, exactly as on a line of its own.
             formats.append((name, given_value))
-    return hashed, formats, ignored, frozenset(sha256_hashes)
+    return hashed, formats, ignored, frozenset(sha256_hashes), other_algorithms
 
 
 def _read_requirements(
@@ -2946,9 +2949,10 @@ def _read_requirements(
             options = " ".join(word for word in words[first_option:] if word)
             hashed = False
             req_hashes: frozenset[str] = frozenset()
+            other_algorithms: list[str] = []
             if options:
                 where = _shown(path, stack) + (f":{number}" if number is not None else "")
-                hashed, formats, ignored, req_hashes = _requirement_options(options, where)
+                hashed, formats, ignored, req_hashes, other_algorithms = _requirement_options(options, where)
                 if ignored_options is not None:
                     for shown, option in ignored:
                         note = f"{where}: pip ignores {shown} after a requirement"
@@ -2976,7 +2980,18 @@ def _read_requirements(
                 name = egg.group(1) if egg else line.split(";", 1)[0].strip()
                 append(Package(name, None, skip="url", origin=path.name, hashes=req_hashes))
                 continue
-            append(requirement_to_package(line, path.name, hashes=req_hashes))
+            pkg = requirement_to_package(line, path.name, hashes=req_hashes)
+            if other_algorithms and not pkg.skip and not constraint:
+                # The index gives each file's sha256 only (PyPI's JSON API), so these can't be matched. Dropped, they
+                # would leave no hash filter at all, while pip checks them: it picks the best file, then refuses it if
+                # no listed hash matches (pip 26.3, markupsafe==3.0.2 --hash=sha512:<the sdist's>, on macOS arm64).
+                # With sha256 hashes beside them, a file whose sha256 isn't listed may still match one of these.
+                where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                pkg.error = (
+                    f"{where} lists {' and '.join(other_algorithms)} hashes for {pkg.name}, which wheelgap can't match "
+                    "(the index gives sha256 digests only), so it can't tell which file pip accepts"
+                )
+            append(pkg)
             if req_lines is not None and not constraint:
                 req_lines.append(line)
     finally:

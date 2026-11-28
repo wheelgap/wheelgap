@@ -443,9 +443,11 @@ Listing only the sdist's hash gives `source`, as pip and uv build it then; listi
 `missing`. If no file of the release has a listed hash, the package is `unknown` (`none of the hashes in
 requirements.txt matches a file of NAME VERSION`), as pip refuses the download. `--explain` names each wheel left
 out: `its hash isn't listed in requirements.txt`. As pip does, a file the index gives no `sha256` for (some mirrors
-behind `WHEELGAP_INDEX_URL`) isn't left out, since pip checks it after the download. Not read yet, so the answer is
-the one without them: `sha384` and `sha512` hashes (PyPI gives no such digest), `--hash` in a constraints file, and
-the lookups of [`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
+behind `WHEELGAP_INDEX_URL`) isn't left out, since pip checks it after the download. A requirement with a `sha384`
+or `sha512` hash is `unknown` (`requirements.txt:3 lists sha512 hashes for NAME, which wheelgap can't match`): PyPI
+gives no such digest, and pip checks them against the file it picks, so wheelgap can't tell which file pip accepts.
+Not read yet, so the answer is the one without them: `--hash` in a constraints file, and the lookups of
+[`--index-url`](cli.md#index-url). `--offline` refuses a requirements file as before: its
 files come from the index.
 
 Other options after a requirement are read as pip 26.3 reads them there. pip parses them and then

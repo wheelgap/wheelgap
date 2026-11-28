@@ -410,6 +410,18 @@ def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, t
     assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
 
 
+def test_requirements_sha512_hashes_are_unknown_not_unhashed(capsys, fake_pypi, tmp_path):
+    # pip 26.3 picks the wheel, checks it against the sha512 and refuses it; before, wheelgap dropped the hash and said
+    # `wheel`.
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1 --hash=sha512:{'ab' * 64}\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "macos-arm64", "--json")
+    (pkg,) = json.loads(out)["packages"]
+    assert pkg["results"]["macos-arm64"] == "unknown" and code == 1
+    assert "lists sha512 hashes for purewheel, which wheelgap can't match" in pkg["error"]
+    assert fake_pypi == []
+
+
 def test_requirements_hashes_filter_files_by_sha256(capsys, fake_pypi, tmp_path):
     # 1. only the sdist's hash -> reports source
     req1 = tmp_path / "req1.txt"
