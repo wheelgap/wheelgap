@@ -182,6 +182,14 @@ def test_uv_lock_and_pylock_reject_wrong_types_and_invalid_toml(tmp_path, filena
         load_inputs([str(path)])
 
 
+@pytest.mark.parametrize("filename", ["uv.lock", "pylock.toml"])
+def test_uv_lock_and_pylock_reject_non_utf8(tmp_path, filename):
+    path = tmp_path / filename
+    path.write_bytes(b'version = 1\nname = "\xff"\n')
+    with pytest.raises(SourceError, match=re.escape(f"{filename}: isn't UTF-8 (byte 20), so it can't be read")):
+        load_inputs([str(path)])
+
+
 def test_uv_lock_dependency_extra_may_be_a_list(tmp_path):
     (tmp_path / "uv.lock").write_text(
         'version = 1\n\n[manifest]\nrequirements = [{ name = "a" }]\n\n[[package]]\nname = "a"\nversion = "1.0"\n'

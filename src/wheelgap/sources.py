@@ -432,8 +432,8 @@ def restore_uv_python_files(packages: Iterable[Package], pythons: Iterable[str])
 def _loads_toml(path: Path) -> dict:
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
-    except UnicodeDecodeError:
-        raise SourceError(f"{path.name}: isn't UTF-8, so it can't be read") from None
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path.name}: isn't UTF-8 (byte {e.start}), so it can't be read") from None
     except tomllib.TOMLDecodeError as e:
         raise SourceError(f"{path.name}: invalid TOML: {e}") from None
 
