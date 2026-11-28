@@ -783,16 +783,39 @@ def uv_selected_roots(source: Source) -> list[int]:
     return project or source.roots
 
 
+def _uv_table(mapping: dict, field: str, owner: str) -> dict:
+    value = mapping.get(field, {})
+    if not isinstance(value, dict):
+        raise SourceError(f"uv.lock: {owner}: {field} must be a table")
+    return value
+
+
 def uv_extra_names(package: dict) -> frozenset[str]:
     # uv omits empty optional-dependency groups from the graph, but records their names here.
-    return frozenset(canonicalize_name(name) for name in package.get("optional-dependencies", {})) | frozenset(
-        canonicalize_name(name) for name in package.get("metadata", {}).get("provides-extras", [])
+    owner = f"package {package.get('name', '?')}"
+    optional = _uv_table(package, "optional-dependencies", owner)
+    metadata = _uv_table(package, "metadata", owner)
+    provides_extras = metadata.get("provides-extras", [])
+    if not isinstance(provides_extras, list) or not all(isinstance(name, str) for name in provides_extras):
+        raise SourceError(f"uv.lock: {owner}: provides-extras must be a list of strings")
+    if not all(isinstance(name, str) for name in optional):
+        raise SourceError(f"uv.lock: {owner}: optional-dependencies keys must be strings")
+    return frozenset(canonicalize_name(name) for name in optional) | frozenset(
+        canonicalize_name(name) for name in provides_extras
     )
 
 
 def uv_group_names(package: dict) -> frozenset[str]:
-    return frozenset(canonicalize_name(name) for name in package.get("dev-dependencies", {})) | frozenset(
-        canonicalize_name(name) for name in package.get("metadata", {}).get("requires-dev", {})
+    owner = f"package {package.get('name', '?')}"
+    dev_deps = _uv_table(package, "dev-dependencies", owner)
+    metadata = _uv_table(package, "metadata", owner)
+    requires_dev = _uv_table(metadata, "requires-dev", owner)
+    if not all(isinstance(name, str) for name in dev_deps):
+        raise SourceError(f"uv.lock: {owner}: dev-dependencies keys must be strings")
+    if not all(isinstance(name, str) for name in requires_dev):
+        raise SourceError(f"uv.lock: {owner}: requires-dev keys must be strings")
+    return frozenset(canonicalize_name(name) for name in dev_deps) | frozenset(
+        canonicalize_name(name) for name in requires_dev
     )
 
 
