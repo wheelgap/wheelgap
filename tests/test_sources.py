@@ -423,10 +423,11 @@ def test_requirements_nested_includes_keep_their_kind(tmp_path):
     (tmp_path / "sub" / "deep" / "c3.txt").write_text("-r r3.txt\nfromc3<4\n", encoding="utf-8")
     (tmp_path / "sub" / "deep" / "r3.txt").write_text("fromr3==3.0\n", encoding="utf-8")
     src = parse_requirements(path)
+    # #826: origins name included files relative to the top input, so two same-named files stay distinct.
     assert [(p.name, p.version, p.origin) for p in src.packages] == [
-        ("fromr1", "1.0", "r1.txt"),
-        ("fromr3", "3.0", "r3.txt"),
-        ("fromr2", "2.0", "r2.txt"),
+        ("fromr1", "1.0", "sub/deep/r1.txt"),
+        ("fromr3", "3.0", "sub/deep/r3.txt"),
+        ("fromr2", "2.0", "sub/r2.txt"),
         ("topreq", None, "top.txt"),
     ]
     assert src.constraint_specs == {"fromc1": {"<2"}, "fromc2": {"<3"}, "fromc3": {"<4"}}
@@ -1045,7 +1046,7 @@ def test_requirements_include_after_other_options(tmp_path, line, target):
     path.write_text(f"{line}\nfastlib==2.0.0\n", encoding="utf-8")
     packages = parse_requirements(path).packages
     assert [(p.name, p.version, p.origin) for p in packages] == [
-        ("purewheel", "3.1", "base.txt"),
+        ("purewheel", "3.1", target),
         ("fastlib", "2.0.0", "requirements.txt"),
     ]
 
